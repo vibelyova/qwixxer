@@ -46,9 +46,28 @@ pub struct DNA {
     genes: Arc<Vec<GeneFn>>,
 }
 
+impl DNA {
+    /// If any move locks a row, return it immediately.
+    fn find_locking_move(state: &State, moves: &[Move]) -> Option<Move> {
+        let current_locked = state.count_locked();
+        moves.iter().copied().find(|&mov| {
+            let mut new_state = *state;
+            new_state.apply_move(mov);
+            new_state.count_locked() > current_locked
+        })
+    }
+}
+
 impl Strategy for DNA {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
-        let mut moves = state.generate_moves(dice);
+        let moves = state.generate_moves(dice);
+
+        // Always lock if possible
+        if let Some(mov) = Self::find_locking_move(state, &moves) {
+            return mov;
+        }
+
+        let mut moves = moves;
         moves.push(Move::Strike);
 
         moves
@@ -65,6 +84,11 @@ impl Strategy for DNA {
 
     fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
         let moves = state.generate_opponent_moves(number);
+
+        // Always lock if possible
+        if let Some(mov) = Self::find_locking_move(state, &moves) {
+            return Some(mov);
+        }
 
         let mut states: Vec<_> = moves
             .into_iter()
@@ -251,7 +275,7 @@ impl Population {
     }
 
     pub fn next_generation(&mut self) {
-        const NUMBER_OF_SIMULATIONS: usize = 500;
+        const NUMBER_OF_SIMULATIONS: usize = 1000;
 
         // Pre-generate seeds
         let seeds: Vec<u64> = (0..NUMBER_OF_SIMULATIONS)

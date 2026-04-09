@@ -9,7 +9,7 @@ use rand::SeedableRng;
 
 fn main() {
     println!("Training GA bot (population=40, 20 generations)...\n");
-    let mut pop = bot::Population::new(40, bot::default_genes(), 42);
+    let mut pop = bot::Population::new(100, bot::default_genes(), 42);
     pop.evolve(200);
 
     let champion = pop.current_champion().clone();
