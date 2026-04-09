@@ -59,6 +59,13 @@ impl State {
         self.rows.iter().map(|row| row.free.is_none() as u8).sum()
     }
 
+    pub fn lockable_rows(&self) -> u8 {
+        self.rows
+            .iter()
+            .filter(|row| row.free.is_some() && row.total >= 5)
+            .count() as u8
+    }
+
     pub fn locked(&self) -> [bool; 4] {
         self.rows
             .iter()

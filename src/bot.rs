@@ -10,6 +10,35 @@ use rand::{prelude::*, rngs::SmallRng, Rng};
 
 pub type GeneFn = fn(&State) -> f64;
 
+pub const GENE_NAMES: [&str; 5] = [
+    "concentration",
+    "blanks",
+    "strikes",
+    "lockable_rows",
+    "probability",
+];
+
+pub fn default_genes() -> Vec<GeneFn> {
+    vec![
+        // concentration: sum of row totals squared
+        |state| {
+            state
+                .row_totals()
+                .iter()
+                .map(|&t| (t as f64) * (t as f64))
+                .sum()
+        },
+        // blanks: skipped positions
+        |state| state.blanks() as f64,
+        // strikes
+        |state| state.strikes as f64,
+        // lockable_rows: rows with 5+ marks (ready to lock)
+        |state| state.lockable_rows() as f64,
+        // probability: chance of useful opponent roll
+        |state| state.probability() as f64,
+    ]
+}
+
 #[derive(Clone, Debug)]
 pub struct DNA {
     weights: Vec<f64>,
@@ -95,6 +124,15 @@ impl DNA {
             }
         }
         self.normalize()
+    }
+
+    pub fn print_weights(&self) {
+        let pairs: Vec<String> = GENE_NAMES
+            .iter()
+            .zip(self.weights.iter())
+            .map(|(name, w)| format!("{name}:{w:+.3}"))
+            .collect();
+        println!("[{}]", pairs.join("  "));
     }
 
     pub fn instinct(&self, state: &State) -> f64 {
@@ -220,12 +258,14 @@ impl Population {
 
     pub fn evolve(&mut self, generations: usize) {
         for gen in 0..generations {
-            println!("Growing generation #{gen}");
+            println!("Generation #{gen}...");
             let now = std::time::Instant::now();
             self.next_generation();
-            println!("Generation #{gen} complete in {:?}", now.elapsed());
+            let best = &self.dna[0]; // elitism puts champion at index 0
+            print!("  {:?} ", now.elapsed());
+            best.print_weights();
         }
-        println!("Evolution complete");
+        println!("Evolution complete.");
     }
 
     pub fn champion(&self, rank: &[f32]) -> DNA {
@@ -236,5 +276,9 @@ impl Population {
             .unwrap()
             .1
             .clone()
+    }
+
+    pub fn current_champion(&self) -> &DNA {
+        &self.dna[0]
     }
 }
