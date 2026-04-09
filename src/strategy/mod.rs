@@ -144,17 +144,50 @@ impl Strategy for Interactive {
     }
 }
 
-// TODO
-#[derive(Debug, Default, Clone)]
-pub struct Conservative;
+/// Conservative strategy: only marks numbers that don't skip too many.
+/// Picks the move creating the fewest new blanks, rejecting any that
+/// would add more than `max_new_blanks`. Prefers singles over doubles
+/// at equal blank cost.
+#[derive(Debug, Clone)]
+pub struct Conservative {
+    max_new_blanks: u8,
+}
+
+impl Default for Conservative {
+    fn default() -> Self {
+        Self { max_new_blanks: 2 }
+    }
+}
+
+impl Conservative {
+    fn best_move(state: &State, moves: &[Move], max_new_blanks: u8) -> Option<Move> {
+        let current_blanks = state.blanks();
+        moves
+            .iter()
+            .filter_map(|&mov| {
+                let mut new_state = *state;
+                new_state.apply_move(mov);
+                let new_blanks = new_state.blanks().saturating_sub(current_blanks);
+                if new_blanks <= max_new_blanks {
+                    Some((mov, new_blanks))
+                } else {
+                    None
+                }
+            })
+            .min_by_key(|(_, blanks)| *blanks)
+            .map(|(mov, _)| mov)
+    }
+}
 
 impl Strategy for Conservative {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
-        Move::Strike
+        let moves = state.generate_moves(dice);
+        Self::best_move(state, &moves, self.max_new_blanks).unwrap_or(Move::Strike)
     }
 
     fn opponents_move(&mut self, state: &State, number: u8, _locked: [bool; 4]) -> Option<Move> {
-        None
+        let moves = state.generate_opponent_moves(number);
+        Self::best_move(state, &moves, self.max_new_blanks)
     }
 }
 
