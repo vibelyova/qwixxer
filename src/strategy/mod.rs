@@ -191,6 +191,67 @@ impl Strategy for Conservative {
     }
 }
 
+/// Rush-to-lock strategy: concentrates marks in few rows, racing to 5
+/// marks then locking. Willing to skip numbers for speed. Scores moves
+/// by rewarding locks and concentrated mark counts.
+#[derive(Debug, Default, Clone)]
+pub struct Rusher;
+
+impl Rusher {
+    fn score_state(state: &State) -> i32 {
+        let totals = state.row_totals();
+        let locked = state.count_locked() as i32;
+
+        // Huge bonus per lock — this is the goal
+        let lock_bonus = locked * 1000;
+
+        // Reward concentration: square each row's total so 5+0 beats 3+2
+        let concentration: i32 = totals.iter().map(|&t| (t as i32) * (t as i32)).sum();
+
+        // Mild blank penalty to break ties
+        let blank_penalty = state.blanks() as i32;
+
+        // Strike penalty
+        let strike_penalty = state.strikes as i32 * 30;
+
+        lock_bonus + concentration - blank_penalty - strike_penalty
+    }
+
+    fn best_move(state: &State, moves: &[Move]) -> Option<Move> {
+        moves
+            .iter()
+            .map(|&mov| {
+                let mut new_state = *state;
+                new_state.apply_move(mov);
+                (mov, Self::score_state(&new_state))
+            })
+            .max_by_key(|(_, score)| *score)
+            .map(|(mov, _)| mov)
+    }
+}
+
+impl Strategy for Rusher {
+    fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
+        let mut moves = state.generate_moves(dice);
+        moves.push(Move::Strike);
+        Self::best_move(state, &moves).unwrap()
+    }
+
+    fn opponents_move(&mut self, state: &State, number: u8, _locked: [bool; 4]) -> Option<Move> {
+        let moves = state.generate_opponent_moves(number);
+        if moves.is_empty() {
+            return None;
+        }
+        // Only take it if it improves our score
+        let current_score = Self::score_state(state);
+        Self::best_move(state, &moves).filter(|&mov| {
+            let mut new_state = *state;
+            new_state.apply_move(mov);
+            Self::score_state(&new_state) > current_score
+        })
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Random;
 
