@@ -233,21 +233,30 @@ impl Population {
                 [pair[0], rng.gen_range(0..dna.len())]
             };
 
-            let mut players = Vec::with_capacity(4);
+            // Build players: 2 DNA bots + 1 Conservative + 1 Rusher
+            // Track which positions the DNA bots land in after shuffle
+            let mut slots: Vec<(Option<usize>, Box<dyn Strategy>)> = Vec::with_capacity(4);
             for &i in &dna_indices {
-                players.push(Player::new(
-                    Box::new(dna[i].clone()) as Box<dyn Strategy>,
-                    Box::new(SmallRng::from_rng(&mut rng).unwrap()),
-                ));
+                slots.push((Some(i), Box::new(dna[i].clone()) as Box<dyn Strategy>));
             }
-            players.push(Player::new(
-                Box::<Conservative>::default(),
-                Box::new(SmallRng::from_rng(&mut rng).unwrap()),
-            ));
-            players.push(Player::new(
-                Box::<Rusher>::default(),
-                Box::new(SmallRng::from_rng(&mut rng).unwrap()),
-            ));
+            slots.push((None, Box::<Conservative>::default()));
+            slots.push((None, Box::<Rusher>::default()));
+
+            // Shuffle seat order to eliminate position bias
+            slots.shuffle(&mut rng);
+
+            let dna_positions: Vec<(usize, usize)> = slots
+                .iter()
+                .enumerate()
+                .filter_map(|(seat, (di, _))| di.map(|di| (seat, di)))
+                .collect();
+
+            let players: Vec<Player> = slots
+                .into_iter()
+                .map(|(_, strat)| {
+                    Player::new(strat, Box::new(SmallRng::from_rng(&mut rng).unwrap()))
+                })
+                .collect();
 
             let mut game = Game::new(players);
             game.play();
@@ -259,15 +268,15 @@ impl Population {
                 .collect();
             let max_points = *points.iter().max().unwrap();
 
-            // Only score the DNA bots (first 2 players)
-            for (j, &di) in dna_indices.iter().enumerate() {
-                let p = points[j];
+            // Only score the DNA bots at their shuffled positions
+            for (seat, di) in &dna_positions {
+                let p = points[*seat];
                 let normalized = if max_points <= 0 {
                     0.25
                 } else {
                     (p as f32).max(0.0) / max_points as f32
                 };
-                score[di] += normalized;
+                score[*di] += normalized;
             }
         }
 
