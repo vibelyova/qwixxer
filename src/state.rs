@@ -282,3 +282,289 @@ impl std::str::FromStr for Move {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- Row basics ----
+
+    #[test]
+    fn ascending_row_marks_in_order() {
+        let mut row = Row { ascending: true, total: 0, free: Some(2) };
+        assert!(row.can_mark(2));
+        assert!(row.can_mark(7));
+        assert!(row.can_mark(12) == false); // need 5 marks first
+        row.mark(3);
+        assert_eq!(row.free, Some(4));
+        assert_eq!(row.total, 1);
+        assert!(!row.can_mark(3)); // already past
+        assert!(row.can_mark(4));
+    }
+
+    #[test]
+    fn descending_row_marks_in_order() {
+        let mut row = Row { ascending: false, total: 0, free: Some(12) };
+        assert!(row.can_mark(12));
+        assert!(row.can_mark(5));
+        assert!(!row.can_mark(2)); // need 5 marks first
+        row.mark(10);
+        assert_eq!(row.free, Some(9));
+        assert_eq!(row.total, 1);
+        assert!(!row.can_mark(11)); // already past
+        assert!(row.can_mark(9));
+    }
+
+    #[test]
+    fn cannot_mark_out_of_range() {
+        let row = Row { ascending: true, total: 0, free: Some(2) };
+        assert!(!row.can_mark(0));
+        assert!(!row.can_mark(1));
+        assert!(!row.can_mark(13));
+    }
+
+    #[test]
+    fn cannot_mark_locked_row() {
+        let row = Row { ascending: true, total: 6, free: None };
+        assert!(!row.can_mark(7));
+    }
+
+    #[test]
+    fn locking_ascending_row() {
+        let mut row = Row { ascending: true, total: 5, free: Some(11) };
+        assert!(row.can_mark(12));
+        row.mark(12);
+        assert_eq!(row.free, None); // locked
+        assert_eq!(row.total, 7); // 5 + 1 for mark + 1 bonus for lock
+    }
+
+    #[test]
+    fn locking_descending_row() {
+        let mut row = Row { ascending: false, total: 5, free: Some(3) };
+        assert!(row.can_mark(2));
+        row.mark(2);
+        assert_eq!(row.free, None);
+        assert_eq!(row.total, 7);
+    }
+
+    #[test]
+    fn cannot_lock_with_fewer_than_5_marks() {
+        let row = Row { ascending: true, total: 4, free: Some(11) };
+        assert!(!row.can_mark(12));
+
+        let row = Row { ascending: false, total: 4, free: Some(3) };
+        assert!(!row.can_mark(2));
+    }
+
+    // ---- State scoring ----
+
+    #[test]
+    fn empty_state_scores_zero() {
+        let state = State::default();
+        assert_eq!(state.count_points(), 0);
+    }
+
+    #[test]
+    fn scoring_triangular_numbers() {
+        let mut state = State::default();
+        // Mark 3 numbers in red (row 0): 2, 3, 4
+        state.apply_move((0usize, 2u8));
+        state.apply_move((0usize, 3u8));
+        state.apply_move((0usize, 4u8));
+        // 3 marks = 3*4/2 = 6 points
+        assert_eq!(state.count_points(), 6);
+    }
+
+    #[test]
+    fn strikes_subtract_five_each() {
+        let mut state = State::default();
+        state.apply_move(Move::Strike);
+        assert_eq!(state.count_points(), -5);
+        state.apply_move(Move::Strike);
+        assert_eq!(state.count_points(), -10);
+    }
+
+    // ---- State locking ----
+
+    #[test]
+    fn lock_propagates_to_rows() {
+        let mut state = State::default();
+        assert_eq!(state.count_locked(), 0);
+        state.lock([true, false, false, true]);
+        assert_eq!(state.count_locked(), 2);
+        assert_eq!(state.locked(), [true, false, false, true]);
+    }
+
+    #[test]
+    fn locking_via_mark_locks_row() {
+        let mut state = State::default();
+        // Mark 5 numbers in red then lock with 12
+        for n in 2..=6 {
+            state.apply_move((0usize, n as u8));
+        }
+        assert_eq!(state.locked(), [false, false, false, false]);
+        state.apply_move((0usize, 12u8));
+        assert_eq!(state.locked(), [true, false, false, false]);
+    }
+
+    // ---- Move application ----
+
+    #[test]
+    fn double_move_marks_two_rows() {
+        let mut state = State::default();
+        state.apply_move(((0usize, 5u8), (2usize, 10u8)));
+        // Red row: 1 mark = 1 point. Green row: 1 mark = 1 point.
+        assert_eq!(state.count_points(), 2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn fifth_strike_panics() {
+        let mut state = State::default();
+        for _ in 0..5 {
+            state.apply_move(Move::Strike);
+        }
+    }
+
+    // ---- generate_opponent_moves ----
+
+    #[test]
+    fn opponent_moves_are_all_singles() {
+        let state = State::default();
+        let moves = state.generate_opponent_moves(7);
+        for mov in &moves {
+            assert!(matches!(mov, Move::Single(_)));
+        }
+    }
+
+    #[test]
+    fn opponent_moves_fresh_state() {
+        let state = State::default();
+        // 7 is markable in all 4 rows on a fresh state
+        let moves = state.generate_opponent_moves(7);
+        assert_eq!(moves.len(), 4);
+    }
+
+    #[test]
+    fn opponent_moves_respects_free_pointer() {
+        let mut state = State::default();
+        // Mark red 5, so red free = 6
+        state.apply_move((0usize, 5u8));
+        // 4 is no longer markable in red, but still in yellow
+        let moves = state.generate_opponent_moves(4);
+        let rows: Vec<usize> = moves.iter().map(|m| match m {
+            Move::Single(mark) => mark.row,
+            _ => panic!("expected single"),
+        }).collect();
+        assert!(!rows.contains(&0)); // red excluded
+        assert!(rows.contains(&1));  // yellow still open
+    }
+
+    #[test]
+    fn opponent_moves_skips_locked_row() {
+        let mut state = State::default();
+        state.lock([true, false, false, false]);
+        let moves = state.generate_opponent_moves(7);
+        let rows: Vec<usize> = moves.iter().map(|m| match m {
+            Move::Single(mark) => mark.row,
+            _ => panic!("expected single"),
+        }).collect();
+        assert!(!rows.contains(&0));
+        assert_eq!(moves.len(), 3);
+    }
+
+    // ---- generate_moves (active player) ----
+
+    #[test]
+    fn generate_moves_includes_singles_and_doubles() {
+        let state = State::default();
+        // dice: W1=3, W2=4, R=1, Y=2, G=3, B=4
+        let moves = state.generate_moves([3, 4, 1, 2, 3, 4]);
+        let has_single = moves.iter().any(|m| matches!(m, Move::Single(_)));
+        let has_double = moves.iter().any(|m| matches!(m, Move::Double(_, _)));
+        assert!(has_single);
+        assert!(has_double);
+    }
+
+    #[test]
+    fn generate_moves_no_strikes() {
+        let state = State::default();
+        let moves = state.generate_moves([3, 4, 1, 2, 3, 4]);
+        assert!(moves.iter().all(|m| !matches!(m, Move::Strike)));
+    }
+
+    #[test]
+    fn generate_moves_empty_when_nothing_markable() {
+        let mut state = State::default();
+        state.lock([true, true, true, true]);
+        let moves = state.generate_moves([3, 4, 1, 2, 3, 4]);
+        assert!(moves.is_empty());
+    }
+
+    // ---- Parsing ----
+
+    #[test]
+    fn parse_mark() {
+        let mark: Mark = "r5".parse().unwrap();
+        assert_eq!(mark.row, 0);
+        assert_eq!(mark.number, 5);
+
+        let mark: Mark = "G10".parse().unwrap();
+        assert_eq!(mark.row, 2);
+        assert_eq!(mark.number, 10);
+    }
+
+    #[test]
+    fn parse_move_strike() {
+        let mov: Move = "strike".parse().unwrap();
+        assert!(matches!(mov, Move::Strike));
+    }
+
+    #[test]
+    fn parse_move_single() {
+        let mov: Move = "b7".parse().unwrap();
+        match mov {
+            Move::Single(m) => { assert_eq!(m.row, 3); assert_eq!(m.number, 7); }
+            _ => panic!("expected single"),
+        }
+    }
+
+    #[test]
+    fn parse_move_double() {
+        let mov: Move = "r4 g10".parse().unwrap();
+        match mov {
+            Move::Double(m1, m2) => {
+                assert_eq!(m1.row, 0);
+                assert_eq!(m1.number, 4);
+                assert_eq!(m2.row, 2);
+                assert_eq!(m2.number, 10);
+            }
+            _ => panic!("expected double"),
+        }
+    }
+
+    // ---- Metrics ----
+
+    #[test]
+    fn blanks_fresh_state() {
+        let state = State::default();
+        assert_eq!(state.blanks(), 0);
+    }
+
+    #[test]
+    fn blanks_after_skip() {
+        let mut state = State::default();
+        // Mark red 5, skipping 2,3,4 = 3 blanks
+        state.apply_move((0usize, 5u8));
+        assert_eq!(state.blanks(), 3);
+    }
+
+    #[test]
+    fn probability_fresh_state() {
+        let state = State::default();
+        // Fresh: free values are 2 and 12
+        // 2 has 1 way (1+1), 12 has 1 way (6+6) → 2/36
+        let p = state.probability();
+        assert!((p - 2.0 / 36.0).abs() < 1e-6);
+    }
+}
