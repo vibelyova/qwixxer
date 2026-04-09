@@ -109,12 +109,15 @@ impl Game {
     }
 
     fn game_over(&self) -> bool {
-        let max_strikes = self
-            .players
-            .iter()
-            .map(|player| player.state.strikes)
-            .max()
-            .unwrap();
+        self.game_over_reason().is_some()
+    }
+
+    pub fn game_over_reason(&self) -> Option<GameOverReason> {
+        for (i, player) in self.players.iter().enumerate() {
+            if player.state.strikes >= 4 {
+                return Some(GameOverReason::Strikes(i));
+            }
+        }
 
         let total_locked = self
             .players
@@ -123,6 +126,74 @@ impl Game {
             .max()
             .unwrap();
 
-        max_strikes == 4 || total_locked >= 2
+        if total_locked >= 2 {
+            return Some(GameOverReason::TwoRowsLocked);
+        }
+
+        None
     }
+
+    pub fn print_game_over(&self) {
+        const BOLD: &str = "\x1b[1m";
+        const DIM: &str = "\x1b[2m";
+        const RESET: &str = "\x1b[0m";
+        const YELLOW: &str = "\x1b[93m";
+        const RED: &str = "\x1b[91m";
+
+        println!("\n  {BOLD}═══════════════════════════════════════════════{RESET}");
+        println!("  {BOLD}                  GAME OVER{RESET}");
+        println!("  {BOLD}═══════════════════════════════════════════════{RESET}\n");
+
+        // Reason
+        match self.game_over_reason() {
+            Some(GameOverReason::Strikes(i)) => {
+                println!("  {RED}Player {} reached 4 strikes!{RESET}\n", i + 1);
+            }
+            Some(GameOverReason::TwoRowsLocked) => {
+                println!("  Two rows have been locked!\n");
+            }
+            None => {}
+        }
+
+        // Collect scores for ranking
+        let mut scores: Vec<(usize, isize)> = self
+            .players
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, p.state.count_points()))
+            .collect();
+        scores.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Print each player's board
+        for (i, player) in self.players.iter().enumerate() {
+            let rank = scores.iter().position(|(idx, _)| *idx == i).unwrap();
+            let label = if rank == 0 {
+                format!("{YELLOW}{BOLD}Player {} (Winner){RESET}", i + 1)
+            } else {
+                format!("{BOLD}Player {}{RESET}", i + 1)
+            };
+            println!("  {DIM}───{RESET} {label} {DIM}───{RESET}\n");
+            println!("{}", player.state);
+            println!();
+        }
+
+        // Final ranking
+        println!("  {BOLD}Final Ranking{RESET}");
+        println!("  {DIM}──────────────────────{RESET}");
+        for (rank, (i, score)) in scores.iter().enumerate() {
+            let medal = match rank {
+                0 => format!("{YELLOW}{BOLD}1st{RESET}"),
+                1 => format!("{DIM}2nd{RESET}"),
+                2 => format!("{DIM}3rd{RESET}"),
+                _ => format!("{DIM}{}th{RESET}", rank + 1),
+            };
+            println!("  {medal}  Player {}  {BOLD}{score}{RESET} pts", i + 1);
+        }
+        println!("  {DIM}──────────────────────{RESET}");
+    }
+}
+
+pub enum GameOverReason {
+    Strikes(usize),
+    TwoRowsLocked,
 }

@@ -21,9 +21,5 @@ fn main() {
     ]);
 
     game.play();
-
-    println!("\n  Game over!\n");
-    for (i, player) in game.players.iter().enumerate() {
-        println!("  Player {} score: {}", i + 1, player.state.count_points());
-    }
+    game.print_game_over();
 }
