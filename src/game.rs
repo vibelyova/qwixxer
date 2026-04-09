@@ -49,6 +49,18 @@ impl Player {
         }
     }
 
+    pub fn new_with_state(
+        strategy: Box<dyn Strategy>,
+        dice: Box<dyn DiceSource>,
+        state: State,
+    ) -> Self {
+        Self {
+            strategy,
+            state,
+            dice,
+        }
+    }
+
     fn roll(&mut self) -> [u8; 6] {
         self.dice.roll()
     }
@@ -69,15 +81,20 @@ impl Player {
 #[derive(Debug)]
 pub struct Game {
     pub players: Vec<Player>,
+    start_turn: Option<usize>,
 }
 
 impl Game {
     pub fn new(players: Vec<Player>) -> Self {
-        Self { players }
+        Self { players, start_turn: None }
+    }
+
+    pub fn new_from_turn(players: Vec<Player>, start_turn: usize) -> Self {
+        Self { players, start_turn: Some(start_turn) }
     }
 
     pub fn play(&mut self) {
-        let mut active_player = 0;
+        let mut active_player = self.start_turn.take().unwrap_or(0);
         while !self.game_over() {
             let dice = self.players[active_player].roll();
             let on_white = dice[0] + dice[1];
