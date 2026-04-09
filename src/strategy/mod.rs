@@ -252,6 +252,67 @@ impl Strategy for Rusher {
     }
 }
 
+/// Opportunist strategy: optimizes for probability (keeping free pointers
+/// on common 2d6 sums like 6/7/8) to maximize marks on opponent turns.
+/// Always locks when possible, never strikes unless forced.
+#[derive(Debug, Default, Clone)]
+pub struct Opportunist;
+
+impl Opportunist {
+    fn find_locking_move(state: &State, moves: &[Move]) -> Option<Move> {
+        let current_locked = state.count_locked();
+        moves.iter().copied().find(|&mov| {
+            let mut new_state = *state;
+            new_state.apply_move(mov);
+            new_state.count_locked() > current_locked
+        })
+    }
+
+    /// Filter moves to those within a blank budget, then pick by best probability.
+    fn best_move(state: &State, moves: &[Move], max_new_blanks: u8) -> Option<Move> {
+        let current_blanks = state.blanks();
+        moves
+            .iter()
+            .copied()
+            .filter_map(|mov| {
+                let mut new_state = *state;
+                new_state.apply_move(mov);
+                let new_blanks = new_state.blanks().saturating_sub(current_blanks);
+                if new_blanks <= max_new_blanks {
+                    Some((mov, new_state.probability()))
+                } else {
+                    None
+                }
+            })
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(mov, _)| mov)
+    }
+}
+
+impl Strategy for Opportunist {
+    fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
+        let moves = state.generate_moves(dice);
+
+        if let Some(mov) = Self::find_locking_move(state, &moves) {
+            return mov;
+        }
+
+        // Allow up to 2 blanks on active turn, pick by probability
+        Self::best_move(state, &moves, 2).unwrap_or(Move::Strike)
+    }
+
+    fn opponents_move(&mut self, state: &State, number: u8, _locked: [bool; 4]) -> Option<Move> {
+        let moves = state.generate_opponent_moves(number);
+
+        if let Some(mov) = Self::find_locking_move(state, &moves) {
+            return Some(mov);
+        }
+
+        // Allow up to 1 blank on opponent turn, pick by probability
+        Self::best_move(state, &moves, 1)
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Random;
 

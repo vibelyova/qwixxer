@@ -60,9 +60,50 @@ fn train_and_bench() {
     }
 }
 
+fn bench() {
+    let n = 10_000;
+    let names = ["Conservative", "Rusher", "Opportunist"];
+    let mut wins = [0u32; 3];
+    let mut total_pts = [0i64; 3];
+
+    for _ in 0..n {
+        let mut game = game::Game::new(vec![
+            Player::new(Box::<strategy::Conservative>::default(), Box::new(SmallRng::from_entropy())),
+            Player::new(Box::<strategy::Rusher>::default(), Box::new(SmallRng::from_entropy())),
+            Player::new(Box::<strategy::Opportunist>::default(), Box::new(SmallRng::from_entropy())),
+        ]);
+        game.play();
+
+        let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+        let max = *scores.iter().max().unwrap();
+        for (i, &s) in scores.iter().enumerate() {
+            total_pts[i] += s as i64;
+            if s == max {
+                wins[i] += 1;
+            }
+        }
+    }
+
+    println!("Results over {n} 3-player games:");
+    for i in 0..3 {
+        println!(
+            "  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts",
+            names[i],
+            wins[i],
+            wins[i] as f64 / n as f64 * 100.0,
+            total_pts[i] as f64 / n as f64
+        );
+    }
+}
+
 fn main() {
     if std::env::args().any(|a| a == "--train") {
         train_and_bench();
+        return;
+    }
+
+    if std::env::args().any(|a| a == "--bench") {
+        bench();
         return;
     }
 
