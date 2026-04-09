@@ -4,6 +4,7 @@ use crate::state::State;
 use crate::strategy::{Conservative, Rusher, Strategy};
 use itertools::Itertools;
 use rand::distributions::WeightedIndex;
+use rayon::prelude::*;
 use std::sync::Arc;
 
 use rand::{prelude::*, rngs::SmallRng, Rng};
@@ -193,36 +194,35 @@ impl Population {
         Population { genes, dna, rng }
     }
 
-    pub fn rank_generation(&mut self, seed: u64) -> Vec<f32> {
-        let mut indices: Vec<usize> = (0..self.dna.len()).collect();
-        indices.shuffle(&mut self.rng);
+    fn rank_generation(dna: &[DNA], seed: u64) -> Vec<f32> {
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let mut indices: Vec<usize> = (0..dna.len()).collect();
+        indices.shuffle(&mut rng);
 
-        let mut score = vec![0.0f32; self.dna.len()];
-        let mut game_rng = SmallRng::seed_from_u64(seed);
+        let mut score = vec![0.0f32; dna.len()];
 
         // Each game: 2 DNA bots + 1 Conservative + 1 Rusher
         for pair in indices.chunks(2) {
-            let dna_indices: Vec<usize> = if pair.len() == 2 {
-                vec![pair[0], pair[1]]
+            let dna_indices = if pair.len() == 2 {
+                [pair[0], pair[1]]
             } else {
-                // Odd population: pad with a random pick
-                vec![pair[0], self.rng.gen_range(0..self.dna.len())]
+                [pair[0], rng.gen_range(0..dna.len())]
             };
 
             let mut players = Vec::with_capacity(4);
             for &i in &dna_indices {
                 players.push(Player::new(
-                    Box::new(self.dna[i].clone()) as Box<dyn Strategy>,
-                    Box::new(SmallRng::from_rng(&mut game_rng).unwrap()),
+                    Box::new(dna[i].clone()) as Box<dyn Strategy>,
+                    Box::new(SmallRng::from_rng(&mut rng).unwrap()),
                 ));
             }
             players.push(Player::new(
                 Box::<Conservative>::default(),
-                Box::new(SmallRng::from_rng(&mut game_rng).unwrap()),
+                Box::new(SmallRng::from_rng(&mut rng).unwrap()),
             ));
             players.push(Player::new(
                 Box::<Rusher>::default(),
-                Box::new(SmallRng::from_rng(&mut game_rng).unwrap()),
+                Box::new(SmallRng::from_rng(&mut rng).unwrap()),
             ));
 
             let mut game = Game::new(players);
@@ -251,16 +251,25 @@ impl Population {
     }
 
     pub fn next_generation(&mut self) {
-        let mut global_rank = vec![0.0f32; self.dna.len()];
         const NUMBER_OF_SIMULATIONS: usize = 500;
-        for _ in 0..NUMBER_OF_SIMULATIONS {
-            let seed = self.rng.gen();
-            let rank = self.rank_generation(seed);
-            global_rank
-                .iter_mut()
-                .zip(rank.iter())
-                .for_each(|(a, b)| *a += b);
-        }
+
+        // Pre-generate seeds
+        let seeds: Vec<u64> = (0..NUMBER_OF_SIMULATIONS)
+            .map(|_| self.rng.gen())
+            .collect();
+
+        // Run simulations in parallel
+        let dna = &self.dna;
+        let global_rank = seeds
+            .par_iter()
+            .map(|&seed| Self::rank_generation(dna, seed))
+            .reduce(
+                || vec![0.0f32; dna.len()],
+                |mut acc, rank| {
+                    acc.iter_mut().zip(rank.iter()).for_each(|(a, b)| *a += b);
+                    acc
+                },
+            );
 
         let dist = WeightedIndex::new(&global_rank).expect("All weights are zero");
 
