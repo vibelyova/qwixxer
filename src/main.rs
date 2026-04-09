@@ -14,50 +14,40 @@ fn train_and_bench() {
     pop.evolve(200);
 
     let champion = pop.current_champion().clone();
-    println!("\nBenchmarking champion...\n");
+    println!("\nBenchmarking champion vs Opportunist (2-player, alternating seats)...\n");
 
     let n = 10_000;
-    let names = ["GA Bot", "Conservative", "Rusher"];
-    let mut wins = [0u32; 3];
-    let mut total_pts = [0i64; 3];
+    let mut ga_wins = 0u32;
+    let mut opp_wins = 0u32;
+    let mut ga_total = 0i64;
+    let mut opp_total = 0i64;
 
-    for _ in 0..n {
-        let mut game = game::Game::new(vec![
-            Player::new(
-                Box::new(champion.clone()) as Box<dyn strategy::Strategy>,
-                Box::new(SmallRng::from_entropy()),
-            ),
-            Player::new(
-                Box::<strategy::Conservative>::default(),
-                Box::new(SmallRng::from_entropy()),
-            ),
-            Player::new(
-                Box::<strategy::Rusher>::default(),
-                Box::new(SmallRng::from_entropy()),
-            ),
-        ]);
+    for i in 0..n {
+        let (ga_seat, opp_seat) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
+        let mut players = vec![
+            Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+            Player::new(Box::<strategy::Opportunist>::default(), Box::new(SmallRng::from_entropy())),
+        ];
+        if ga_seat == 1 {
+            players.swap(0, 1);
+        }
+
+        let mut game = game::Game::new(players);
         game.play();
 
         let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
-        let max = *scores.iter().max().unwrap();
-        for (i, &s) in scores.iter().enumerate() {
-            total_pts[i] += s as i64;
-            if s == max {
-                wins[i] += 1;
-            }
-        }
+        let ga_pts = scores[ga_seat];
+        let opp_pts = scores[opp_seat];
+        ga_total += ga_pts as i64;
+        opp_total += opp_pts as i64;
+        if ga_pts > opp_pts { ga_wins += 1; }
+        if opp_pts > ga_pts { opp_wins += 1; }
     }
 
-    println!("Results over {n} 3-player games:");
-    for i in 0..3 {
-        println!(
-            "  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts",
-            names[i],
-            wins[i],
-            wins[i] as f64 / n as f64 * 100.0,
-            total_pts[i] as f64 / n as f64
-        );
-    }
+    println!("  GA Bot:       {ga_wins} wins ({:.1}%)  avg {:.1} pts",
+        ga_wins as f64 / n as f64 * 100.0, ga_total as f64 / n as f64);
+    println!("  Opportunist:  {opp_wins} wins ({:.1}%)  avg {:.1} pts",
+        opp_wins as f64 / n as f64 * 100.0, opp_total as f64 / n as f64);
 }
 
 fn bench() {
@@ -66,39 +56,51 @@ fn bench() {
         bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt found");
 
     let n = 10_000;
-    let names = ["Opportunist 1", "Opportunist 2", "GA Bot 1", "GA Bot 2"];
-    let mut wins = [0u32; 4];
-    let mut total_pts = [0i64; 4];
+    let mut ga_wins = 0u32;
+    let mut opp_wins = 0u32;
+    let mut ties = 0u32;
+    let mut ga_total = 0i64;
+    let mut opp_total = 0i64;
 
-    for _ in 0..n {
-        let mut game = game::Game::new(vec![
-            Player::new(Box::<strategy::Opportunist>::default(), Box::new(SmallRng::from_entropy())),
-            Player::new(Box::<strategy::Opportunist>::default(), Box::new(SmallRng::from_entropy())),
+    for i in 0..n {
+        // Alternate who goes first
+        let (ga_seat, opp_seat) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
+        let mut players = vec![
             Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
-            Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
-        ]);
+            Player::new(Box::<strategy::Opportunist>::default(), Box::new(SmallRng::from_entropy())),
+        ];
+        if ga_seat == 1 {
+            players.swap(0, 1);
+        }
+
+        let mut game = game::Game::new(players);
         game.play();
 
         let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
-        let max = *scores.iter().max().unwrap();
-        for (i, &s) in scores.iter().enumerate() {
-            total_pts[i] += s as i64;
-            if s == max {
-                wins[i] += 1;
-            }
+        let ga_pts = scores[ga_seat];
+        let opp_pts = scores[opp_seat];
+        ga_total += ga_pts as i64;
+        opp_total += opp_pts as i64;
+        match ga_pts.cmp(&opp_pts) {
+            std::cmp::Ordering::Greater => ga_wins += 1,
+            std::cmp::Ordering::Less => opp_wins += 1,
+            std::cmp::Ordering::Equal => ties += 1,
         }
     }
 
-    println!("Results over {n} 4-player games (lookahead enabled):");
-    for i in 0..4 {
-        println!(
-            "  {:<16} {:>5} wins ({:>4.1}%)  avg {:.1} pts",
-            names[i],
-            wins[i],
-            wins[i] as f64 / n as f64 * 100.0,
-            total_pts[i] as f64 / n as f64
-        );
-    }
+    println!("Results over {n} 2-player games (alternating seats):");
+    println!(
+        "  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts",
+        "GA Bot", ga_wins, ga_wins as f64 / n as f64 * 100.0, ga_total as f64 / n as f64
+    );
+    println!(
+        "  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts",
+        "Opportunist", opp_wins, opp_wins as f64 / n as f64 * 100.0, opp_total as f64 / n as f64
+    );
+    println!(
+        "  {:<14} {:>5}       ({:>4.1}%)",
+        "Ties", ties, ties as f64 / n as f64 * 100.0
+    );
 }
 
 fn main() {
