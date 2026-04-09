@@ -231,50 +231,42 @@ impl Population {
         let mut indices: Vec<usize> = (0..dna.len()).collect();
         indices.shuffle(&mut rng);
 
-        // Pad to even
-        if indices.len() % 2 != 0 {
+        // Pad to multiple of 4
+        while indices.len() % 4 != 0 {
             indices.push(rng.gen_range(0..dna.len()));
         }
 
         let mut score = vec![0.0f32; dna.len()];
 
-        // 2-player games: each pair plays head-to-head
-        for pair in indices.chunks(2) {
-            let a = pair[0];
-            let b = pair[1];
-
-            // Play twice with swapped seats to cancel position bias
-            for &(first, second) in &[(a, b), (b, a)] {
-                let players = vec![
+        for group in indices.chunks(4) {
+            let players: Vec<Player> = group
+                .iter()
+                .map(|&i| {
                     Player::new(
-                        Box::new(dna[first].clone()) as Box<dyn Strategy>,
+                        Box::new(dna[i].clone()) as Box<dyn Strategy>,
                         Box::new(SmallRng::from_rng(&mut rng).unwrap()),
-                    ),
-                    Player::new(
-                        Box::new(dna[second].clone()) as Box<dyn Strategy>,
-                        Box::new(SmallRng::from_rng(&mut rng).unwrap()),
-                    ),
-                ];
+                    )
+                })
+                .collect();
 
-                let mut game = Game::new(players);
-                game.play();
+            let mut game = Game::new(players);
+            game.play();
 
-                let points: Vec<isize> = game
-                    .players
-                    .into_iter()
-                    .map(|p| p.state.count_points())
-                    .collect();
-                let max_points = *points.iter().max().unwrap();
+            let points: Vec<isize> = game
+                .players
+                .into_iter()
+                .map(|p| p.state.count_points())
+                .collect();
+            let max_points = *points.iter().max().unwrap();
 
-                for (j, &di) in [first, second].iter().enumerate() {
-                    let p = points[j];
-                    let normalized = if max_points <= 0 {
-                        0.5
-                    } else {
-                        (p as f32).max(0.0) / max_points as f32
-                    };
-                    score[di] += normalized;
-                }
+            for (j, &di) in group.iter().enumerate() {
+                let p = points[j];
+                let normalized = if max_points <= 0 {
+                    0.25
+                } else {
+                    (p as f32).max(0.0) / max_points as f32
+                };
+                score[di] += normalized;
             }
         }
 
