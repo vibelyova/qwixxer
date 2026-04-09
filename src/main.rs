@@ -6,9 +6,10 @@ mod strategy;
 use game::Player;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use std::sync::Arc;
 
-fn main() {
-    println!("Training GA bot (population=40, 20 generations)...\n");
+fn train_and_bench() {
+    println!("Training GA bot (population=100, 200 generations)...\n");
     let mut pop = bot::Population::new(100, bot::default_genes(), 42);
     pop.evolve(200);
 
@@ -22,9 +23,18 @@ fn main() {
 
     for _ in 0..n {
         let mut game = game::Game::new(vec![
-            Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
-            Player::new(Box::<strategy::Conservative>::default(), Box::new(SmallRng::from_entropy())),
-            Player::new(Box::<strategy::Rusher>::default(), Box::new(SmallRng::from_entropy())),
+            Player::new(
+                Box::new(champion.clone()) as Box<dyn strategy::Strategy>,
+                Box::new(SmallRng::from_entropy()),
+            ),
+            Player::new(
+                Box::<strategy::Conservative>::default(),
+                Box::new(SmallRng::from_entropy()),
+            ),
+            Player::new(
+                Box::<strategy::Rusher>::default(),
+                Box::new(SmallRng::from_entropy()),
+            ),
         ]);
         game.play();
 
@@ -48,4 +58,40 @@ fn main() {
             total_pts[i] as f64 / n as f64
         );
     }
+}
+
+fn main() {
+    if std::env::args().any(|a| a == "--train") {
+        train_and_bench();
+        return;
+    }
+
+    let champion = match bot::DNA::load_weights("champion.txt", Arc::new(bot::default_genes())) {
+        Ok(dna) => {
+            println!("Loaded champion from champion.txt");
+            dna.print_weights();
+            dna
+        }
+        Err(_) => {
+            println!("No champion.txt found, training...\n");
+            let mut pop = bot::Population::new(100, bot::default_genes(), 42);
+            pop.evolve(200);
+            pop.current_champion().clone()
+        }
+    };
+
+    println!();
+    let mut game = game::Game::new(vec![
+        Player::new(
+            Box::new(champion) as Box<dyn strategy::Strategy>,
+            Box::new(SmallRng::from_entropy()),
+        ),
+        Player::new(
+            Box::<strategy::Interactive>::default(),
+            Box::new(SmallRng::from_entropy()),
+        ),
+    ]);
+
+    game.play();
+    game.print_game_over();
 }
