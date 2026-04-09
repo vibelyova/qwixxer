@@ -11,16 +11,30 @@ use rand::{prelude::*, rngs::SmallRng, Rng};
 
 pub type GeneFn = fn(&State) -> f64;
 
-pub const GENE_NAMES: [&str; 5] = [
+pub const GENE_NAMES: [&str; 4] = [
+    "weighted_prob",
+    "strikes",
     "concentration",
     "blanks",
-    "strikes",
-    "lockable_rows",
-    "probability",
 ];
 
 pub fn default_genes() -> Vec<GeneFn> {
     vec![
+        // weighted_probability: sum of P(rolling free) * (total + 1) per active row
+        |state| {
+            state
+                .row_free_values()
+                .iter()
+                .zip(state.row_totals().iter())
+                .map(|(&free, &total)| {
+                    let Some(f) = free else { return 0.0 };
+                    let ways = 6.0 - (7.0f64 - f as f64).abs();
+                    ways / 36.0 * (total as f64 + 1.0)
+                })
+                .sum()
+        },
+        // strikes
+        |state| state.strikes as f64,
         // concentration: sum of row totals squared
         |state| {
             state
@@ -31,12 +45,6 @@ pub fn default_genes() -> Vec<GeneFn> {
         },
         // blanks: skipped positions
         |state| state.blanks() as f64,
-        // strikes
-        |state| state.strikes as f64,
-        // lockable_rows: rows with 5+ marks (ready to lock)
-        |state| state.lockable_rows() as f64,
-        // probability: chance of useful opponent roll
-        |state| state.probability() as f64,
     ]
 }
 

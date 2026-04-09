@@ -55,6 +55,10 @@ impl State {
         core::array::from_fn(|i| self.rows[i].total)
     }
 
+    pub fn row_free_values(&self) -> [Option<u8>; 4] {
+        core::array::from_fn(|i| self.rows[i].free)
+    }
+
     pub fn count_locked(&self) -> u8 {
         self.rows.iter().map(|row| row.free.is_none() as u8).sum()
     }
