@@ -1,4 +1,5 @@
 use itertools::Itertools;
+use std::fmt;
 
 #[derive(Debug, Clone, Copy)]
 pub struct State {
@@ -281,6 +282,115 @@ impl std::str::FromStr for Move {
             }
         }
     }
+}
+
+// ---- Display ----
+
+const ROW_COLORS: [&str; 4] = ["\x1b[91m", "\x1b[93m", "\x1b[92m", "\x1b[94m"];
+const ROW_NAMES: [&str; 4] = ["RED", "YLW", "GRN", "BLU"];
+const DIM: &str = "\x1b[2m";
+const BOLD: &str = "\x1b[1m";
+const RESET: &str = "\x1b[0m";
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        writeln!(f, "{DIM}──────────────────────────────────────────────{RESET}")?;
+
+        for (i, row) in self.rows.iter().enumerate() {
+            let numbers: Vec<u8> = if row.ascending {
+                (2..=12).collect()
+            } else {
+                (2..=12).rev().collect()
+            };
+
+            write!(f, "  {BOLD}{}{:<4}{RESET}", ROW_COLORS[i], ROW_NAMES[i])?;
+
+            for &n in &numbers {
+                let is_available = match row.free {
+                    None => false,
+                    Some(free) => {
+                        if row.ascending {
+                            n >= free
+                        } else {
+                            n <= free
+                        }
+                    }
+                };
+
+                let is_lock_number = (row.ascending && n == 12) || (!row.ascending && n == 2);
+
+                if !is_available {
+                    write!(f, " {DIM}·{RESET} ")?;
+                } else if is_lock_number && row.total < 5 {
+                    write!(f, "{DIM}{:>2}{RESET} ", n)?;
+                } else {
+                    write!(f, "{}{BOLD}{:>2}{RESET} ", ROW_COLORS[i], n)?;
+                }
+            }
+
+            if row.free.is_none() {
+                writeln!(f, "  {DIM}LOCKED{RESET}")?;
+            } else {
+                writeln!(f, "  {}{}{RESET}", ROW_COLORS[i], row.total)?;
+            }
+        }
+
+        writeln!(f, "{DIM}──────────────────────────────────────────────{RESET}")?;
+
+        write!(f, "  Strikes ")?;
+        for i in 0..4u8 {
+            if i < self.strikes {
+                write!(f, "\x1b[91m✗{RESET} ")?;
+            } else {
+                write!(f, "{DIM}·{RESET} ")?;
+            }
+        }
+
+        let points = self.count_points();
+        writeln!(f, "                Score: {BOLD}{points}{RESET}")?;
+
+        write!(f, "{DIM}──────────────────────────────────────────────{RESET}")?;
+
+        Ok(())
+    }
+}
+
+impl fmt::Display for Mark {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let color = ROW_COLORS[self.row];
+        let name = ROW_NAMES[self.row];
+        write!(f, "{BOLD}{color}{name} {}{RESET}", self.number)
+    }
+}
+
+impl fmt::Display for Move {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Move::Strike => write!(f, "{BOLD}\x1b[91m✗ Strike{RESET}"),
+            Move::Single(mark) => write!(f, "{mark}"),
+            Move::Double(m1, m2) => write!(f, "{m1} + {m2}"),
+        }
+    }
+}
+
+const DICE_COLORS: [&str; 6] = [
+    "\x1b[97m", "\x1b[97m", // white dice
+    "\x1b[91m", "\x1b[93m", // red, yellow
+    "\x1b[92m", "\x1b[94m", // green, blue
+];
+const DICE_NAMES: [&str; 6] = ["W", "W", "R", "Y", "G", "B"];
+
+pub fn format_dice(dice: [u8; 6]) -> String {
+    let mut s = String::from("  Dice  ");
+    for (i, &d) in dice.iter().enumerate() {
+        s += &format!(
+            "{BOLD}{}{}:{}{RESET} ",
+            DICE_COLORS[i], DICE_NAMES[i], d
+        );
+    }
+    let white_sum = dice[0] + dice[1];
+    s += &format!("  {DIM}(white sum: {BOLD}{white_sum}{RESET}{DIM}){RESET}");
+    s
 }
 
 #[cfg(test)]
