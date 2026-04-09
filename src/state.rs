@@ -359,7 +359,7 @@ impl fmt::Display for Mark {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let color = ROW_COLORS[self.row];
         let name = ROW_NAMES[self.row];
-        write!(f, "{BOLD}{color}{name} {}{RESET}", self.number)
+        write!(f, "{BOLD}{color}{name} {:>2}{RESET}", self.number)
     }
 }
 

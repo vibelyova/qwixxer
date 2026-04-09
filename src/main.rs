@@ -15,7 +15,8 @@ fn main() {
         ),
         Player::new(
             Box::<strategy::Interactive>::default(),
-            Box::new(game::ManualDice),
+            //Box::new(game::ManualDice),
+            Box::new(SmallRng::from_entropy()),
         ),
     ]);
 

@@ -16,19 +16,86 @@ pub struct Interactive;
 
 impl Interactive {
     fn show_moves(moves: &[Move]) {
-        println!("  {DIM}Available moves:{RESET}");
-        for (i, mov) in moves.iter().enumerate() {
-            println!("    {DIM}{:>2}){RESET} {mov}", i + 1);
+        let singles: Vec<_> = moves
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m, Move::Single(_)))
+            .collect();
+        let doubles: Vec<_> = moves
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m, Move::Double(_, _)))
+            .collect();
+
+        let w = if moves.len() >= 10 { 2 } else { 1 };
+
+        if !singles.is_empty() {
+            print!("  {DIM}Single:{RESET} ");
+            for (i, mov) in &singles {
+                print!(" {DIM}{:>w$}){RESET} {mov}", i + 1);
+            }
+            println!();
         }
+        if !doubles.is_empty() {
+            print!("  {DIM}Both:{RESET}   ");
+            let per_line = 3;
+            for (j, (i, mov)) in doubles.iter().enumerate() {
+                if j > 0 && j % per_line == 0 {
+                    print!("\n          ");
+                }
+                print!(" {DIM}{:>w$}){RESET} {mov}", i + 1);
+            }
+            println!();
+        }
+        println!("  {DIM}{:>w$}) {BOLD}\x1b[91m✗ Strike{RESET}", "S");
     }
 
-    fn read_move() -> String {
+    fn read_line() -> String {
         use std::io::{self, Write};
         print!("  {BOLD}> {RESET}");
         io::stdout().flush().unwrap();
         let mut input = String::new();
         io::stdin().read_line(&mut input).unwrap();
         input
+    }
+
+    fn pick_move(moves: &[Move]) -> Move {
+        println!("\n  {DIM}Enter number or s for strike:{RESET}");
+        loop {
+            let input = Self::read_line();
+            let input = input.trim();
+            if input.eq_ignore_ascii_case("s") {
+                return Move::Strike;
+            }
+            if let Ok(n) = input.parse::<usize>() {
+                if n >= 1 && n <= moves.len() {
+                    if let Some(mov) = moves.get(n - 1) {
+                        return *mov;
+                    }
+                }
+            }
+            println!("  \x1b[91mInvalid. Enter a number 1-{} or s.{RESET}", moves.len());
+        }
+    }
+
+    fn pick_opponent_move(moves: &[Move]) -> Option<Move> {
+        println!("\n  {DIM}Enter number or Enter to skip:{RESET}");
+        loop {
+            let input = Self::read_line();
+            let input = input.trim();
+            if input.is_empty() {
+                println!("  {DIM}Skipped.{RESET}");
+                return None;
+            }
+            if let Ok(n) = input.parse::<usize>() {
+                if n >= 1 && n <= moves.len() {
+                    if let Some(mov) = moves.get(n - 1) {
+                        return Some(*mov);
+                    }
+                }
+            }
+            println!("  \x1b[91mInvalid. Enter 1-{} or Enter to skip.{RESET}", moves.len());
+        }
     }
 }
 
@@ -39,18 +106,13 @@ impl Strategy for Interactive {
         println!("{}", format_dice(dice));
         println!();
 
-        let mut moves = state.generate_moves(dice);
-        moves.push(Move::Strike);
-        Self::show_moves(&moves);
-
-        println!("\n  {DIM}Enter move (e.g. r5, r5 g10, strike):{RESET}");
-        loop {
-            let input = Self::read_move();
-            match input.trim().parse::<Move>() {
-                Ok(mov) => return mov,
-                Err(e) => println!("  {}\x1b[91m{e}{RESET}", ""),
-            }
+        let moves = state.generate_moves(dice);
+        if moves.is_empty() {
+            println!("  {DIM}No moves available — strike.{RESET}");
+            return Move::Strike;
         }
+        Self::show_moves(&moves);
+        Self::pick_move(&moves)
     }
 
     fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
@@ -71,15 +133,14 @@ impl Strategy for Interactive {
             return None;
         }
 
-        Self::show_moves(&moves);
-        println!("\n  {DIM}Enter move or press Enter to skip:{RESET}");
-
-        let input = Self::read_move();
-        if input.trim().is_empty() {
-            println!("  {DIM}Skipped.{RESET}");
-            return None;
+        // Opponent moves are always singles, show compact
+        print!("  {DIM}Mark:{RESET} ");
+        for (i, mov) in moves.iter().enumerate() {
+            print!(" {DIM}{}){RESET} {mov}", i + 1);
         }
-        input.trim().parse().ok()
+        println!();
+
+        Self::pick_opponent_move(&moves)
     }
 }
 
