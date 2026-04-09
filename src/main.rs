@@ -61,17 +61,20 @@ fn train_and_bench() {
 }
 
 fn bench() {
+    let genes = Arc::new(bot::default_genes());
+    let champion = bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt found");
+
     let n = 10_000;
-    let names = ["Conservative 1", "Conservative 2", "Opportunist 1", "Opportunist 2"];
+    let names = ["Opportunist 1", "Opportunist 2", "GA Bot 1", "GA Bot 2"];
     let mut wins = [0u32; 4];
     let mut total_pts = [0i64; 4];
 
     for _ in 0..n {
         let mut game = game::Game::new(vec![
-            Player::new(Box::<strategy::Conservative>::default(), Box::new(SmallRng::from_entropy())),
-            Player::new(Box::<strategy::Conservative>::default(), Box::new(SmallRng::from_entropy())),
             Player::new(Box::<strategy::Opportunist>::default(), Box::new(SmallRng::from_entropy())),
             Player::new(Box::<strategy::Opportunist>::default(), Box::new(SmallRng::from_entropy())),
+            Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+            Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
         ]);
         game.play();
 
