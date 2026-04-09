@@ -1,9 +1,17 @@
 use itertools::Itertools;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct State {
     pub strikes: u8,
     rows: [Row; 4],
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Row {
+    ascending: bool,
+    total: u8,
+    // None if locked, otherwise next free number
+    free: Option<u8>,
 }
 
 impl Default for State {
@@ -72,7 +80,7 @@ impl State {
     }
 
     // For opponent's move you can use [on_white, 0, 0, 0, 0, 0].
-    // This method ignores the strike move.
+    // This method ignores the `Strike` move.
     pub fn generate_moves(&self, dice: [u8; 6]) -> Vec<Move> {
         let (white, color) = dice.split_at(2);
         let on_white: u8 = white.iter().sum();
@@ -122,14 +130,16 @@ impl State {
             .collect()
     }
 
-    // Metrics //
+    //////////////////////////////////////
+    // Metrics ///////////////////////////
+    //////////////////////////////////////
 
     pub fn blanks(&self) -> u8 {
         self.rows
             .iter()
             .map(|row| {
                 let Some(free) = row.free else {
-                    // if the row is locked, we don't care about blanks
+                    // if the row is locked, we don't care
                     return 0;
                 };
                 if row.ascending {
@@ -151,14 +161,12 @@ impl State {
             .sum::<usize>() as f32
             / 36.0
     }
-}
 
-#[derive(Debug, Clone, Copy, Default)]
-struct Row {
-    ascending: bool,
-    total: u8,
-    // None if locked, otherwise next free number
-    free: Option<u8>,
+    // Probability that at least one of N opponents will roll a number I can mark with no blanks.
+    pub fn probability_n(&self, n: u8) -> f32 {
+        let p = self.probability();
+        1.0 - (1.0 - p).powi(n as i32)
+    }
 }
 
 impl Row {

@@ -23,14 +23,44 @@ impl Player {
     }
 }
 
+trait DiceSource: std::fmt::Debug {
+    fn roll(&mut self) -> [u8; 6];
+}
+
+impl DiceSource for SmallRng {
+    fn roll(&mut self) -> [u8; 6] {
+        core::array::from_fn(|_| self.gen_range(1..=6))
+    }
+}
+
+#[derive(Debug)]
+pub struct ManualDice;
+
+impl DiceSource for ManualDice {
+    fn roll(&mut self) -> [u8; 6] {
+        use std::io::{self, Write};
+        print!("Enter dice WWRYGB: ");
+        io::stdout().flush().unwrap();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        input
+            .trim()
+            .chars()
+            .map(|ch| ch.to_digit(10).unwrap() as u8)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap()
+    }
+}
+
 #[derive(Debug)]
 pub struct Game {
     pub players: Vec<Player>,
-    rng: SmallRng,
+    dice: Box<dyn DiceSource>,
 }
 
 impl Game {
-    pub fn new(players: Vec<Box<dyn Strategy>>) -> Self {
+    pub fn new_rng(players: Vec<Box<dyn Strategy>>) -> Self {
         Self {
             players: players
                 .into_iter()
@@ -39,14 +69,27 @@ impl Game {
                     state: State::default(),
                 })
                 .collect(),
-            rng: SmallRng::from_entropy(),
+            dice: Box::new(SmallRng::from_entropy()),
+        }
+    }
+
+    pub fn new_manual(players: Vec<Box<dyn Strategy>>) -> Self {
+        Self {
+            players: players
+                .into_iter()
+                .map(|strategy| Player {
+                    strategy,
+                    state: State::default(),
+                })
+                .collect(),
+            dice: Box::new(ManualDice),
         }
     }
 
     pub fn play(&mut self) {
         let mut active_player = 0;
         while !self.game_over() {
-            let dice: [u8; 6] = core::array::from_fn(|_| self.rng.gen_range(1..=6));
+            let dice = self.dice.roll();
             let on_white = dice[0] + dice[1];
 
             self.players[active_player].your_move(dice);
@@ -55,7 +98,10 @@ impl Game {
             for index in 1..self.players.len() {
                 let opponent = (active_player + index) % self.players.len();
                 self.players[opponent].opponents_move(on_white, new_locked);
-                new_locked = self.players[opponent].state.locked();
+
+                for (row, locked) in self.players[opponent].state.locked().iter().enumerate() {
+                    new_locked[row] |= *locked;
+                }
             }
 
             for player in self.players.iter_mut() {
