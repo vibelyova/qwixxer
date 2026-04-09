@@ -79,8 +79,17 @@ impl State {
             - self.strikes as isize * 5
     }
 
-    // For opponent's move you can use [on_white, 0, 0, 0, 0, 0].
-    // This method ignores the `Strike` move.
+    // Generate moves for an opponent's turn (white dice sum only, single mark).
+    pub fn generate_opponent_moves(&self, number: u8) -> Vec<Move> {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.can_mark(number))
+            .map(|(i, _)| Move::from((i, number)))
+            .collect()
+    }
+
+    // Generate moves for the active player's turn. Does not include `Strike`.
     pub fn generate_moves(&self, dice: [u8; 6]) -> Vec<Move> {
         let (white, color) = dice.split_at(2);
         let on_white: u8 = white.iter().sum();

@@ -68,7 +68,7 @@ impl Strategy for Random {
     }
 
     fn opponents_move(&mut self, state: &State, number: u8, _locked: [bool; 4]) -> Option<Move> {
-        let moves = state.generate_moves([number, 0, 0, 0, 0, 0]);
+        let moves = state.generate_opponent_moves(number);
         if !moves.is_empty() {
             let mut rng = rand::thread_rng();
             Some(moves[rng.gen_range(0..moves.len())])

@@ -1,4 +1,4 @@
-use crate::game::Game;
+use crate::game::{Game, Player};
 use crate::state::Move;
 use crate::state::State;
 use crate::strategy::Strategy;
@@ -28,7 +28,7 @@ impl Strategy for DNA {
     }
 
     fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
-        let moves = state.generate_moves([number, 0, 0, 0, 0, 0]);
+        let moves = state.generate_opponent_moves(number);
 
         let mut states = moves
             .into_iter()
@@ -138,11 +138,17 @@ impl Population {
             .chunks(4)
             .into_iter()
             .for_each(|chunk| {
-                let (indexes, bots): (Vec<_>, Vec<_>) = chunk
+                let (indexes, players): (Vec<_>, Vec<_>) = chunk
                     .into_iter()
-                    .map(|(i, bot)| (i, Box::new(bot) as Box<dyn Strategy>))
+                    .map(|(i, bot)| {
+                        let player = Player::new(
+                            Box::new(bot) as Box<dyn Strategy>,
+                            Box::new(SmallRng::from_entropy()),
+                        );
+                        (i, player)
+                    })
                     .unzip();
-                let mut game = Game::new_rng(bots);
+                let mut game = Game::new(players);
                 game.play();
                 let points = game
                     .players
@@ -150,10 +156,14 @@ impl Population {
                     .map(|p| p.state.count_points())
                     .collect_vec();
                 let max_points = *points.iter().max().unwrap();
-                let points = points
-                    .into_iter()
-                    .map(|p| (p as f32).max(0.0) / (max_points as f32))
-                    .collect_vec();
+                let points = if max_points <= 0 {
+                    vec![1.0 / points.len() as f32; points.len()]
+                } else {
+                    points
+                        .into_iter()
+                        .map(|p| (p as f32).max(0.0) / (max_points as f32))
+                        .collect_vec()
+                };
 
                 for (dna_index, sc) in indexes.into_iter().zip(points.into_iter()) {
                     score[dna_index] += sc;
@@ -215,11 +225,11 @@ impl Population {
         println!("Evolution complete");
     }
 
-    pub fn champion(&self, rank: &[u32]) -> DNA {
+    pub fn champion(&self, rank: &[f32]) -> DNA {
         self.dna
             .iter()
             .enumerate()
-            .max_by_key(|(index, _)| rank[*index])
+            .max_by(|(a, _), (b, _)| rank[*a].partial_cmp(&rank[*b]).unwrap())
             .unwrap()
             .1
             .clone()

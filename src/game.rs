@@ -3,27 +3,7 @@ use crate::strategy::Strategy;
 
 use rand::{prelude::*, rngs::SmallRng, Rng};
 
-#[derive(Debug)]
-pub struct Player {
-    strategy: Box<dyn Strategy>,
-    pub state: State,
-}
-
-impl Player {
-    fn your_move(&mut self, dice: [u8; 6]) {
-        let mov = self.strategy.your_move(&self.state, dice);
-        self.state.apply_move(mov);
-    }
-
-    fn opponents_move(&mut self, number: u8, locked: [bool; 4]) {
-        if let Some(mov) = self.strategy.opponents_move(&self.state, number, locked) {
-            self.state.apply_move(mov);
-        }
-        self.state.lock(locked);
-    }
-}
-
-trait DiceSource: std::fmt::Debug {
+pub trait DiceSource: std::fmt::Debug {
     fn roll(&mut self) -> [u8; 6];
 }
 
@@ -54,42 +34,52 @@ impl DiceSource for ManualDice {
 }
 
 #[derive(Debug)]
-pub struct Game {
-    pub players: Vec<Player>,
+pub struct Player {
+    strategy: Box<dyn Strategy>,
+    pub state: State,
     dice: Box<dyn DiceSource>,
 }
 
-impl Game {
-    pub fn new_rng(players: Vec<Box<dyn Strategy>>) -> Self {
+impl Player {
+    pub fn new(strategy: Box<dyn Strategy>, dice: Box<dyn DiceSource>) -> Self {
         Self {
-            players: players
-                .into_iter()
-                .map(|strategy| Player {
-                    strategy,
-                    state: State::default(),
-                })
-                .collect(),
-            dice: Box::new(SmallRng::from_entropy()),
+            strategy,
+            state: State::default(),
+            dice,
         }
     }
 
-    pub fn new_manual(players: Vec<Box<dyn Strategy>>) -> Self {
-        Self {
-            players: players
-                .into_iter()
-                .map(|strategy| Player {
-                    strategy,
-                    state: State::default(),
-                })
-                .collect(),
-            dice: Box::new(ManualDice),
+    fn roll(&mut self) -> [u8; 6] {
+        self.dice.roll()
+    }
+
+    fn your_move(&mut self, dice: [u8; 6]) {
+        let mov = self.strategy.your_move(&self.state, dice);
+        self.state.apply_move(mov);
+    }
+
+    fn opponents_move(&mut self, number: u8, locked: [bool; 4]) {
+        if let Some(mov) = self.strategy.opponents_move(&self.state, number, locked) {
+            self.state.apply_move(mov);
         }
+        self.state.lock(locked);
+    }
+}
+
+#[derive(Debug)]
+pub struct Game {
+    pub players: Vec<Player>,
+}
+
+impl Game {
+    pub fn new(players: Vec<Player>) -> Self {
+        Self { players }
     }
 
     pub fn play(&mut self) {
         let mut active_player = 0;
         while !self.game_over() {
-            let dice = self.dice.roll();
+            let dice = self.players[active_player].roll();
             let on_white = dice[0] + dice[1];
 
             self.players[active_player].your_move(dice);
