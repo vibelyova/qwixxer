@@ -1,7 +1,7 @@
 use crate::game::{Game, Player};
 use crate::state::Move;
 use crate::state::State;
-use crate::strategy::Strategy;
+use crate::strategy::{Conservative, Rusher, Strategy};
 use itertools::Itertools;
 use rand::distributions::WeightedIndex;
 use std::sync::Arc;
@@ -135,6 +135,31 @@ impl DNA {
         println!("[{}]", pairs.join("  "));
     }
 
+    pub fn save_weights(&self, path: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        for (name, w) in GENE_NAMES.iter().zip(self.weights.iter()) {
+            writeln!(f, "{name} {w}")?;
+        }
+        Ok(())
+    }
+
+    pub fn load_weights(path: &str, genes: Arc<Vec<GeneFn>>) -> std::io::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let weights: Vec<f64> = content
+            .lines()
+            .map(|line| {
+                line.split_whitespace()
+                    .last()
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(weights.len(), genes.len(), "Weight count mismatch");
+        Ok(DNA { weights, genes })
+    }
+
     pub fn instinct(&self, state: &State) -> f64 {
         self.genes
             .iter()
@@ -172,51 +197,55 @@ impl Population {
         let mut indices: Vec<usize> = (0..self.dna.len()).collect();
         indices.shuffle(&mut self.rng);
 
-        // Pad to multiple of 4 by repeating random picks
-        while indices.len() % 4 != 0 {
-            indices.push(self.rng.gen_range(0..self.dna.len()));
-        }
-
         let mut score = vec![0.0f32; self.dna.len()];
         let mut game_rng = SmallRng::seed_from_u64(seed);
 
-        indices
-            .into_iter()
-            .map(|i| (i, self.dna[i].clone()))
-            .chunks(4)
-            .into_iter()
-            .for_each(|chunk| {
-                let (indexes, players): (Vec<_>, Vec<_>) = chunk
-                    .into_iter()
-                    .map(|(i, bot)| {
-                        let player = Player::new(
-                            Box::new(bot) as Box<dyn Strategy>,
-                            Box::new(SmallRng::from_rng(&mut game_rng).unwrap()),
-                        );
-                        (i, player)
-                    })
-                    .unzip();
-                let mut game = Game::new(players);
-                game.play();
-                let points: Vec<isize> = game
-                    .players
-                    .into_iter()
-                    .map(|p| p.state.count_points())
-                    .collect();
-                let max_points = *points.iter().max().unwrap();
-                let normalized = if max_points <= 0 {
-                    vec![1.0 / indexes.len() as f32; indexes.len()]
-                } else {
-                    points
-                        .into_iter()
-                        .map(|p| (p as f32).max(0.0) / (max_points as f32))
-                        .collect_vec()
-                };
+        // Each game: 2 DNA bots + 1 Conservative + 1 Rusher
+        for pair in indices.chunks(2) {
+            let dna_indices: Vec<usize> = if pair.len() == 2 {
+                vec![pair[0], pair[1]]
+            } else {
+                // Odd population: pad with a random pick
+                vec![pair[0], self.rng.gen_range(0..self.dna.len())]
+            };
 
-                for (dna_index, sc) in indexes.into_iter().zip(normalized.into_iter()) {
-                    score[dna_index] += sc;
-                }
-            });
+            let mut players = Vec::with_capacity(4);
+            for &i in &dna_indices {
+                players.push(Player::new(
+                    Box::new(self.dna[i].clone()) as Box<dyn Strategy>,
+                    Box::new(SmallRng::from_rng(&mut game_rng).unwrap()),
+                ));
+            }
+            players.push(Player::new(
+                Box::<Conservative>::default(),
+                Box::new(SmallRng::from_rng(&mut game_rng).unwrap()),
+            ));
+            players.push(Player::new(
+                Box::<Rusher>::default(),
+                Box::new(SmallRng::from_rng(&mut game_rng).unwrap()),
+            ));
+
+            let mut game = Game::new(players);
+            game.play();
+
+            let points: Vec<isize> = game
+                .players
+                .into_iter()
+                .map(|p| p.state.count_points())
+                .collect();
+            let max_points = *points.iter().max().unwrap();
+
+            // Only score the DNA bots (first 2 players)
+            for (j, &di) in dna_indices.iter().enumerate() {
+                let p = points[j];
+                let normalized = if max_points <= 0 {
+                    0.25
+                } else {
+                    (p as f32).max(0.0) / max_points as f32
+                };
+                score[di] += normalized;
+            }
+        }
 
         score
     }
@@ -266,6 +295,11 @@ impl Population {
             best.print_weights();
         }
         println!("Evolution complete.");
+        if let Err(e) = self.dna[0].save_weights("champion.txt") {
+            eprintln!("Failed to save weights: {e}");
+        } else {
+            println!("Champion saved to champion.txt");
+        }
     }
 
     pub fn champion(&self, rank: &[f32]) -> DNA {
