@@ -52,6 +52,7 @@ pub fn default_genes() -> Vec<GeneFn> {
 pub struct DNA {
     weights: Vec<f64>,
     genes: Arc<Vec<GeneFn>>,
+    pub lookahead: bool,
 }
 
 impl DNA {
@@ -63,6 +64,47 @@ impl DNA {
             new_state.apply_move(mov);
             new_state.count_locked() > current_locked
         })
+    }
+
+    /// Expected instinct after one opponent turn: average over all possible
+    /// white sums, picking the best mark (or no mark) for each.
+    fn expected_instinct(&self, state: &State) -> f64 {
+        let mut expected = 0.0;
+        for white_sum in 2..=12u8 {
+            let ways = 6.0 - (7.0f64 - white_sum as f64).abs();
+            let prob = ways / 36.0;
+
+            let moves = state.generate_opponent_moves(white_sum);
+
+            // Always lock if possible
+            if let Some(lock_mov) = Self::find_locking_move(state, &moves) {
+                let mut s = *state;
+                s.apply_move(lock_mov);
+                expected += prob * self.instinct(&s);
+                continue;
+            }
+
+            // Try each possible mark and no-mark, pick best
+            let mut best = self.instinct(state);
+            for mov in moves {
+                let mut s = *state;
+                s.apply_move(mov);
+                let score = self.instinct(&s);
+                if score > best {
+                    best = score;
+                }
+            }
+            expected += prob * best;
+        }
+        expected
+    }
+
+    fn score_state(&self, state: &State) -> f64 {
+        if self.lookahead {
+            self.expected_instinct(state)
+        } else {
+            self.instinct(state)
+        }
     }
 }
 
@@ -83,7 +125,7 @@ impl Strategy for DNA {
             .map(|mov| {
                 let mut new_state = *state;
                 new_state.apply_move(mov);
-                (self.instinct(&new_state), mov)
+                (self.score_state(&new_state), mov)
             })
             .max_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap())
             .unwrap()
@@ -124,7 +166,12 @@ impl Strategy for DNA {
 impl DNA {
     pub fn new_random(genes: Arc<Vec<GeneFn>>, rng: &mut impl Rng) -> Self {
         let weights: Vec<f64> = (0..genes.len()).map(|_| rng.gen_range(-1.0..=1.0)).collect();
-        DNA { weights, genes }.normalize()
+        DNA {
+            weights,
+            genes,
+            lookahead: false,
+        }
+        .normalize()
     }
 
     fn normalize(mut self) -> Self {
@@ -146,6 +193,7 @@ impl DNA {
         DNA {
             weights,
             genes: Arc::clone(&self.genes),
+            lookahead: self.lookahead,
         }
         .normalize()
     }
@@ -190,7 +238,11 @@ impl DNA {
             })
             .collect();
         assert_eq!(weights.len(), genes.len(), "Weight count mismatch");
-        Ok(DNA { weights, genes })
+        Ok(DNA {
+            weights,
+            genes,
+            lookahead: false,
+        })
     }
 
     pub fn instinct(&self, state: &State) -> f64 {

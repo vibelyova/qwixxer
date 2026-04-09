@@ -62,19 +62,20 @@ fn train_and_bench() {
 
 fn bench() {
     let genes = Arc::new(bot::default_genes());
-    let champion = bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt found");
+    let mut champion =
+        bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt found");
+    champion.lookahead = true;
 
     let n = 10_000;
-    let names = ["Opportunist 1", "Opportunist 2", "GA Bot 1", "GA Bot 2"];
-    let mut wins = [0u32; 4];
-    let mut total_pts = [0i64; 4];
+    let names = ["GA Bot", "Conservative", "Rusher"];
+    let mut wins = [0u32; 3];
+    let mut total_pts = [0i64; 3];
 
     for _ in 0..n {
         let mut game = game::Game::new(vec![
-            Player::new(Box::<strategy::Opportunist>::default(), Box::new(SmallRng::from_entropy())),
-            Player::new(Box::<strategy::Opportunist>::default(), Box::new(SmallRng::from_entropy())),
             Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
-            Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+            Player::new(Box::<strategy::Conservative>::default(), Box::new(SmallRng::from_entropy())),
+            Player::new(Box::<strategy::Rusher>::default(), Box::new(SmallRng::from_entropy())),
         ]);
         game.play();
 
@@ -88,10 +89,10 @@ fn bench() {
         }
     }
 
-    println!("Results over {n} 4-player games:");
-    for i in 0..4 {
+    println!("Results over {n} 3-player games (lookahead enabled):");
+    for i in 0..3 {
         println!(
-            "  {:<16} {:>5} wins ({:>4.1}%)  avg {:.1} pts",
+            "  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts",
             names[i],
             wins[i],
             wins[i] as f64 / n as f64 * 100.0,
@@ -112,8 +113,9 @@ fn main() {
     }
 
     let champion = match bot::DNA::load_weights("champion.txt", Arc::new(bot::default_genes())) {
-        Ok(dna) => {
-            println!("Loaded champion from champion.txt");
+        Ok(mut dna) => {
+            dna.lookahead = true;
+            println!("Loaded champion from champion.txt (lookahead enabled)");
             dna.print_weights();
             dna
         }
