@@ -4,86 +4,92 @@ use crate::state::State;
 use crate::strategy::Strategy;
 use itertools::Itertools;
 use rand::distributions::WeightedIndex;
+use std::sync::Arc;
 
 use rand::{prelude::*, rngs::SmallRng, Rng};
-static GENES: [Box<dyn Gene + Sync>; 0] = [];
+
+pub type GeneFn = fn(&State) -> f64;
+
+#[derive(Clone, Debug)]
+pub struct DNA {
+    weights: Vec<f64>,
+    genes: Arc<Vec<GeneFn>>,
+}
 
 impl Strategy for DNA {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
         let mut moves = state.generate_moves(dice);
         moves.push(Move::Strike);
 
-        let states = moves.into_iter().map(|mov| {
-            let mut new_state = state.clone();
-            new_state.apply_move(mov);
-            (new_state, mov)
-        });
-
-        let mov = states
-            .map(|(state, mov)| (self.instinct(&state), mov))
+        moves
+            .into_iter()
+            .map(|mov| {
+                let mut new_state = *state;
+                new_state.apply_move(mov);
+                (self.instinct(&new_state), mov)
+            })
             .max_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap())
-            .unwrap();
-
-        mov.1
+            .unwrap()
+            .1
     }
 
     fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
         let moves = state.generate_opponent_moves(number);
 
-        let mut states = moves
+        let mut states: Vec<_> = moves
             .into_iter()
             .map(|mov| {
-                let mut new_state = state.clone();
+                let mut new_state = *state;
                 new_state.apply_move(mov);
                 (new_state, Some(mov))
             })
-            .collect::<Vec<_>>();
+            .collect();
         states.push((*state, None));
 
         for (state, _) in states.iter_mut() {
             state.lock(locked);
         }
 
-        let mov = states
+        *states
             .iter()
-            .map(|(state, mov)| (self.instinct(&state), mov))
+            .map(|(state, mov)| (self.instinct(state), mov))
             .max_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap())
-            .unwrap();
-
-        *mov.1
+            .unwrap()
+            .1
     }
 }
-
-pub trait Gene {
-    fn evaluate(&self, state: &State) -> f64;
-}
-
-// TODO: use arrays to reduce allocation
-#[derive(Clone, Debug, Default)]
-pub struct DNA(pub Vec<f64>);
 
 impl DNA {
-    pub fn new_random(size: usize, rng: &mut impl Rng) -> Self {
-        DNA((0..size).map(|_| rng.gen_range(-1.0..=1.0)).collect()).normalize()
+    pub fn new_random(genes: Arc<Vec<GeneFn>>, rng: &mut impl Rng) -> Self {
+        let weights: Vec<f64> = (0..genes.len()).map(|_| rng.gen_range(-1.0..=1.0)).collect();
+        DNA { weights, genes }.normalize()
     }
 
-    pub fn normalize(mut self) -> Self {
-        let norm = self.0.iter().map(|x| x * x).sum::<f64>().sqrt();
-        self.0.iter_mut().for_each(|x| *x /= norm);
+    fn normalize(mut self) -> Self {
+        let norm = self.weights.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm > 0.0 {
+            self.weights.iter_mut().for_each(|x| *x /= norm);
+        }
         self
     }
 
-    pub fn crossover(&self, other: &Self) -> Self {
-        debug_assert!(self.0.len() == other.0.len());
-        let mut child = Vec::with_capacity(self.0.len());
-        for (a, b) in self.0.iter().zip(other.0.iter()) {
-            child.push(*a + *b);
+    pub fn crossover(&self, other: &Self, rng: &mut impl Rng) -> Self {
+        debug_assert!(self.weights.len() == other.weights.len());
+        let weights: Vec<f64> = self
+            .weights
+            .iter()
+            .zip(other.weights.iter())
+            .map(|(a, b)| if rng.gen_bool(0.5) { *a } else { *b })
+            .collect();
+        DNA {
+            weights,
+            genes: Arc::clone(&self.genes),
         }
-        DNA(child).normalize()
+        .normalize()
     }
 
     pub fn mutate(mut self, rate: f64, rng: &mut impl Rng) -> Self {
-        for x in self.0.iter_mut() {
+        for x in self.weights.iter_mut() {
             if rng.gen_range(0.0..=1.0) < rate {
                 *x += rng.gen_range(-0.1..=0.1);
             }
@@ -92,45 +98,49 @@ impl DNA {
     }
 
     pub fn instinct(&self, state: &State) -> f64 {
-        GENES
+        self.genes
             .iter()
-            .zip(self.0.iter())
-            .map(|(gene, weight)| gene.evaluate(state) * weight)
+            .zip(self.weights.iter())
+            .map(|(gene, weight)| gene(state) * weight)
             .sum()
     }
 }
 
 pub struct Population {
+    genes: Arc<Vec<GeneFn>>,
     dna: Vec<DNA>,
     rng: SmallRng,
 }
 
 impl Population {
     pub fn single(dna: DNA) -> Self {
-        assert_eq!(GENES.len(), dna.0.len());
         Self {
+            genes: Arc::clone(&dna.genes),
             dna: vec![dna],
             rng: SmallRng::from_entropy(),
         }
     }
 
-    pub fn new(size: usize, genes: Vec<Box<dyn Gene + Sync>>, seed: u64) -> Self {
+    pub fn new(size: usize, genes: Vec<GeneFn>, seed: u64) -> Self {
         let mut rng = SmallRng::seed_from_u64(seed);
-        let mut dna = Vec::with_capacity(size);
-        for _ in 0..size {
-            dna.push(DNA::new_random(genes.len(), &mut rng));
-        }
-        Population { dna, rng }
+        let genes = Arc::new(genes);
+        let dna: Vec<DNA> = (0..size)
+            .map(|_| DNA::new_random(Arc::clone(&genes), &mut rng))
+            .collect();
+        Population { genes, dna, rng }
     }
 
     pub fn rank_generation(&mut self, seed: u64) -> Vec<f32> {
-        // TODO parallelize
-
-        // shuffle indices
         let mut indices: Vec<usize> = (0..self.dna.len()).collect();
         indices.shuffle(&mut self.rng);
 
-        let mut score = vec![0.0; self.dna.len()];
+        // Pad to multiple of 4 by repeating random picks
+        while indices.len() % 4 != 0 {
+            indices.push(self.rng.gen_range(0..self.dna.len()));
+        }
+
+        let mut score = vec![0.0f32; self.dna.len()];
+        let mut game_rng = SmallRng::seed_from_u64(seed);
 
         indices
             .into_iter()
@@ -143,21 +153,21 @@ impl Population {
                     .map(|(i, bot)| {
                         let player = Player::new(
                             Box::new(bot) as Box<dyn Strategy>,
-                            Box::new(SmallRng::from_entropy()),
+                            Box::new(SmallRng::from_rng(&mut game_rng).unwrap()),
                         );
                         (i, player)
                     })
                     .unzip();
                 let mut game = Game::new(players);
                 game.play();
-                let points = game
+                let points: Vec<isize> = game
                     .players
                     .into_iter()
                     .map(|p| p.state.count_points())
-                    .collect_vec();
+                    .collect();
                 let max_points = *points.iter().max().unwrap();
-                let points = if max_points <= 0 {
-                    vec![1.0 / points.len() as f32; points.len()]
+                let normalized = if max_points <= 0 {
+                    vec![1.0 / indexes.len() as f32; indexes.len()]
                 } else {
                     points
                         .into_iter()
@@ -165,7 +175,7 @@ impl Population {
                         .collect_vec()
                 };
 
-                for (dna_index, sc) in indexes.into_iter().zip(points.into_iter()) {
+                for (dna_index, sc) in indexes.into_iter().zip(normalized.into_iter()) {
                     score[dna_index] += sc;
                 }
             });
@@ -174,39 +184,34 @@ impl Population {
     }
 
     pub fn next_generation(&mut self) {
-        let mut new_dna = Vec::with_capacity(self.dna.len());
-        // Do X rankings for each generation
-        let mut global_rank = vec![0.0; self.dna.len()];
-        const NUMBER_OF_SIMULATIONS: usize = 10_000;
+        let mut global_rank = vec![0.0f32; self.dna.len()];
+        const NUMBER_OF_SIMULATIONS: usize = 500;
         for _ in 0..NUMBER_OF_SIMULATIONS {
-            // Seed is fixed for each generation
             let seed = self.rng.gen();
             let rank = self.rank_generation(seed);
-            // log::info!(
-            //     "Champion (score {}): {:?}",
-            //     *rank.iter().max().unwrap(),
-            //     self.champion(&rank)
-            // );
             global_rank
                 .iter_mut()
                 .zip(rank.iter())
                 .for_each(|(a, b)| *a += b);
         }
-        // log::info!(
-        //     "Champion (score {}): {:?}",
-        //     *global_rank.iter().max().unwrap() / NUMBER_OF_SIMULATIONS as u32,
-        //     self.champion(&global_rank)
-        // );
 
-        let dist = WeightedIndex::new(global_rank /* .into_iter().map(|x| x * x) */)
-            .expect("This generation is shit");
-        for _ in 0..self.dna.len() {
+        let dist = WeightedIndex::new(&global_rank).expect("All weights are zero");
+
+        // Elitism: carry the top individual forward unchanged
+        let champion_idx = global_rank
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap()
+            .0;
+        let mut new_dna = vec![self.dna[champion_idx].clone()];
+
+        for _ in 1..self.dna.len() {
             let a = dist.sample(&mut self.rng);
             let b = dist.sample(&mut self.rng);
-            // TODO: vanishing rate
             new_dna.push(
                 self.dna[a]
-                    .crossover(&self.dna[b])
+                    .crossover(&self.dna[b], &mut self.rng)
                     .mutate(0.2, &mut self.rng),
             );
         }
@@ -215,12 +220,10 @@ impl Population {
 
     pub fn evolve(&mut self, generations: usize) {
         for gen in 0..generations {
-            // log::info!("Growing generation #{gen}");
             println!("Growing generation #{gen}");
             let now = std::time::Instant::now();
             self.next_generation();
             println!("Generation #{gen} complete in {:?}", now.elapsed());
-            // log::info!("Generation grew up in {:?}", now.elapsed());
         }
         println!("Evolution complete");
     }
