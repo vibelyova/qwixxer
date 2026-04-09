@@ -1,7 +1,7 @@
 use crate::game::{Game, Player};
 use crate::state::Move;
 use crate::state::State;
-use crate::strategy::{Conservative, Rusher, Strategy};
+use crate::strategy::Strategy;
 use itertools::Itertools;
 use rand::distributions::WeightedIndex;
 use rayon::prelude::*;
@@ -223,38 +223,21 @@ impl Population {
         let mut indices: Vec<usize> = (0..dna.len()).collect();
         indices.shuffle(&mut rng);
 
+        // Pad to multiple of 4
+        while indices.len() % 4 != 0 {
+            indices.push(rng.gen_range(0..dna.len()));
+        }
+
         let mut score = vec![0.0f32; dna.len()];
 
-        // Each game: 2 DNA bots + 1 Conservative + 1 Rusher
-        for pair in indices.chunks(2) {
-            let dna_indices = if pair.len() == 2 {
-                [pair[0], pair[1]]
-            } else {
-                [pair[0], rng.gen_range(0..dna.len())]
-            };
-
-            // Build players: 2 DNA bots + 1 Conservative + 1 Rusher
-            // Track which positions the DNA bots land in after shuffle
-            let mut slots: Vec<(Option<usize>, Box<dyn Strategy>)> = Vec::with_capacity(4);
-            for &i in &dna_indices {
-                slots.push((Some(i), Box::new(dna[i].clone()) as Box<dyn Strategy>));
-            }
-            slots.push((None, Box::<Conservative>::default()));
-            slots.push((None, Box::<Rusher>::default()));
-
-            // Shuffle seat order to eliminate position bias
-            slots.shuffle(&mut rng);
-
-            let dna_positions: Vec<(usize, usize)> = slots
+        for group in indices.chunks(4) {
+            let players: Vec<Player> = group
                 .iter()
-                .enumerate()
-                .filter_map(|(seat, (di, _))| di.map(|di| (seat, di)))
-                .collect();
-
-            let players: Vec<Player> = slots
-                .into_iter()
-                .map(|(_, strat)| {
-                    Player::new(strat, Box::new(SmallRng::from_rng(&mut rng).unwrap()))
+                .map(|&i| {
+                    Player::new(
+                        Box::new(dna[i].clone()) as Box<dyn Strategy>,
+                        Box::new(SmallRng::from_rng(&mut rng).unwrap()),
+                    )
                 })
                 .collect();
 
@@ -268,15 +251,14 @@ impl Population {
                 .collect();
             let max_points = *points.iter().max().unwrap();
 
-            // Only score the DNA bots at their shuffled positions
-            for (seat, di) in &dna_positions {
-                let p = points[*seat];
+            for (j, &di) in group.iter().enumerate() {
+                let p = points[j];
                 let normalized = if max_points <= 0 {
                     0.25
                 } else {
                     (p as f32).max(0.0) / max_points as f32
                 };
-                score[*di] += normalized;
+                score[di] += normalized;
             }
         }
 
