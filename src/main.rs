@@ -239,7 +239,7 @@ fn bench_mc() {
         let (mc_seat, opp_seat) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
         let mut players = vec![
             Player::new(
-                Box::new(mcts::MonteCarlo::new(sims, champion.clone())),
+                Box::new(mcts::MonteCarlo::with_ga(sims, champion.clone())),
                 Box::new(SmallRng::from_entropy()),
             ),
             Player::new(
@@ -351,6 +351,50 @@ fn main() {
         return;
     }
 
+    if std::env::args().any(|a| a == "--mc-dqn-vs-mc-ga") {
+        let genes = Arc::new(bot::default_genes());
+        let champion = bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt");
+        let dqn_factory: mcts::RolloutFactory = Arc::new(|| {
+            Box::new(dqn::DqnStrategy::load("dqn_model")) as Box<dyn strategy::Strategy>
+        });
+        let ga_clone = champion.clone();
+        let ga_factory: mcts::RolloutFactory = Arc::new(move || {
+            Box::new(ga_clone.clone()) as Box<dyn strategy::Strategy>
+        });
+
+        let sims = 200;
+        let n = 500;
+        let mut dqn_wins = 0u32;
+        let mut ga_wins = 0u32;
+        let mut ties = 0u32;
+        let mut dqn_total = 0i64;
+        let mut ga_total = 0i64;
+        println!("MC+DQN rollout vs MC+GA rollout ({n} games, {sims} sims, alternating seats):\n");
+        for i in 0..n {
+            if i % 50 == 0 && i > 0 { eprintln!("  {i}/{n}..."); }
+            let (a_seat, b_seat) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
+            let mut players = vec![
+                Player::new(Box::new(mcts::MonteCarlo::new(sims, dqn_factory.clone())), Box::new(SmallRng::from_entropy())),
+                Player::new(Box::new(mcts::MonteCarlo::new(sims, ga_factory.clone())), Box::new(SmallRng::from_entropy())),
+            ];
+            if a_seat == 1 { players.swap(0, 1); }
+            let mut game = game::Game::new(players);
+            game.play();
+            let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+            dqn_total += scores[a_seat] as i64;
+            ga_total += scores[b_seat] as i64;
+            match scores[a_seat].cmp(&scores[b_seat]) {
+                std::cmp::Ordering::Greater => dqn_wins += 1,
+                std::cmp::Ordering::Less => ga_wins += 1,
+                std::cmp::Ordering::Equal => ties += 1,
+            }
+        }
+        println!("  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts", "MC+DQN", dqn_wins, dqn_wins as f64/n as f64*100.0, dqn_total as f64/n as f64);
+        println!("  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts", "MC+GA", ga_wins, ga_wins as f64/n as f64*100.0, ga_total as f64/n as f64);
+        println!("  {:<14} {:>5}       ({:>4.1}%)", "Ties", ties, ties as f64/n as f64*100.0);
+        return;
+    }
+
     if std::env::args().any(|a| a == "--mc-vs-ga") {
         let genes = Arc::new(bot::default_genes());
         let champion = bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt");
@@ -364,7 +408,7 @@ fn main() {
         for i in 0..n {
             let (mc_seat, ga_seat) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
             let mut players = vec![
-                Player::new(Box::new(mcts::MonteCarlo::new(500, champion.clone())), Box::new(SmallRng::from_entropy())),
+                Player::new(Box::new(mcts::MonteCarlo::with_ga(500, champion.clone())), Box::new(SmallRng::from_entropy())),
                 Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
             ];
             if mc_seat == 1 { players.swap(0, 1); }
@@ -522,7 +566,7 @@ fn main() {
     } else if use_ga {
         Box::new(champion)
     } else {
-        Box::new(mcts::MonteCarlo::new(500, champion))
+        Box::new(mcts::MonteCarlo::with_ga(500, champion.clone()))
     };
 
     let mut game = game::Game::new(vec![

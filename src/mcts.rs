@@ -1,22 +1,38 @@
-use crate::bot::DNA;
 use crate::game::{Game, Player};
 use crate::state::{Move, State};
 use crate::strategy::Strategy;
 use rand::{rngs::SmallRng, SeedableRng};
 use rayon::prelude::*;
+use std::sync::Arc;
 
-#[derive(Debug)]
+/// A factory that creates rollout strategies. Must be Send+Sync for rayon.
+pub type RolloutFactory = Arc<dyn Fn() -> Box<dyn Strategy> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct MonteCarlo {
     simulations: usize,
-    opponent: DNA,
+    rollout_factory: RolloutFactory,
+}
+
+impl std::fmt::Debug for MonteCarlo {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "MonteCarlo(sims={})", self.simulations)
+    }
 }
 
 impl MonteCarlo {
-    pub fn new(simulations: usize, opponent: DNA) -> Self {
+    pub fn new(simulations: usize, rollout_factory: RolloutFactory) -> Self {
         Self {
             simulations,
-            opponent,
+            rollout_factory,
         }
+    }
+
+    /// Convenience: create MC with GA champion as rollout policy.
+    pub fn with_ga(simulations: usize, champion: crate::bot::DNA) -> Self {
+        Self::new(simulations, Arc::new(move || {
+            Box::new(champion.clone()) as Box<dyn Strategy>
+        }))
     }
 
     pub fn evaluate_move_public(&self, state: &State, mov: Move, opponent_state: &State) -> f64 {
@@ -32,12 +48,12 @@ impl MonteCarlo {
             .map(|_| {
                 let mut rng = SmallRng::from_entropy();
                 let us = Player::new_with_state(
-                    Box::new(self.opponent.clone()),
+                    (self.rollout_factory)(),
                     Box::new(SmallRng::from_rng(&mut rng).unwrap()),
                     our_state,
                 );
                 let them = Player::new_with_state(
-                    Box::new(self.opponent.clone()),
+                    (self.rollout_factory)(),
                     Box::new(SmallRng::from_rng(&mut rng).unwrap()),
                     *opponent_state,
                 );
@@ -56,7 +72,6 @@ impl Strategy for MonteCarlo {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
         let moves = state.generate_moves(dice);
 
-        // Always lock if possible
         let current_locked = state.count_locked();
         if let Some(mov) = moves.iter().copied().find(|&mov| {
             let mut s = *state;
@@ -89,7 +104,6 @@ impl Strategy for MonteCarlo {
     fn opponents_move(&mut self, state: &State, number: u8, _locked: [bool; 4]) -> Option<Move> {
         let moves = state.generate_opponent_moves(number);
 
-        // Always lock if possible
         let current_locked = state.count_locked();
         if let Some(mov) = moves.iter().copied().find(|&mov| {
             let mut s = *state;
@@ -103,22 +117,8 @@ impl Strategy for MonteCarlo {
             return None;
         }
 
-        // Use GA instinct for opponent turns (fast)
-        let mut states: Vec<_> = moves
-            .into_iter()
-            .map(|mov| {
-                let mut new_state = *state;
-                new_state.apply_move(mov);
-                (new_state, Some(mov))
-            })
-            .collect();
-        states.push((*state, None));
-
-        *states
-            .iter()
-            .map(|(state, mov)| (self.opponent.instinct(state), mov))
-            .max_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap())
-            .unwrap()
-            .1
+        // Use rollout strategy for opponent-turn evaluation
+        let mut eval = (self.rollout_factory)();
+        eval.opponents_move(state, number, _locked)
     }
 }

@@ -194,7 +194,7 @@ impl<B: Backend> InferenceStep for QwixxModel<B> {
 pub fn generate_training_data(num_games: usize, mc_sims: usize) -> Vec<TrainingSample> {
     let genes = Arc::new(bot::default_genes());
     let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt found");
-    let mc = MonteCarlo::new(mc_sims, champion.clone());
+    let mc = MonteCarlo::with_ga(mc_sims, champion.clone());
 
     println!("Generating training data: {num_games} games, {mc_sims} MC sims per state...");
 
