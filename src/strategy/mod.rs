@@ -11,6 +11,9 @@ pub trait Strategy: std::fmt::Debug {
     fn is_interactive(&self) -> bool {
         false
     }
+    /// Called before each decision with our score and the other players' states.
+    /// Default: no-op. Override to use opponent information.
+    fn observe_opponents(&mut self, _our_score: isize, _opponents: &[State]) {}
 }
 
 #[derive(Debug, Default, Clone)]

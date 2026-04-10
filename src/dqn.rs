@@ -25,10 +25,18 @@ type MyBackend = NdArray;
 type MyAutodiffBackend = Autodiff<MyBackend>;
 
 /// Number of input features for the state representation.
-pub const NUM_FEATURES: usize = 18;
+pub const NUM_FEATURES: usize = 21;
+
+/// Context about opponents, updated via observe_opponents.
+#[derive(Clone, Debug, Default)]
+pub struct OpponentContext {
+    pub num_opponents: u8,
+    pub max_opponent_strikes: u8,
+    pub score_gap_to_leader: isize, // positive = we're ahead
+}
 
 /// Extract features from a game state as a fixed-size float array.
-pub fn state_features(state: &State) -> [f32; NUM_FEATURES] {
+pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURES] {
     let totals = state.row_totals();
     let frees = state.row_free_values();
     let locked = state.locked();
@@ -56,8 +64,21 @@ pub fn state_features(state: &State) -> [f32; NUM_FEATURES] {
     features[16] = state.strikes as f32 / 4.0;
     // Blanks normalized
     features[17] = state.blanks() as f32 / 20.0;
+    // Opponent context
+    features[18] = ctx.num_opponents as f32 / 4.0;
+    features[19] = ctx.max_opponent_strikes as f32 / 4.0;
+    features[20] = (ctx.score_gap_to_leader as f32 / 100.0).clamp(-1.0, 1.0);
 
     features
+}
+
+/// Build opponent context from a 2-player game state.
+fn make_context(our_state: &State, opponent_state: &State) -> OpponentContext {
+    OpponentContext {
+        num_opponents: 1,
+        max_opponent_strikes: opponent_state.strikes,
+        score_gap_to_leader: our_state.count_points() - opponent_state.count_points(),
+    }
 }
 
 // ---- Training data ----
@@ -209,7 +230,8 @@ pub fn generate_training_data(num_games: usize, mc_sims: usize) -> Vec<TrainingS
                     for &(mov, mc_value) in &evaluated {
                         let mut new_state = state;
                         new_state.apply_move(mov);
-                        let features = state_features(&new_state);
+                        let ctx = make_context(&new_state, &opponent_state);
+                        let features = state_features(&new_state, &ctx);
                         local_samples.push(TrainingSample {
                             features: features.to_vec(),
                             value: mc_value as f32,
@@ -309,6 +331,7 @@ pub fn train(samples: Vec<TrainingSample>, artifact_dir: &str) {
 pub struct DqnStrategy {
     model: QwixxModel<MyBackend>,
     device: burn::backend::ndarray::NdArrayDevice,
+    context: OpponentContext,
 }
 
 impl std::fmt::Debug for DqnStrategy {
@@ -324,11 +347,11 @@ impl DqnStrategy {
             .init::<MyBackend>(&device)
             .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
             .expect("Failed to load model");
-        DqnStrategy { model, device }
+        DqnStrategy { model, device, context: OpponentContext::default() }
     }
 
     fn evaluate(&self, state: &State) -> f32 {
-        let features = state_features(state);
+        let features = state_features(state, &self.context);
         self.model.evaluate_state(&features, &self.device)
     }
 
@@ -405,6 +428,13 @@ impl Strategy for DqnStrategy {
             None
         }
     }
+
+    fn observe_opponents(&mut self, our_score: isize, opponents: &[State]) {
+        self.context.num_opponents = opponents.len() as u8;
+        self.context.max_opponent_strikes = opponents.iter().map(|s| s.strikes).max().unwrap_or(0);
+        let max_opp_score = opponents.iter().map(|s| s.count_points()).max().unwrap_or(0);
+        self.context.score_gap_to_leader = our_score - max_opp_score;
+    }
 }
 
 // ---- Self-play RL training ----
@@ -417,6 +447,7 @@ fn pick_move_with_model(
     moves: &[Move],
     epsilon: f32,
     rng: &mut SmallRng,
+    ctx: &OpponentContext,
 ) -> Move {
     if moves.is_empty() {
         return Move::Strike;
@@ -442,10 +473,10 @@ fn pick_move_with_model(
         .max_by(|&&a, &&b| {
             let mut sa = *state;
             sa.apply_move(a);
-            let va = model.evaluate_state(&state_features(&sa), device);
+            let va = model.evaluate_state(&state_features(&sa, ctx), device);
             let mut sb = *state;
             sb.apply_move(b);
-            let vb = model.evaluate_state(&state_features(&sb), device);
+            let vb = model.evaluate_state(&state_features(&sb, ctx), device);
             va.partial_cmp(&vb).unwrap()
         })
         .unwrap()
@@ -458,6 +489,7 @@ fn pick_passive_move_with_model(
     state: &State,
     number: u8,
     locked: [bool; 4],
+    ctx: &OpponentContext,
 ) -> Option<Move> {
     let moves = state.generate_opponent_moves(number);
     if moves.is_empty() {
@@ -480,11 +512,11 @@ fn pick_passive_move_with_model(
             let mut sa = *state;
             sa.apply_move(a);
             sa.lock(locked);
-            let va = model.evaluate_state(&state_features(&sa), device);
+            let va = model.evaluate_state(&state_features(&sa, ctx), device);
             let mut sb = *state;
             sb.apply_move(b);
             sb.lock(locked);
-            let vb = model.evaluate_state(&state_features(&sb), device);
+            let vb = model.evaluate_state(&state_features(&sb, ctx), device);
             va.partial_cmp(&vb).unwrap()
         })
         .copied()
@@ -496,8 +528,8 @@ fn pick_passive_move_with_model(
     let mut skip_state = *state;
     skip_state.lock(locked);
 
-    let mark_val = model.evaluate_state(&state_features(&mark_state), device);
-    let skip_val = model.evaluate_state(&state_features(&skip_state), device);
+    let mark_val = model.evaluate_state(&state_features(&mark_state, ctx), device);
+    let skip_val = model.evaluate_state(&state_features(&skip_state, ctx), device);
 
     if mark_val > skip_val {
         Some(best)
@@ -528,23 +560,26 @@ fn self_play_game(
         let passive = 1 - active;
 
         // Active turn
+        let ctx = make_context(&states[active], &states[passive]);
         let mut moves = states[active].generate_moves(dice);
         moves.push(Move::Strike);
-        let mov = pick_move_with_model(model, device, &states[active], &moves, epsilon, rng);
+        let mov = pick_move_with_model(model, device, &states[active], &moves, epsilon, rng, &ctx);
 
         // Record state AFTER the move for player 0
         if active == 0 {
             let mut s = states[0];
             s.apply_move(mov);
-            recorded_features.push(state_features(&s));
+            let ctx0 = make_context(&s, &states[1]);
+            recorded_features.push(state_features(&s, &ctx0));
         }
 
         states[active].apply_move(mov);
         let locked = states[active].locked();
 
         // Passive turn
+        let ctx_passive = make_context(&states[passive], &states[active]);
         let passive_mov = pick_passive_move_with_model(
-            model, device, &states[passive], on_white, locked,
+            model, device, &states[passive], on_white, locked, &ctx_passive,
         );
         if let Some(mov) = passive_mov {
             // Record passive marks for player 0 too
@@ -552,7 +587,8 @@ fn self_play_game(
                 let mut s = states[0];
                 s.apply_move(mov);
                 s.lock(locked);
-                recorded_features.push(state_features(&s));
+                let ctx0 = make_context(&s, &states[1]);
+                recorded_features.push(state_features(&s, &ctx0));
             }
             states[passive].apply_move(mov);
         }
@@ -605,12 +641,14 @@ fn play_against_strategy(
 
         if active == 0 {
             // DQN's active turn
+            let ctx = make_context(&states[0], &states[1]);
             let mut moves = states[0].generate_moves(dice);
             moves.push(Move::Strike);
-            let mov = pick_move_with_model(model, device, &states[0], &moves, epsilon, rng);
+            let mov = pick_move_with_model(model, device, &states[0], &moves, epsilon, rng, &ctx);
             let mut s = states[0];
             s.apply_move(mov);
-            recorded_features.push(state_features(&s));
+            let ctx_after = make_context(&s, &states[1]);
+            recorded_features.push(state_features(&s, &ctx_after));
             states[0].apply_move(mov);
             let locked = states[0].locked();
             // Opponent's passive turn
@@ -624,12 +662,14 @@ fn play_against_strategy(
             states[1].apply_move(opp_mov);
             let locked = states[1].locked();
             // DQN's passive turn
-            let our_mov = pick_passive_move_with_model(model, device, &states[0], on_white, locked);
+            let ctx = make_context(&states[0], &states[1]);
+            let our_mov = pick_passive_move_with_model(model, device, &states[0], on_white, locked, &ctx);
             if let Some(mov) = our_mov {
                 let mut s = states[0];
                 s.apply_move(mov);
                 s.lock(locked);
-                recorded_features.push(state_features(&s));
+                let ctx_after = make_context(&s, &states[1]);
+                recorded_features.push(state_features(&s, &ctx_after));
                 states[0].apply_move(mov);
             }
             states[0].lock(locked);

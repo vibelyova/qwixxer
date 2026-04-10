@@ -65,6 +65,11 @@ impl Player {
         self.strategy.is_interactive()
     }
 
+    fn observe_opponents(&mut self, opponents: &[State]) {
+        let our_score = self.state.count_points();
+        self.strategy.observe_opponents(our_score, opponents);
+    }
+
     fn roll(&mut self) -> [u8; 6] {
         self.dice.roll()
     }
@@ -107,6 +112,15 @@ impl Game {
             let dice = self.players[active_player].roll();
             let on_white = dice[0] + dice[1];
 
+            // Gather opponent states and notify active player
+            let opponent_states: Vec<State> = self.players
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != active_player)
+                .map(|(_, p)| p.state)
+                .collect();
+            self.players[active_player].observe_opponents(&opponent_states);
+
             let verbose_active = self.verbose && !self.players[active_player].is_interactive();
 
             let mov = self.players[active_player].your_move(dice);
@@ -125,6 +139,13 @@ impl Game {
 
             for index in 1..self.players.len() {
                 let opponent = (active_player + index) % self.players.len();
+                let opp_states: Vec<State> = self.players
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != opponent)
+                    .map(|(_, p)| p.state)
+                    .collect();
+                self.players[opponent].observe_opponents(&opp_states);
                 let passive_mov = self.players[opponent].opponents_move(on_white, new_locked);
 
                 if self.verbose && !self.players[opponent].is_interactive() {
