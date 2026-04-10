@@ -8,7 +8,7 @@ use burn::{
         dataloader::{DataLoaderBuilder, batcher::Batcher},
         dataset::{Dataset, InMemDataset},
     },
-    nn::{BatchNorm, BatchNormConfig, Linear, LinearConfig, Relu, loss::{MseLoss, Reduction::Mean}},
+    nn::{Linear, LinearConfig, Relu, loss::{MseLoss, Reduction::Mean}},
     optim::AdamConfig,
     prelude::*,
     record::CompactRecorder,
@@ -121,9 +121,7 @@ impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
 #[derive(Module, Debug)]
 pub struct QwixxModel<B: Backend> {
     layer1: Linear<B>,
-    bn1: BatchNorm<B>,
     layer2: Linear<B>,
-    bn2: BatchNorm<B>,
     output: Linear<B>,
     activation: Relu,
 }
@@ -139,11 +137,9 @@ pub struct QwixxModelConfig {
 impl QwixxModelConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> QwixxModel<B> {
         QwixxModel {
-            layer1: LinearConfig::new(NUM_FEATURES, self.hidden1).with_bias(false).init(device),
-            bn1: BatchNormConfig::new(self.hidden1).init(device),
-            layer2: LinearConfig::new(self.hidden1, self.hidden2).with_bias(false).init(device),
-            bn2: BatchNormConfig::new(self.hidden2).init(device),
-            output: LinearConfig::new(self.hidden2, 1).with_bias(true).init(device), // output keeps bias (no BN after it)
+            layer1: LinearConfig::new(NUM_FEATURES, self.hidden1).with_bias(true).init(device),
+            layer2: LinearConfig::new(self.hidden1, self.hidden2).with_bias(true).init(device),
+            output: LinearConfig::new(self.hidden2, 1).with_bias(true).init(device),
             activation: Relu::new(),
         }
     }
@@ -151,12 +147,8 @@ impl QwixxModelConfig {
 
 impl<B: Backend> QwixxModel<B> {
     pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
-        let x = self.layer1.forward(input);
-        let x = self.bn1.forward(x);
-        let x = self.activation.forward(x);
-        let x = self.layer2.forward(x);
-        let x = self.bn2.forward(x);
-        let x = self.activation.forward(x);
+        let x = self.activation.forward(self.layer1.forward(input));
+        let x = self.activation.forward(self.layer2.forward(x));
         self.output.forward(x)
     }
 
@@ -597,10 +589,8 @@ fn make_context_multi(our_state: &State, all_states: &[State]) -> OpponentContex
 
 /// Play a training game: DQN is player 0, opponents are arbitrary strategies.
 /// Records (state_features, final_score) for player 0.
-/// `target_model` is used for TD(lambda) target computation (can be same as model).
 fn play_training_game(
     model: &QwixxModel<MyBackend>,
-    target_model: &QwixxModel<MyBackend>,
     device: &burn::backend::ndarray::NdArrayDevice,
     opponents: &mut [Box<dyn Strategy>],
     epsilon: f32,
@@ -689,10 +679,10 @@ fn play_training_game(
         return (Vec::new(), final_score);
     }
 
-    // Get target model's value estimates for TD targets (stable targets)
+    // Get model's value estimates for each recorded state
     let values: Vec<f32> = recorded_features
         .iter()
-        .map(|f| target_model.evaluate_state(f, device))
+        .map(|f| model.evaluate_state(f, device))
         .collect();
 
     // Compute targets: G_t = (1-lambda)*V(s_{t+1}) + lambda*G_{t+1}
@@ -723,9 +713,8 @@ pub fn self_play_train(
     epochs_per_iteration: usize,
 ) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-    let buffer_iterations = 5;
+    let buffer_iterations = 5; // keep last 5 iterations of data
     let mut replay_buffer: Vec<Vec<TrainingSample>> = Vec::new();
-    let target_update_freq = 5; // update target network every 5 iterations
 
     for iteration in 0..num_iterations {
         let epsilon = (0.2 * (0.95f32).powi(iteration as i32)).max(0.05);
@@ -734,7 +723,7 @@ pub fn self_play_train(
             iteration + 1
         );
 
-        // Load current model for inference (policy network)
+        // Load current model for inference
         let model: QwixxModel<MyBackend> = if iteration == 0 {
             QwixxModelConfig::new()
                 .init::<MyBackend>(&device)
@@ -750,20 +739,6 @@ pub fn self_play_train(
                 .expect("Failed to load model")
         };
 
-        // Target network: load from separate file, or use current model initially
-        let target_model: QwixxModel<MyBackend> = QwixxModelConfig::new()
-            .init::<MyBackend>(&device)
-            .load_file(format!("{artifact_dir}/target_model"), &CompactRecorder::new(), &device)
-            .unwrap_or_else(|_| model.clone());
-
-        // Update target network periodically
-        if iteration % target_update_freq == 0 {
-            model.clone()
-                .save_file(format!("{artifact_dir}/target_model"), &CompactRecorder::new())
-                .expect("Failed to save target model");
-            println!("  Target network updated");
-        }
-
         // Generate training data: 3-4 player games vs GA champions and self
         let genes = Arc::new(bot::default_genes());
         let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
@@ -775,13 +750,9 @@ pub fn self_play_train(
             .collect();
 
         let tmp_model_path = format!("{artifact_dir}/tmp_thread_model");
-        let tmp_target_path = format!("{artifact_dir}/tmp_target_model");
         model
             .save_file(&tmp_model_path, &CompactRecorder::new())
             .expect("Failed to save temp model");
-        target_model
-            .save_file(&tmp_target_path, &CompactRecorder::new())
-            .expect("Failed to save temp target model");
 
         let game_results: Vec<(Vec<TrainingSample>, f32)> = game_configs
             .par_iter()
@@ -790,10 +761,6 @@ pub fn self_play_train(
                     .init::<MyBackend>(&device)
                     .load_file(&tmp_model_path, &CompactRecorder::new(), &device)
                     .expect("Failed to load thread model");
-                let thread_target = QwixxModelConfig::new()
-                    .init::<MyBackend>(&device)
-                    .load_file(&tmp_target_path, &CompactRecorder::new(), &device)
-                    .expect("Failed to load thread target model");
                 let mut rng = SmallRng::from_entropy();
                 let mut opps: Vec<Box<dyn Strategy>> = match config {
                     // 3-player: vs 2 GA champions
@@ -812,7 +779,7 @@ pub fn self_play_train(
                         Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::from_entropy() }),
                     ],
                 };
-                play_training_game(&thread_model, &thread_target, &device, &mut opps, epsilon, &mut rng)
+                play_training_game(&thread_model, &device, &mut opps, epsilon, &mut rng)
             })
             .collect();
 
