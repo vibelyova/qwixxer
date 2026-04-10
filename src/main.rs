@@ -339,26 +339,25 @@ fn main() {
         return;
     }
 
-    let champion = match bot::DNA::load_weights("champion.txt", Arc::new(bot::default_genes())) {
-        Ok(dna) => {
-            println!("Loaded champion from champion.txt");
-            dna.print_weights();
-            dna
-        }
-        Err(_) => {
-            println!("No champion.txt found, training...\n");
-            let mut pop = bot::Population::new(100, bot::default_genes(), 42);
-            pop.evolve(200);
-            pop.current_champion().clone()
-        }
+    let genes = Arc::new(bot::default_genes());
+    let champion = bot::DNA::load_weights("champion.txt", genes)
+        .expect("No champion.txt found. Run --train first.");
+
+    let use_ga = std::env::args().any(|a| a == "--ga");
+
+    println!(
+        "Playing against {} bot...\n",
+        if use_ga { "GA champion" } else { "MCTS (500 sims/move)" }
+    );
+
+    let bot_strategy: Box<dyn strategy::Strategy> = if use_ga {
+        Box::new(champion)
+    } else {
+        Box::new(mcts::MonteCarlo::new(500, champion))
     };
 
-    println!();
     let mut game = game::Game::new(vec![
-        Player::new(
-            Box::new(champion) as Box<dyn strategy::Strategy>,
-            Box::new(SmallRng::from_entropy()),
-        ),
+        Player::new(bot_strategy, Box::new(SmallRng::from_entropy())),
         Player::new(
             Box::<strategy::Interactive>::default(),
             Box::new(SmallRng::from_entropy()),
