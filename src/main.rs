@@ -168,13 +168,12 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
         for j in 0..num_players {
             let bot_idx = (j + num_players - rotation) % num_players;
             total_pts[bot_idx] += scores[j] as i64;
-            if scores[j] == max {
-                if num_winners == 1 {
-                    wins[bot_idx] += 1;
-                } else {
-                    ties += 1;
-                }
+            if scores[j] == max && num_winners == 1 {
+                wins[bot_idx] += 1;
             }
+        }
+        if num_winners > 1 {
+            ties += 1;
         }
     }
 

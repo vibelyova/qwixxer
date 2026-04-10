@@ -66,7 +66,7 @@ pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURE
     // Strikes normalized
     features[16] = state.strikes as f32 / 4.0;
     // Blanks normalized
-    features[17] = state.blanks() as f32 / 20.0;
+    features[17] = state.blanks() as f32 / 40.0;
     // Opponent context
     features[18] = ctx.num_opponents as f32 / 4.0;
     features[19] = ctx.max_opponent_strikes as f32 / 4.0;
@@ -412,8 +412,10 @@ impl Strategy for DqnStrategy {
             .max_by(|&a, &b| {
                 let mut sa = *state;
                 sa.apply_move(a);
+                sa.lock(locked);
                 let mut sb = *state;
                 sb.apply_move(b);
+                sb.lock(locked);
                 self.evaluate(&sa).partial_cmp(&self.evaluate(&sb)).unwrap()
             })
             .unwrap();
@@ -545,6 +547,7 @@ fn pick_passive_move_with_model(
 struct DqnSelfPlayOpponent {
     model: QwixxModel<MyBackend>,
     device: burn::backend::ndarray::NdArrayDevice,
+    rng: SmallRng,
 }
 
 impl std::fmt::Debug for DqnSelfPlayOpponent {
@@ -558,8 +561,7 @@ impl Strategy for DqnSelfPlayOpponent {
         let ctx = OpponentContext::default(); // opponent doesn't need perfect context
         let mut moves = state.generate_moves(dice);
         moves.push(Move::Strike);
-        let mut rng = SmallRng::from_entropy();
-        pick_move_with_model(&self.model, &self.device, state, &moves, 0.0, &mut rng, &ctx)
+        pick_move_with_model(&self.model, &self.device, state, &moves, 0.0, &mut self.rng, &ctx)
     }
 
     fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
@@ -594,7 +596,7 @@ fn play_training_game(
     opponents: &mut [Box<dyn Strategy>],
     epsilon: f32,
     rng: &mut SmallRng,
-) -> Vec<TrainingSample> {
+) -> (Vec<TrainingSample>, f32) {
     let num_players = 1 + opponents.len();
     let mut states: Vec<State> = (0..num_players).map(|_| State::default()).collect();
     let mut recorded_features: Vec<[f32; NUM_FEATURES]> = Vec::new();
@@ -675,7 +677,7 @@ fn play_training_game(
     let lambda = 0.8f32;
     let n = recorded_features.len();
     if n == 0 {
-        return Vec::new();
+        return (Vec::new(), final_score);
     }
 
     // Get model's value estimates for each recorded state
@@ -692,14 +694,15 @@ fn play_training_game(
         targets[t] = (1.0 - lambda) * values[t + 1] + lambda * targets[t + 1];
     }
 
-    recorded_features
+    let samples = recorded_features
         .into_iter()
         .zip(targets)
         .map(|(features, target)| TrainingSample {
             features: features.to_vec(),
             value: target,
         })
-        .collect()
+        .collect();
+    (samples, final_score)
 }
 
 /// Self-play RL training loop with replay buffer and mixed opponents.
@@ -753,17 +756,16 @@ pub fn self_play_train(
             .save_file(&tmp_model_path, &CompactRecorder::new())
             .expect("Failed to save temp model");
 
-        let artifact_dir_str = artifact_dir.to_string();
-        let new_samples: Vec<TrainingSample> = game_configs
+        let game_results: Vec<(Vec<TrainingSample>, f32)> = game_configs
             .par_iter()
-            .flat_map(|&config| {
+            .map(|&config| {
                 let thread_model = QwixxModelConfig::new()
                     .init::<MyBackend>(&device)
                     .load_file(&tmp_model_path, &CompactRecorder::new(), &device)
                     .expect("Failed to load thread model");
                 let mut rng = SmallRng::from_entropy();
                 let mut opps: Vec<Box<dyn Strategy>> = match config {
-                    0 => vec![Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone() })],
+                    0 => vec![Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::from_entropy() })],
                     1 => vec![Box::new(champion.clone())],
                     2 => vec![Box::new(champion.clone()), Box::new(crate::strategy::Opportunist)],
                     3 => vec![Box::new(champion.clone()), Box::new(champion.clone()), Box::new(champion.clone())],
@@ -774,15 +776,8 @@ pub fn self_play_train(
             })
             .collect();
 
-        // Compute avg score
-        let mut game_scores: Vec<f32> = Vec::new();
-        let mut prev_val = f32::NAN;
-        for s in &new_samples {
-            if s.value != prev_val {
-                game_scores.push(s.value);
-                prev_val = s.value;
-            }
-        }
+        let new_samples: Vec<TrainingSample> = game_results.iter().flat_map(|(s, _)| s.iter().cloned()).collect();
+        let game_scores: Vec<f32> = game_results.iter().map(|(_, score)| *score).collect();
         let avg_score = if game_scores.is_empty() {
             0.0
         } else {
