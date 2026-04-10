@@ -1,2 +1,10 @@
-target
-
+target/
+dqn_model/checkpoint/
+dqn_model/train/
+dqn_model/valid/
+dqn_model/experiment.log
+dqn_model/tmp_*.mpk
+champion-*.txt
+champion_finetuned.txt
+divergences.txt
+*.pdf
