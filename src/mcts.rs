@@ -19,6 +19,10 @@ impl MonteCarlo {
         }
     }
 
+    pub fn evaluate_move_public(&self, state: &State, mov: Move, opponent_state: &State) -> f64 {
+        self.evaluate_move(state, mov, opponent_state)
+    }
+
     fn evaluate_move(&self, state: &State, mov: Move, opponent_state: &State) -> f64 {
         let mut our_state = *state;
         our_state.apply_move(mov);
