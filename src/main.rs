@@ -346,6 +346,11 @@ fn main() {
         return;
     }
 
+    if std::env::args().any(|a| a == "--dqn-selfplay") {
+        dqn::self_play_train("dqn_model", 20, 1000, 10);
+        return;
+    }
+
     if std::env::args().any(|a| a == "--dqn-bench") {
         let dqn_bot = dqn::DqnStrategy::load("dqn_model");
         let genes = Arc::new(bot::default_genes());

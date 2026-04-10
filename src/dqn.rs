@@ -404,3 +404,295 @@ impl Strategy for DqnStrategy {
         }
     }
 }
+
+// ---- Self-play RL training ----
+
+/// Pick a move using the model, with epsilon-greedy exploration.
+fn pick_move_with_model(
+    model: &QwixxModel<MyBackend>,
+    device: &burn::backend::ndarray::NdArrayDevice,
+    state: &State,
+    moves: &[Move],
+    epsilon: f32,
+    rng: &mut SmallRng,
+) -> Move {
+    if moves.is_empty() {
+        return Move::Strike;
+    }
+
+    // Always lock if possible
+    let current_locked = state.count_locked();
+    if let Some(mov) = moves.iter().copied().find(|&mov| {
+        let mut s = *state;
+        s.apply_move(mov);
+        s.count_locked() > current_locked
+    }) {
+        return mov;
+    }
+
+    // Epsilon-greedy
+    if rng.gen::<f32>() < epsilon {
+        return moves[rng.gen_range(0..moves.len())];
+    }
+
+    *moves
+        .iter()
+        .max_by(|&&a, &&b| {
+            let mut sa = *state;
+            sa.apply_move(a);
+            let va = model.evaluate_state(&state_features(&sa), device);
+            let mut sb = *state;
+            sb.apply_move(b);
+            let vb = model.evaluate_state(&state_features(&sb), device);
+            va.partial_cmp(&vb).unwrap()
+        })
+        .unwrap()
+}
+
+/// Pick an opponent-turn move using the model.
+fn pick_passive_move_with_model(
+    model: &QwixxModel<MyBackend>,
+    device: &burn::backend::ndarray::NdArrayDevice,
+    state: &State,
+    number: u8,
+    locked: [bool; 4],
+) -> Option<Move> {
+    let moves = state.generate_opponent_moves(number);
+    if moves.is_empty() {
+        return None;
+    }
+
+    // Always lock
+    let current_locked = state.count_locked();
+    if let Some(mov) = moves.iter().copied().find(|&mov| {
+        let mut s = *state;
+        s.apply_move(mov);
+        s.count_locked() > current_locked
+    }) {
+        return Some(mov);
+    }
+
+    let best = moves
+        .iter()
+        .max_by(|&&a, &&b| {
+            let mut sa = *state;
+            sa.apply_move(a);
+            sa.lock(locked);
+            let va = model.evaluate_state(&state_features(&sa), device);
+            let mut sb = *state;
+            sb.apply_move(b);
+            sb.lock(locked);
+            let vb = model.evaluate_state(&state_features(&sb), device);
+            va.partial_cmp(&vb).unwrap()
+        })
+        .copied()
+        .unwrap();
+
+    let mut mark_state = *state;
+    mark_state.apply_move(best);
+    mark_state.lock(locked);
+    let mut skip_state = *state;
+    skip_state.lock(locked);
+
+    let mark_val = model.evaluate_state(&state_features(&mark_state), device);
+    let skip_val = model.evaluate_state(&state_features(&skip_state), device);
+
+    if mark_val > skip_val {
+        Some(best)
+    } else {
+        None
+    }
+}
+
+/// Play one self-play game, recording (state_features, final_score) for player 0.
+fn self_play_game(
+    model: &QwixxModel<MyBackend>,
+    device: &burn::backend::ndarray::NdArrayDevice,
+    epsilon: f32,
+    rng: &mut SmallRng,
+) -> Vec<TrainingSample> {
+    let mut states = [State::default(), State::default()];
+    let mut recorded_features: Vec<[f32; NUM_FEATURES]> = Vec::new();
+    let mut turn = 0u32;
+
+    loop {
+        // Game over check
+        if states[0].strikes >= 4 || states[1].strikes >= 4 { break; }
+        if states[0].count_locked() >= 2 || states[1].count_locked() >= 2 { break; }
+
+        let dice: [u8; 6] = core::array::from_fn(|_| rng.gen_range(1..=6));
+        let on_white = dice[0] + dice[1];
+        let active = (turn as usize) % 2;
+        let passive = 1 - active;
+
+        // Active turn
+        let mut moves = states[active].generate_moves(dice);
+        moves.push(Move::Strike);
+        let mov = pick_move_with_model(model, device, &states[active], &moves, epsilon, rng);
+
+        // Record state AFTER the move for player 0
+        if active == 0 {
+            let mut s = states[0];
+            s.apply_move(mov);
+            recorded_features.push(state_features(&s));
+        }
+
+        states[active].apply_move(mov);
+        let locked = states[active].locked();
+
+        // Passive turn
+        let passive_mov = pick_passive_move_with_model(
+            model, device, &states[passive], on_white, locked,
+        );
+        if let Some(mov) = passive_mov {
+            // Record passive marks for player 0 too
+            if passive == 0 {
+                let mut s = states[0];
+                s.apply_move(mov);
+                s.lock(locked);
+                recorded_features.push(state_features(&s));
+            }
+            states[passive].apply_move(mov);
+        }
+
+        // Propagate locks
+        let all_locked = [
+            states[0].locked()[0] || states[1].locked()[0],
+            states[0].locked()[1] || states[1].locked()[1],
+            states[0].locked()[2] || states[1].locked()[2],
+            states[0].locked()[3] || states[1].locked()[3],
+        ];
+        states[0].lock(all_locked);
+        states[1].lock(all_locked);
+
+        turn += 1;
+        if turn > 200 { break; }
+    }
+
+    let final_score = states[0].count_points() as f32;
+
+    recorded_features
+        .into_iter()
+        .map(|features| TrainingSample {
+            features: features.to_vec(),
+            value: final_score,
+        })
+        .collect()
+}
+
+/// Self-play RL training loop.
+/// Uses the existing train() function at each iteration, loading/saving the model between rounds.
+pub fn self_play_train(
+    artifact_dir: &str,
+    num_iterations: usize,
+    games_per_iteration: usize,
+    epochs_per_iteration: usize,
+) {
+    let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+
+    for iteration in 0..num_iterations {
+        let epsilon = (0.2 * (0.95f32).powi(iteration as i32)).max(0.05);
+        println!(
+            "\n=== Iteration {}/{num_iterations} (epsilon={epsilon:.3}) ===",
+            iteration + 1
+        );
+
+        // Load current model for inference
+        let model: QwixxModel<MyBackend> = if iteration == 0 {
+            // Try loading pretrained, fall back to random
+            QwixxModelConfig::new()
+                .init::<MyBackend>(&device)
+                .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+                .unwrap_or_else(|_| {
+                    println!("  No pretrained model, starting fresh");
+                    QwixxModelConfig::new().init::<MyBackend>(&device)
+                })
+        } else {
+            QwixxModelConfig::new()
+                .init::<MyBackend>(&device)
+                .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+                .expect("Failed to load model")
+        };
+
+        // Generate self-play data
+        let mut rng = SmallRng::from_entropy();
+        let mut all_samples = Vec::new();
+
+        for _ in 0..games_per_iteration {
+            let samples = self_play_game(&model, &device, epsilon, &mut rng);
+            all_samples.extend(samples);
+        }
+
+        // Compute avg score
+        let mut game_scores: Vec<f32> = Vec::new();
+        let mut prev_val = f32::NAN;
+        for s in &all_samples {
+            if s.value != prev_val {
+                game_scores.push(s.value);
+                prev_val = s.value;
+            }
+        }
+        let avg_score = if game_scores.is_empty() {
+            0.0
+        } else {
+            game_scores.iter().sum::<f32>() / game_scores.len() as f32
+        };
+        println!(
+            "  Generated {} samples from {games_per_iteration} games (avg score: {avg_score:.1})",
+            all_samples.len()
+        );
+
+        // Train using the existing train function (handles model init, optimizer, epochs)
+        train_with_epochs(all_samples, artifact_dir, epochs_per_iteration);
+    }
+
+    println!("\nSelf-play training complete. Model saved to {artifact_dir}/model");
+}
+
+/// Train with a specific number of epochs, loading from existing model if present.
+fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epochs: usize) {
+    let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+
+    let split = (samples.len() * 9) / 10;
+    let train_data = InMemDataset::new(samples[..split].to_vec());
+    let valid_data = InMemDataset::new(samples[split..].to_vec());
+
+    // Load existing model or init fresh
+    let model: QwixxModel<MyAutodiffBackend> = QwixxModelConfig::new()
+        .init::<MyAutodiffBackend>(&device)
+        .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+        .unwrap_or_else(|_| QwixxModelConfig::new().init::<MyAutodiffBackend>(&device));
+
+    let batcher_train = QwixxBatcher::<MyAutodiffBackend> { device: device.clone() };
+    let batcher_valid = QwixxBatcher::<MyBackend> { device: device.clone() };
+
+    let dataloader_train = DataLoaderBuilder::new(batcher_train)
+        .batch_size(256)
+        .shuffle(42)
+        .build(train_data);
+
+    let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
+        .batch_size(256)
+        .shuffle(42)
+        .build(valid_data);
+
+    // Use a temp dir for checkpoints to avoid clobbering the main model dir
+    let ckpt_dir = format!("{artifact_dir}/ckpt");
+    std::fs::remove_dir_all(&ckpt_dir).ok();
+    std::fs::create_dir_all(&ckpt_dir).ok();
+
+    let training = SupervisedTraining::new(&ckpt_dir, dataloader_train, dataloader_valid)
+        .metric_train_numeric(LossMetric::new())
+        .metric_valid_numeric(LossMetric::new())
+        .num_epochs(num_epochs)
+        .summary();
+
+    let result = training.launch(Learner::new(model, AdamConfig::new().init(), 1e-4));
+
+    result
+        .model
+        .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
+        .expect("Failed to save model");
+
+    std::fs::remove_dir_all(&ckpt_dir).ok();
+}
