@@ -100,28 +100,28 @@ impl Game {
             let dice = self.players[active_player].roll();
             let on_white = dice[0] + dice[1];
 
-            if self.verbose && active_player != self.players.len() - 1 {
-                // Bot's active turn — show dice and board before move
+            let state_before = if self.verbose && active_player != self.players.len() - 1 {
+                Some(self.players[active_player].state)
+            } else {
+                None
+            };
+
+            self.players[active_player].your_move(dice);
+
+            if let Some(before) = state_before {
+                let after = &self.players[active_player].state;
+                let points_diff = after.count_points() - before.count_points();
                 println!(
                     "\n  \x1b[2m── Bot (Player {}) active turn ──\x1b[0m\n",
                     active_player + 1
                 );
                 println!("{}", crate::state::format_dice(dice));
                 println!();
-                println!("{}", self.players[active_player].state);
-            }
-
-            let state_before = self.players[active_player].state;
-            self.players[active_player].your_move(dice);
-
-            if self.verbose && active_player != self.players.len() - 1 {
-                // Show what the bot did
-                let state_after = &self.players[active_player].state;
-                let points_diff = state_after.count_points() - state_before.count_points();
+                println!("{}", after);
                 println!(
                     "  \x1b[2mBot scored {:+} pts (now {})\x1b[0m",
                     points_diff,
-                    state_after.count_points()
+                    after.count_points()
                 );
             }
 
