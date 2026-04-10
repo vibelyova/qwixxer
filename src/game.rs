@@ -1,4 +1,4 @@
-use crate::state::State;
+use crate::state::{Move, State};
 use crate::strategy::Strategy;
 
 use rand::{prelude::*, rngs::SmallRng, Rng};
@@ -69,16 +69,19 @@ impl Player {
         self.dice.roll()
     }
 
-    fn your_move(&mut self, dice: [u8; 6]) {
+    fn your_move(&mut self, dice: [u8; 6]) -> Move {
         let mov = self.strategy.your_move(&self.state, dice);
         self.state.apply_move(mov);
+        mov
     }
 
-    fn opponents_move(&mut self, number: u8, locked: [bool; 4]) {
-        if let Some(mov) = self.strategy.opponents_move(&self.state, number, locked) {
+    fn opponents_move(&mut self, number: u8, locked: [bool; 4]) -> Option<Move> {
+        let mov = self.strategy.opponents_move(&self.state, number, locked);
+        if let Some(mov) = mov {
             self.state.apply_move(mov);
         }
         self.state.lock(locked);
+        mov
     }
 }
 
@@ -105,50 +108,34 @@ impl Game {
             let on_white = dice[0] + dice[1];
 
             let verbose_active = self.verbose && !self.players[active_player].is_interactive();
-            let state_before = if verbose_active {
-                Some(self.players[active_player].state)
-            } else {
-                None
-            };
 
-            self.players[active_player].your_move(dice);
+            let mov = self.players[active_player].your_move(dice);
 
-            if let Some(before) = state_before {
-                let after = &self.players[active_player].state;
-                let points_diff = after.count_points() - before.count_points();
+            if verbose_active {
                 println!(
-                    "\n  \x1b[2m── Player {} active turn ──\x1b[0m\n",
+                    "\n  \x1b[2m── Player {} active turn ──\x1b[0m",
                     active_player + 1
                 );
-                println!("{}", crate::state::format_dice(dice));
-                println!();
-                println!("{}", after);
-                println!(
-                    "  \x1b[2mPlayer {} scored {:+} pts (now {})\x1b[0m",
-                    active_player + 1,
-                    points_diff,
-                    after.count_points()
-                );
+                println!("  \x1b[2m{}\x1b[0m", crate::state::format_dice(dice));
+                println!("  \x1b[2mPlayed: {mov}\x1b[0m");
             }
 
             let mut new_locked = self.players[active_player].state.locked();
 
             for index in 1..self.players.len() {
                 let opponent = (active_player + index) % self.players.len();
-                let before = self.players[opponent].state;
-                self.players[opponent].opponents_move(on_white, new_locked);
+                let passive_mov = self.players[opponent].opponents_move(on_white, new_locked);
 
                 if self.verbose && !self.players[opponent].is_interactive() {
-                    let after = &self.players[opponent].state;
-                    if after.count_points() != before.count_points() {
-                        let diff = after.count_points() - before.count_points();
-                        println!(
-                            "  \x1b[2mPlayer {} marked on white sum {on_white} ({:+} pts, now {})\x1b[0m",
-                            opponent + 1, diff, after.count_points()
-                        );
-                    } else {
-                        println!("  \x1b[2mPlayer {} skipped white sum {on_white}\x1b[0m",
-                            opponent + 1);
+                    match passive_mov {
+                        Some(mov) => println!(
+                            "  \x1b[2mPlayer {} marked: {mov}\x1b[0m",
+                            opponent + 1
+                        ),
+                        None => println!(
+                            "  \x1b[2mPlayer {} skipped\x1b[0m",
+                            opponent + 1
+                        ),
                     }
                 }
 
