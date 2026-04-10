@@ -65,8 +65,8 @@ pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURE
     }
     // Strikes normalized
     features[16] = state.strikes as f32 / 4.0;
-    // Blanks normalized
-    features[17] = state.blanks() as f32 / 40.0;
+    // Blanks normalized (TODO: should be /40.0 for true [0,1] range, retrain model first)
+    features[17] = state.blanks() as f32 / 20.0;
     // Opponent context
     features[18] = ctx.num_opponents as f32 / 4.0;
     features[19] = ctx.max_opponent_strikes as f32 / 4.0;
