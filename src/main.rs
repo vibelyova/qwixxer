@@ -351,6 +351,91 @@ fn main() {
         return;
     }
 
+    if std::env::args().any(|a| a == "--mc-vs-ga") {
+        let genes = Arc::new(bot::default_genes());
+        let champion = bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt");
+        let n = 1_000;
+        let mut mc_wins = 0u32;
+        let mut ga_wins = 0u32;
+        let mut ties = 0u32;
+        let mut mc_total = 0i64;
+        let mut ga_total = 0i64;
+        println!("MC (500 sims) vs GA Champion ({n} games, alternating seats):\n");
+        for i in 0..n {
+            let (mc_seat, ga_seat) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
+            let mut players = vec![
+                Player::new(Box::new(mcts::MonteCarlo::new(500, champion.clone())), Box::new(SmallRng::from_entropy())),
+                Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+            ];
+            if mc_seat == 1 { players.swap(0, 1); }
+            let mut game = game::Game::new(players);
+            game.play();
+            let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+            mc_total += scores[mc_seat] as i64;
+            ga_total += scores[ga_seat] as i64;
+            match scores[mc_seat].cmp(&scores[ga_seat]) {
+                std::cmp::Ordering::Greater => mc_wins += 1,
+                std::cmp::Ordering::Less => ga_wins += 1,
+                std::cmp::Ordering::Equal => ties += 1,
+            }
+            if i % 100 == 0 && i > 0 { eprintln!("  {i}/{n}..."); }
+        }
+        println!("  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts", "MC Bot", mc_wins, mc_wins as f64/n as f64*100.0, mc_total as f64/n as f64);
+        println!("  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts", "GA Champion", ga_wins, ga_wins as f64/n as f64*100.0, ga_total as f64/n as f64);
+        println!("  {:<14} {:>5}       ({:>4.1}%)", "Ties", ties, ties as f64/n as f64*100.0);
+        return;
+    }
+
+    if std::env::args().any(|a| a == "--dqn-vs-ga-2v2") {
+        let genes = Arc::new(bot::default_genes());
+        let champion = bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt");
+        let n = 1_000;
+        let mut ga_wins = 0u32;
+        let mut dqn_wins = 0u32;
+        let mut ties = 0u32;
+        let mut ga_total = 0i64;
+        let mut dqn_total = 0i64;
+        println!("2v2: DQN Bots vs GA Champions ({n} games, alternating seats):\n");
+        for i in 0..n {
+            let (ga_seats, dqn_seats) = if i % 2 == 0 {
+                ([0usize, 2], [1usize, 3])
+            } else {
+                ([1, 3], [0, 2])
+            };
+            let mut players: Vec<Player> = if i % 2 == 0 {
+                vec![
+                    Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                    Player::new(Box::new(dqn::DqnStrategy::load("dqn_model")) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                    Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                    Player::new(Box::new(dqn::DqnStrategy::load("dqn_model")) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                ]
+            } else {
+                vec![
+                    Player::new(Box::new(dqn::DqnStrategy::load("dqn_model")) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                    Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                    Player::new(Box::new(dqn::DqnStrategy::load("dqn_model")) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                    Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                ]
+            };
+            let mut game = game::Game::new(players);
+            game.play();
+            let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+            let ga_best = ga_seats.iter().map(|&s| scores[s]).max().unwrap();
+            let dqn_best = dqn_seats.iter().map(|&s| scores[s]).max().unwrap();
+            ga_total += ga_seats.iter().map(|&s| scores[s] as i64).sum::<i64>();
+            dqn_total += dqn_seats.iter().map(|&s| scores[s] as i64).sum::<i64>();
+            match dqn_best.cmp(&ga_best) {
+                std::cmp::Ordering::Greater => dqn_wins += 1,
+                std::cmp::Ordering::Less => ga_wins += 1,
+                std::cmp::Ordering::Equal => ties += 1,
+            }
+        }
+        println!("  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts/player", "DQN Bots", dqn_wins, dqn_wins as f64/n as f64*100.0, dqn_total as f64/n as f64/2.0);
+        println!("  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts/player", "GA Champions", ga_wins, ga_wins as f64/n as f64*100.0, ga_total as f64/n as f64/2.0);
+        println!("  {:<14} {:>5}       ({:>4.1}%)", "Ties", ties, ties as f64/n as f64*100.0);
+        return;
+    }
+
     if std::env::args().any(|a| a == "--dqn-bench") {
         let genes = Arc::new(bot::default_genes());
         let champion = bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt");

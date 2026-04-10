@@ -538,142 +538,128 @@ fn pick_passive_move_with_model(
     }
 }
 
-/// Play one self-play game, recording (state_features, final_score) for player 0.
-fn self_play_game(
+/// A simple wrapper to use the DQN model as an opponent (no epsilon, no recording).
+struct DqnSelfPlayOpponent {
+    model: QwixxModel<MyBackend>,
+    device: burn::backend::ndarray::NdArrayDevice,
+}
+
+impl std::fmt::Debug for DqnSelfPlayOpponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "DqnSelfPlayOpponent")
+    }
+}
+
+impl Strategy for DqnSelfPlayOpponent {
+    fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
+        let ctx = OpponentContext::default(); // opponent doesn't need perfect context
+        let mut moves = state.generate_moves(dice);
+        moves.push(Move::Strike);
+        let mut rng = SmallRng::from_entropy();
+        pick_move_with_model(&self.model, &self.device, state, &moves, 0.0, &mut rng, &ctx)
+    }
+
+    fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
+        let ctx = OpponentContext::default();
+        pick_passive_move_with_model(&self.model, &self.device, state, number, locked, &ctx)
+    }
+}
+
+/// Build opponent context for player 0 given all player states.
+fn make_context_multi(our_state: &State, all_states: &[State]) -> OpponentContext {
+    let our_score = our_state.count_points();
+    let mut max_strikes = 0u8;
+    let mut max_score = our_score;
+    let mut num_opponents = 0u8;
+    for s in all_states.iter().skip(1) {
+        num_opponents += 1;
+        max_strikes = max_strikes.max(s.strikes);
+        max_score = max_score.max(s.count_points());
+    }
+    OpponentContext {
+        num_opponents,
+        max_opponent_strikes: max_strikes,
+        score_gap_to_leader: our_score - max_score,
+    }
+}
+
+/// Play a training game: DQN is player 0, opponents are arbitrary strategies.
+/// Records (state_features, final_score) for player 0.
+fn play_training_game(
     model: &QwixxModel<MyBackend>,
     device: &burn::backend::ndarray::NdArrayDevice,
+    opponents: &mut [Box<dyn Strategy>],
     epsilon: f32,
     rng: &mut SmallRng,
 ) -> Vec<TrainingSample> {
-    let mut states = [State::default(), State::default()];
+    let num_players = 1 + opponents.len();
+    let mut states: Vec<State> = (0..num_players).map(|_| State::default()).collect();
     let mut recorded_features: Vec<[f32; NUM_FEATURES]> = Vec::new();
     let mut turn = 0u32;
 
     loop {
         // Game over check
-        if states[0].strikes >= 4 || states[1].strikes >= 4 { break; }
-        if states[0].count_locked() >= 2 || states[1].count_locked() >= 2 { break; }
+        if states.iter().any(|s| s.strikes >= 4) { break; }
+        if states.iter().any(|s| s.count_locked() >= 2) { break; }
 
         let dice: [u8; 6] = core::array::from_fn(|_| rng.gen_range(1..=6));
         let on_white = dice[0] + dice[1];
-        let active = (turn as usize) % 2;
-        let passive = 1 - active;
-
-        // Active turn
-        let ctx = make_context(&states[active], &states[passive]);
-        let mut moves = states[active].generate_moves(dice);
-        moves.push(Move::Strike);
-        let mov = pick_move_with_model(model, device, &states[active], &moves, epsilon, rng, &ctx);
-
-        // Record state AFTER the move for player 0
-        if active == 0 {
-            let mut s = states[0];
-            s.apply_move(mov);
-            let ctx0 = make_context(&s, &states[1]);
-            recorded_features.push(state_features(&s, &ctx0));
-        }
-
-        states[active].apply_move(mov);
-        let locked = states[active].locked();
-
-        // Passive turn
-        let ctx_passive = make_context(&states[passive], &states[active]);
-        let passive_mov = pick_passive_move_with_model(
-            model, device, &states[passive], on_white, locked, &ctx_passive,
-        );
-        if let Some(mov) = passive_mov {
-            // Record passive marks for player 0 too
-            if passive == 0 {
-                let mut s = states[0];
-                s.apply_move(mov);
-                s.lock(locked);
-                let ctx0 = make_context(&s, &states[1]);
-                recorded_features.push(state_features(&s, &ctx0));
-            }
-            states[passive].apply_move(mov);
-        }
-
-        // Propagate locks
-        let all_locked = [
-            states[0].locked()[0] || states[1].locked()[0],
-            states[0].locked()[1] || states[1].locked()[1],
-            states[0].locked()[2] || states[1].locked()[2],
-            states[0].locked()[3] || states[1].locked()[3],
-        ];
-        states[0].lock(all_locked);
-        states[1].lock(all_locked);
-
-        turn += 1;
-        if turn > 200 { break; }
-    }
-
-    let final_score = states[0].count_points() as f32;
-
-    recorded_features
-        .into_iter()
-        .map(|features| TrainingSample {
-            features: features.to_vec(),
-            value: final_score,
-        })
-        .collect()
-}
-
-/// Play a game where DQN (player 0) plays against an arbitrary strategy (player 1).
-fn play_against_strategy(
-    model: &QwixxModel<MyBackend>,
-    device: &burn::backend::ndarray::NdArrayDevice,
-    opponent: &mut dyn Strategy,
-    epsilon: f32,
-    rng: &mut SmallRng,
-) -> Vec<TrainingSample> {
-    let mut states = [State::default(), State::default()];
-    let mut recorded_features: Vec<[f32; NUM_FEATURES]> = Vec::new();
-    let mut turn = 0u32;
-
-    loop {
-        if states[0].strikes >= 4 || states[1].strikes >= 4 { break; }
-        if states[0].count_locked() >= 2 || states[1].count_locked() >= 2 { break; }
-
-        let dice: [u8; 6] = core::array::from_fn(|_| rng.gen_range(1..=6));
-        let on_white = dice[0] + dice[1];
-        let active = (turn as usize) % 2;
-        let passive = 1 - active;
+        let active = (turn as usize) % num_players;
 
         if active == 0 {
             // DQN's active turn
-            let ctx = make_context(&states[0], &states[1]);
+            let ctx = make_context_multi(&states[0], &states);
             let mut moves = states[0].generate_moves(dice);
             moves.push(Move::Strike);
             let mov = pick_move_with_model(model, device, &states[0], &moves, epsilon, rng, &ctx);
             let mut s = states[0];
             s.apply_move(mov);
-            let ctx_after = make_context(&s, &states[1]);
+            let ctx_after = make_context_multi(&s, &states);
             recorded_features.push(state_features(&s, &ctx_after));
             states[0].apply_move(mov);
-            let locked = states[0].locked();
-            // Opponent's passive turn
-            let opp_mov = opponent.opponents_move(&states[1], on_white, locked);
-            if let Some(mov) = opp_mov { states[1].apply_move(mov); }
-            states[1].lock(locked);
-            states[0].lock(states[1].locked());
         } else {
             // Opponent's active turn
-            let opp_mov = opponent.your_move(&states[1], dice);
-            states[1].apply_move(opp_mov);
-            let locked = states[1].locked();
-            // DQN's passive turn
-            let ctx = make_context(&states[0], &states[1]);
-            let our_mov = pick_passive_move_with_model(model, device, &states[0], on_white, locked, &ctx);
-            if let Some(mov) = our_mov {
-                let mut s = states[0];
-                s.apply_move(mov);
-                s.lock(locked);
-                let ctx_after = make_context(&s, &states[1]);
-                recorded_features.push(state_features(&s, &ctx_after));
-                states[0].apply_move(mov);
+            let opp_idx = active - 1;
+            let opp_mov = opponents[opp_idx].your_move(&states[active], dice);
+            states[active].apply_move(opp_mov);
+        }
+
+        let mut new_locked = states[active].locked();
+
+        // Passive turns for all non-active players
+        for idx in 1..num_players {
+            let passive = (active + idx) % num_players;
+            if passive == 0 {
+                // DQN's passive turn
+                let ctx = make_context_multi(&states[0], &states);
+                let our_mov = pick_passive_move_with_model(
+                    model, device, &states[0], on_white, new_locked, &ctx,
+                );
+                if let Some(mov) = our_mov {
+                    let mut s = states[0];
+                    s.apply_move(mov);
+                    s.lock(new_locked);
+                    let ctx_after = make_context_multi(&s, &states);
+                    recorded_features.push(state_features(&s, &ctx_after));
+                    states[0].apply_move(mov);
+                }
+            } else {
+                let opp_idx = passive - 1;
+                let opp_mov = opponents[opp_idx].opponents_move(
+                    &states[passive], on_white, new_locked,
+                );
+                if let Some(mov) = opp_mov {
+                    states[passive].apply_move(mov);
+                }
             }
-            states[0].lock(locked);
-            states[1].lock(states[0].locked());
+            for (row, locked) in states[passive].locked().iter().enumerate() {
+                new_locked[row] |= *locked;
+            }
+        }
+
+        // Propagate all locks
+        for s in states.iter_mut() {
+            s.lock(new_locked);
         }
 
         turn += 1;
@@ -725,26 +711,61 @@ pub fn self_play_train(
                 .expect("Failed to load model")
         };
 
-        // Generate mixed training data: self-play + vs GA champion + vs Opportunist
+        // Generate mixed training data: varied player counts and opponents
         let genes = Arc::new(bot::default_genes());
         let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
         let mut rng = SmallRng::from_entropy();
         let mut new_samples = Vec::new();
-        let games_each = games_per_iteration / 3;
+        let games_each = games_per_iteration / 6;
 
-        // 1/3: self-play
+        // 2-player games
+        // vs self
         for _ in 0..games_each {
-            new_samples.extend(self_play_game(&model, &device, epsilon, &mut rng));
+            let mut opps: Vec<Box<dyn Strategy>> = vec![Box::new(DqnSelfPlayOpponent { model: model.clone(), device: device.clone() })];
+            new_samples.extend(play_training_game(&model, &device, &mut opps, epsilon, &mut rng));
         }
-        // 1/3: vs GA champion
+        // vs GA champion
         for _ in 0..games_each {
-            let mut opp = champion.clone();
-            new_samples.extend(play_against_strategy(&model, &device, &mut opp, epsilon, &mut rng));
+            let mut opps: Vec<Box<dyn Strategy>> = vec![Box::new(champion.clone())];
+            new_samples.extend(play_training_game(&model, &device, &mut opps, epsilon, &mut rng));
         }
-        // 1/3: vs Opportunist
+
+        // 3-player games
         for _ in 0..games_each {
-            let mut opp = crate::strategy::Opportunist;
-            new_samples.extend(play_against_strategy(&model, &device, &mut opp, epsilon, &mut rng));
+            let mut opps: Vec<Box<dyn Strategy>> = vec![
+                Box::new(champion.clone()),
+                Box::new(crate::strategy::Opportunist),
+            ];
+            new_samples.extend(play_training_game(&model, &device, &mut opps, epsilon, &mut rng));
+        }
+
+        // 4-player games
+        // vs 3 GA champions
+        for _ in 0..games_each {
+            let mut opps: Vec<Box<dyn Strategy>> = vec![
+                Box::new(champion.clone()),
+                Box::new(champion.clone()),
+                Box::new(champion.clone()),
+            ];
+            new_samples.extend(play_training_game(&model, &device, &mut opps, epsilon, &mut rng));
+        }
+        // vs mixed
+        for _ in 0..games_each {
+            let mut opps: Vec<Box<dyn Strategy>> = vec![
+                Box::new(champion.clone()),
+                Box::new(crate::strategy::Opportunist),
+                Box::new(crate::strategy::Conservative::default()),
+            ];
+            new_samples.extend(play_training_game(&model, &device, &mut opps, epsilon, &mut rng));
+        }
+        // vs 3 Opportunists
+        for _ in 0..games_each {
+            let mut opps: Vec<Box<dyn Strategy>> = vec![
+                Box::new(crate::strategy::Opportunist),
+                Box::new(crate::strategy::Opportunist),
+                Box::new(crate::strategy::Opportunist),
+            ];
+            new_samples.extend(play_training_game(&model, &device, &mut opps, epsilon, &mut rng));
         }
 
         // Compute avg score from this iteration's games
