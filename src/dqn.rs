@@ -129,9 +129,9 @@ pub struct QwixxModel<B: Backend> {
 
 #[derive(Config, Debug)]
 pub struct QwixxModelConfig {
-    #[config(default = 32)]
+    #[config(default = 64)]
     pub hidden1: usize,
-    #[config(default = 16)]
+    #[config(default = 32)]
     pub hidden2: usize,
 }
 
@@ -670,11 +670,34 @@ fn play_training_game(
     }
 
     let final_score = states[0].count_points() as f32;
+
+    // Compute TD(lambda) targets backwards through the trajectory
+    let lambda = 0.8f32;
+    let n = recorded_features.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Get model's value estimates for each recorded state
+    let values: Vec<f32> = recorded_features
+        .iter()
+        .map(|f| model.evaluate_state(f, device))
+        .collect();
+
+    // Compute targets: G_t = (1-lambda)*V(s_{t+1}) + lambda*G_{t+1}
+    // G_{n-1} = final_score
+    let mut targets = vec![0.0f32; n];
+    targets[n - 1] = final_score;
+    for t in (0..n - 1).rev() {
+        targets[t] = (1.0 - lambda) * values[t + 1] + lambda * targets[t + 1];
+    }
+
     recorded_features
         .into_iter()
-        .map(|features| TrainingSample {
+        .zip(targets)
+        .map(|(features, target)| TrainingSample {
             features: features.to_vec(),
-            value: final_score,
+            value: target,
         })
         .collect()
 }
