@@ -65,6 +65,7 @@ fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
     }
 }
 
+#[allow(dead_code)]
 fn bot_name(bot: &BotType, index: usize, total: usize) -> String {
     if total > 1 {
         format!("{} #{}", bot, index + 1)
@@ -151,7 +152,7 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
     for i in 0..num_games {
         // Rotate starting positions
         let rotation = i % num_players;
-        let mut players: Vec<Player> = (0..num_players)
+        let players: Vec<Player> = (0..num_players)
             .map(|j| {
                 let bot_idx = (j + num_players - rotation) % num_players;
                 Player::new(make_strategy(&bots[bot_idx]), Box::new(SmallRng::from_entropy()))
@@ -240,7 +241,7 @@ fn run_train() {
     let mut pop = bot::Population::new(100, bot::default_genes(), 42);
     pop.evolve(200);
 
-    let champion = pop.current_champion().clone();
+    let _champion = pop.current_champion().clone();
     println!("\nBenchmarking champion vs Opportunist...\n");
     run_bench(vec![BotType::Ga, BotType::Opportunist], 10_000);
 }

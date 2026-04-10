@@ -2,17 +2,13 @@
 /// Uses absorbing Markov chains per row to restrict moves to only those that
 /// decrease expected rolls to lock. Uses the "2 sums from 3 dice" criterion
 /// (the best-performing variant from the thesis).
-use crate::state::{Mark, Move, State};
+use crate::state::{Move, State};
 use crate::strategy::Strategy;
 
 /// Row state: (free pointer, mark count). Count < 5 is transient, >= 5 is lockable.
 /// For ascending rows (Red/Yellow): free ranges 2-12, mark towards 12.
 /// Descending rows are handled by mirroring.
-#[derive(Clone, Copy, Debug)]
-struct RowState {
-    free: u8,  // next markable number (2-12 ascending)
-    count: u8, // marks so far (0-10)
-}
+// RowState removed — was unused placeholder from initial design
 
 /// Precomputed allowed-transitions table for one row direction.
 /// allowed[free_idx][count] is a bitmask of which numbers (2-12) are allowed to mark.
@@ -40,7 +36,7 @@ impl AllowedTable {
             let free = free_idx as u8 + 2;
             for count in 0..5usize {
                 for n in free..=11u8 {
-                    let new_free_idx = (n + 1 - 2) as usize; // n+1-2
+                    let _new_free_idx = (n + 1 - 2) as usize; // n+1-2
                     let new_count = count + 1;
                     // Only allow if the resulting state can eventually lock
                     // Dead end: free=12 (new_free_idx=10) with count < 5
@@ -148,7 +144,7 @@ impl AllowedTable {
                     }
 
                     if n_mark > 0 {
-                        let p = n_mark as f64 / 216.0;
+                        let _p = n_mark as f64 / 216.0;
                         // E = 1/p + (weighted_e / n_mark)
                         // Derived from: E = 1 + (n_mark/216)*avg_E_next + ((216-n_mark)/216)*E
                         // => E * (n_mark/216) = 1 + (weighted_e/216)

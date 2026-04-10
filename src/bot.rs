@@ -2,7 +2,7 @@ use crate::game::{Game, Player};
 use crate::state::Move;
 use crate::state::State;
 use crate::strategy::Strategy;
-use itertools::Itertools;
+
 use rand::distributions::WeightedIndex;
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -202,6 +202,7 @@ impl DNA {
     }
 }
 
+#[allow(dead_code)]
 pub struct Population {
     genes: Arc<Vec<GeneFn>>,
     dna: Vec<DNA>,
@@ -209,6 +210,7 @@ pub struct Population {
 }
 
 impl Population {
+    #[allow(dead_code)]
     pub fn single(dna: DNA) -> Self {
         Self {
             genes: Arc::clone(&dna.genes),
@@ -334,6 +336,7 @@ impl Population {
         }
     }
 
+    #[allow(dead_code)]
     pub fn champion(&self, rank: &[f32]) -> DNA {
         self.dna
             .iter()

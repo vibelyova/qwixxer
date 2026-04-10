@@ -170,7 +170,7 @@ impl Strategy for BlankScoreBased {
 
         let mark_score = Self::score_move(state, best_mark);
         let skip_score = {
-            let (g, p, c, l) = Self::score_skip();
+            let (g, p, c, _l) = Self::score_skip();
             g + p + c // single skip sub-move
         };
 

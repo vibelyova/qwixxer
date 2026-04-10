@@ -1,7 +1,7 @@
 use crate::state::{Move, State};
 use crate::strategy::Strategy;
 
-use rand::{prelude::*, rngs::SmallRng, Rng};
+use rand::{rngs::SmallRng, Rng};
 
 pub trait DiceSource: std::fmt::Debug {
     fn roll(&mut self) -> [u8; 6];
@@ -14,6 +14,7 @@ impl DiceSource for SmallRng {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ManualDice;
 
 impl DiceSource for ManualDice {

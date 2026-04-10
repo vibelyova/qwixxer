@@ -63,6 +63,7 @@ impl State {
         self.rows.iter().map(|row| row.free.is_none() as u8).sum()
     }
 
+    #[allow(dead_code)]
     pub fn lockable_rows(&self) -> u8 {
         self.rows
             .iter()
@@ -188,6 +189,7 @@ impl State {
     }
 
     // Probability that at least one of N opponents will roll a number I can mark with no blanks.
+    #[allow(dead_code)]
     pub fn probability_n(&self, n: u8) -> f32 {
         let p = self.probability();
         1.0 - (1.0 - p).powi(n as i32)
@@ -393,6 +395,7 @@ const DICE_COLORS: [&str; 6] = [
     "\x1b[91m", "\x1b[93m", // red, yellow
     "\x1b[92m", "\x1b[94m", // green, blue
 ];
+#[allow(dead_code)]
 const DICE_NAMES: [&str; 6] = ["W", "W", "R", "Y", "G", "B"];
 
 pub fn format_dice(dice: [u8; 6]) -> String {

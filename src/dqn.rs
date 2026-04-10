@@ -1,5 +1,4 @@
 use crate::bot::{self, DNA};
-use crate::game::{Game, Player};
 use crate::mcts::MonteCarlo;
 use crate::state::{Move, State};
 use crate::strategy::Strategy;
@@ -12,7 +11,7 @@ use burn::{
     nn::{Linear, LinearConfig, Relu, loss::{MseLoss, Reduction::Mean}},
     optim::AdamConfig,
     prelude::*,
-    record::{CompactRecorder, Recorder},
+    record::CompactRecorder,
     tensor::backend::AutodiffBackend,
     train::{Learner, RegressionOutput, SupervisedTraining, TrainOutput, TrainStep, InferenceStep, metric::LossMetric},
 };
@@ -94,7 +93,7 @@ pub struct TrainingSample {
 
 #[derive(Clone)]
 pub struct QwixxBatcher<B: Backend> {
-    device: B::Device,
+    _phantom: std::marker::PhantomData<B>,
 }
 
 #[derive(Clone, Debug)]
@@ -294,8 +293,8 @@ pub fn train(samples: Vec<TrainingSample>, artifact_dir: &str) {
 
     let model = QwixxModelConfig::new().init::<MyAutodiffBackend>(&device);
 
-    let batcher_train = QwixxBatcher::<MyAutodiffBackend> { device: device.clone() };
-    let batcher_valid = QwixxBatcher::<MyBackend> { device: device.clone() };
+    let batcher_train = QwixxBatcher::<MyAutodiffBackend> { _phantom: std::marker::PhantomData };
+    let batcher_valid = QwixxBatcher::<MyBackend> { _phantom: std::marker::PhantomData };
 
     let dataloader_train = DataLoaderBuilder::new(batcher_train)
         .batch_size(256)
@@ -818,8 +817,8 @@ fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epoch
         .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
         .unwrap_or_else(|_| QwixxModelConfig::new().init::<MyAutodiffBackend>(&device));
 
-    let batcher_train = QwixxBatcher::<MyAutodiffBackend> { device: device.clone() };
-    let batcher_valid = QwixxBatcher::<MyBackend> { device: device.clone() };
+    let batcher_train = QwixxBatcher::<MyAutodiffBackend> { _phantom: std::marker::PhantomData };
+    let batcher_valid = QwixxBatcher::<MyBackend> { _phantom: std::marker::PhantomData };
 
     let dataloader_train = DataLoaderBuilder::new(batcher_train)
         .batch_size(256)
