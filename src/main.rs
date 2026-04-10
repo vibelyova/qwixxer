@@ -2,6 +2,7 @@ mod blank;
 mod bot;
 mod game;
 mod mcts;
+mod race_to_lock;
 mod state;
 mod strategy;
 
@@ -250,6 +251,7 @@ fn solo() {
             move || Box::new(c.clone())
         })),
         ("Blank S.B.", Box::new(|| Box::new(blank::BlankScoreBased))),
+        ("Blank R.T.L.", Box::new(|| Box::new(race_to_lock::BlankRaceToLock::new()))),
     ];
 
     println!("Single-player scores over {n} games:\n");
