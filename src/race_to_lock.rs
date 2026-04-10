@@ -322,8 +322,8 @@ impl Strategy for BlankRaceToLock {
             }
         }
 
-        // Prefer allowed moves, sorted by smallest gap
-        let mut scored: Vec<_> = moves
+        // Prefer allowed moves by smallest gap; fall back to any move (smallest gap)
+        let scored: Vec<_> = moves
             .iter()
             .map(|&m| {
                 let (allowed, gap_score) = self.score_move(state, m);
@@ -340,8 +340,13 @@ impl Strategy for BlankRaceToLock {
             return mov;
         }
 
-        // No allowed moves — strike (skip this turn)
-        Move::Strike
+        // No allowed moves — fall back to smallest-gap mark rather than striking
+        scored
+            .iter()
+            .filter(|(m, _, _)| !matches!(m, Move::Strike))
+            .max_by_key(|(_, _, gap)| *gap)
+            .map(|(m, _, _)| *m)
+            .unwrap_or(Move::Strike)
     }
 
     fn opponents_move(&mut self, state: &State, number: u8, _locked: [bool; 4]) -> Option<Move> {
@@ -410,6 +415,43 @@ mod tests {
     }
 
     #[test]
+    fn debug_before_after_restrictions() {
+        // Show expected rolls before and after restrictions
+        let mut allowed = [[0u16; 5]; 11];
+        for free_idx in 0..11usize {
+            let free = free_idx as u8 + 2;
+            for count in 0..5usize {
+                for n in free..=11u8 {
+                    let new_count = count + 1;
+                    let remaining = 12u8.saturating_sub(n + 1);
+                    let needed = 5usize.saturating_sub(new_count);
+                    if remaining as usize >= needed || new_count >= 5 {
+                        allowed[free_idx][count] |= 1u16 << (n - 2);
+                    }
+                }
+                if count + 1 >= 5 {
+                    allowed[free_idx][count] |= 1u16 << 10;
+                }
+            }
+        }
+        let before = AllowedTable::compute_expected(&allowed);
+        let table = AllowedTable::compute();
+        let after = AllowedTable::compute_expected(&table.allowed);
+
+        println!("\nState (free, count) | Before E | After E | Before mask | After mask");
+        for count in 0..5 {
+            for free in 2..=8u8 {
+                let fi = (free - 2) as usize;
+                println!(
+                    "  ({free:>2}, {count})             {:>6.1}    {:>6.1}   {:011b}    {:011b}",
+                    before[fi][count], after[fi][count],
+                    allowed[fi][count], table.allowed[fi][count],
+                );
+            }
+        }
+    }
+
+    #[test]
     fn debug_expected_chain() {
         let mut allowed = [[0u16; 5]; 11];
         for free_idx in 0..11usize {
@@ -449,5 +491,23 @@ mod tests {
         let e0 = expected[0][0]; // (free=2, count=0)
         println!("Expected rolls from initial state (after restrictions): {e0:.1}");
         assert!(e0 > 5.0 && e0 < 100.0, "Expected rolls should be reasonable, got {e0}");
+    }
+
+    #[test]
+    fn count_strikes_in_solo() {
+        use crate::game::{Game, Player};
+        use rand::{rngs::SmallRng, SeedableRng};
+        let mut total_strikes = 0u32;
+        let n = 1000;
+        for _ in 0..n {
+            let mut game = Game::new(vec![Player::new(
+                Box::new(BlankRaceToLock::new()),
+                Box::new(SmallRng::from_entropy()),
+            )]);
+            game.play();
+            total_strikes += game.players[0].state.strikes as u32;
+        }
+        let avg = total_strikes as f64 / n as f64;
+        println!("RTL avg strikes per game: {avg:.2}");
     }
 }

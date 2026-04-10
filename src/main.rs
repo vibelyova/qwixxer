@@ -108,8 +108,54 @@ fn bench() {
         );
     }
 
-    // 2v2: GA Bots vs Blank Score-Based
-    println!("\n=== 2v2: GA Bots vs Blank Score-Based ({n} 4-player games) ===\n");
+    // 1v1: GA Bot vs Blank Race-to-Lock
+    println!("\n=== 1v1: GA Bot vs Blank Race-to-Lock ({n} games, alternating seats) ===\n");
+    {
+        let mut a_wins = 0u32;
+        let mut b_wins = 0u32;
+        let mut ties = 0u32;
+        let mut a_total = 0i64;
+        let mut b_total = 0i64;
+
+        for i in 0..n {
+            let (a_seat, b_seat) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
+            let mut players = vec![
+                Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                Player::new(Box::new(race_to_lock::BlankRaceToLock::new()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+            ];
+            if a_seat == 1 {
+                players.swap(0, 1);
+            }
+
+            let mut game = game::Game::new(players);
+            game.play();
+
+            let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+            a_total += scores[a_seat] as i64;
+            b_total += scores[b_seat] as i64;
+            match scores[a_seat].cmp(&scores[b_seat]) {
+                std::cmp::Ordering::Greater => a_wins += 1,
+                std::cmp::Ordering::Less => b_wins += 1,
+                std::cmp::Ordering::Equal => ties += 1,
+            }
+        }
+
+        println!(
+            "  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts",
+            "GA Bot", a_wins, a_wins as f64 / n as f64 * 100.0, a_total as f64 / n as f64
+        );
+        println!(
+            "  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts",
+            "Blank R.T.L.", b_wins, b_wins as f64 / n as f64 * 100.0, b_total as f64 / n as f64
+        );
+        println!(
+            "  {:<14} {:>5}       ({:>4.1}%)",
+            "Ties", ties, ties as f64 / n as f64 * 100.0
+        );
+    }
+
+    // 2v2: GA Bots vs Blank Race-to-Lock
+    println!("\n=== 2v2: GA Bots vs Blank R.T.L. ({n} 4-player games) ===\n");
     {
         let mut ga_wins = 0u32;
         let mut blank_wins = 0u32;
@@ -118,8 +164,6 @@ fn bench() {
         let mut blank_total = 0i64;
 
         for i in 0..n {
-            // Even: GA at seats 0,2; Blank at 1,3
-            // Odd:  Blank at seats 0,2; GA at 1,3
             let ga_seats: [usize; 2];
             let blank_seats: [usize; 2];
             let game = if i % 2 == 0 {
@@ -127,17 +171,17 @@ fn bench() {
                 blank_seats = [1, 3];
                 game::Game::new(vec![
                     Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
-                    Player::new(Box::new(blank::BlankScoreBased) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                    Player::new(Box::new(race_to_lock::BlankRaceToLock::new()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
                     Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
-                    Player::new(Box::new(blank::BlankScoreBased) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                    Player::new(Box::new(race_to_lock::BlankRaceToLock::new()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
                 ])
             } else {
                 ga_seats = [1, 3];
                 blank_seats = [0, 2];
                 game::Game::new(vec![
-                    Player::new(Box::new(blank::BlankScoreBased) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                    Player::new(Box::new(race_to_lock::BlankRaceToLock::new()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
                     Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
-                    Player::new(Box::new(blank::BlankScoreBased) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                    Player::new(Box::new(race_to_lock::BlankRaceToLock::new()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
                     Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
                 ])
             };
@@ -164,7 +208,7 @@ fn bench() {
         );
         println!(
             "  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts/player",
-            "Blank S.B.", blank_wins, blank_wins as f64 / n as f64 * 100.0, blank_total as f64 / n as f64 / 2.0
+            "Blank R.T.L.", blank_wins, blank_wins as f64 / n as f64 * 100.0, blank_total as f64 / n as f64 / 2.0
         );
         println!(
             "  {:<14} {:>5}       ({:>4.1}%)",
