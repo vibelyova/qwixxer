@@ -54,9 +54,12 @@ pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURE
         features[4 + i] = totals[i] as f32 / 11.0;
         // Row locked
         features[8 + i] = if locked[i] { 1.0 } else { 0.0 };
-        // Per-row probability
+        // Per-row weighted probability: P(free) * (total+1), normalized
         features[12 + i] = match frees[i] {
-            Some(f) => (6.0 - (7.0f32 - f as f32).abs()) / 6.0,
+            Some(f) => {
+                let ways = 6.0 - (7.0f32 - f as f32).abs();
+                (ways / 6.0) * (totals[i] as f32 + 1.0) / 11.0
+            }
             None => 0.0,
         };
     }
@@ -711,64 +714,44 @@ pub fn self_play_train(
                 .expect("Failed to load model")
         };
 
-        // Generate mixed training data: varied player counts and opponents
+        // Generate mixed training data in parallel: varied player counts and opponents
         let genes = Arc::new(bot::default_genes());
         let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
-        let mut rng = SmallRng::from_entropy();
-        let mut new_samples = Vec::new();
         let games_each = games_per_iteration / 6;
 
-        // 2-player games
-        // vs self
-        for _ in 0..games_each {
-            let mut opps: Vec<Box<dyn Strategy>> = vec![Box::new(DqnSelfPlayOpponent { model: model.clone(), device: device.clone() })];
-            new_samples.extend(play_training_game(&model, &device, &mut opps, epsilon, &mut rng));
-        }
-        // vs GA champion
-        for _ in 0..games_each {
-            let mut opps: Vec<Box<dyn Strategy>> = vec![Box::new(champion.clone())];
-            new_samples.extend(play_training_game(&model, &device, &mut opps, epsilon, &mut rng));
-        }
+        // Build a list of game configs: (config_id, game_index)
+        let game_configs: Vec<u8> = (0..6)
+            .flat_map(|config| std::iter::repeat(config).take(games_each))
+            .collect();
 
-        // 3-player games
-        for _ in 0..games_each {
-            let mut opps: Vec<Box<dyn Strategy>> = vec![
-                Box::new(champion.clone()),
-                Box::new(crate::strategy::Opportunist),
-            ];
-            new_samples.extend(play_training_game(&model, &device, &mut opps, epsilon, &mut rng));
-        }
+        // Save model to temp file, each thread loads its own copy
+        let tmp_model_path = format!("{artifact_dir}/tmp_thread_model");
+        model
+            .save_file(&tmp_model_path, &CompactRecorder::new())
+            .expect("Failed to save temp model");
 
-        // 4-player games
-        // vs 3 GA champions
-        for _ in 0..games_each {
-            let mut opps: Vec<Box<dyn Strategy>> = vec![
-                Box::new(champion.clone()),
-                Box::new(champion.clone()),
-                Box::new(champion.clone()),
-            ];
-            new_samples.extend(play_training_game(&model, &device, &mut opps, epsilon, &mut rng));
-        }
-        // vs mixed
-        for _ in 0..games_each {
-            let mut opps: Vec<Box<dyn Strategy>> = vec![
-                Box::new(champion.clone()),
-                Box::new(crate::strategy::Opportunist),
-                Box::new(crate::strategy::Conservative::default()),
-            ];
-            new_samples.extend(play_training_game(&model, &device, &mut opps, epsilon, &mut rng));
-        }
-        // vs 3 Opportunists
-        for _ in 0..games_each {
-            let mut opps: Vec<Box<dyn Strategy>> = vec![
-                Box::new(crate::strategy::Opportunist),
-                Box::new(crate::strategy::Opportunist),
-                Box::new(crate::strategy::Opportunist),
-            ];
-            new_samples.extend(play_training_game(&model, &device, &mut opps, epsilon, &mut rng));
-        }
+        let artifact_dir_str = artifact_dir.to_string();
+        let new_samples: Vec<TrainingSample> = game_configs
+            .par_iter()
+            .flat_map(|&config| {
+                let thread_model = QwixxModelConfig::new()
+                    .init::<MyBackend>(&device)
+                    .load_file(&tmp_model_path, &CompactRecorder::new(), &device)
+                    .expect("Failed to load thread model");
+                let mut rng = SmallRng::from_entropy();
+                let mut opps: Vec<Box<dyn Strategy>> = match config {
+                    0 => vec![Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone() })],
+                    1 => vec![Box::new(champion.clone())],
+                    2 => vec![Box::new(champion.clone()), Box::new(crate::strategy::Opportunist)],
+                    3 => vec![Box::new(champion.clone()), Box::new(champion.clone()), Box::new(champion.clone())],
+                    4 => vec![Box::new(champion.clone()), Box::new(crate::strategy::Opportunist), Box::new(crate::strategy::Conservative::default())],
+                    _ => vec![Box::new(crate::strategy::Opportunist), Box::new(crate::strategy::Opportunist), Box::new(crate::strategy::Opportunist)],
+                };
+                play_training_game(&thread_model, &device, &mut opps, epsilon, &mut rng)
+            })
+            .collect();
 
-        // Compute avg score from this iteration's games
+        // Compute avg score
         let mut game_scores: Vec<f32> = Vec::new();
         let mut prev_val = f32::NAN;
         for s in &new_samples {
