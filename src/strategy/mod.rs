@@ -8,7 +8,9 @@ const RESET: &str = "\x1b[0m";
 pub trait Strategy: std::fmt::Debug {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move;
     fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move>;
-    // fn observe(&mut self, _player: usize, _state: &State) {}
+    fn is_interactive(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -141,6 +143,10 @@ impl Strategy for Interactive {
         println!();
 
         Self::pick_opponent_move(&moves)
+    }
+
+    fn is_interactive(&self) -> bool {
+        true
     }
 }
 

@@ -61,6 +61,10 @@ impl Player {
         }
     }
 
+    pub fn is_interactive(&self) -> bool {
+        self.strategy.is_interactive()
+    }
+
     fn roll(&mut self) -> [u8; 6] {
         self.dice.roll()
     }
@@ -100,7 +104,8 @@ impl Game {
             let dice = self.players[active_player].roll();
             let on_white = dice[0] + dice[1];
 
-            let state_before = if self.verbose && active_player != self.players.len() - 1 {
+            let verbose_active = self.verbose && !self.players[active_player].is_interactive();
+            let state_before = if verbose_active {
                 Some(self.players[active_player].state)
             } else {
                 None
@@ -112,14 +117,15 @@ impl Game {
                 let after = &self.players[active_player].state;
                 let points_diff = after.count_points() - before.count_points();
                 println!(
-                    "\n  \x1b[2m── Bot (Player {}) active turn ──\x1b[0m\n",
+                    "\n  \x1b[2m── Player {} active turn ──\x1b[0m\n",
                     active_player + 1
                 );
                 println!("{}", crate::state::format_dice(dice));
                 println!();
                 println!("{}", after);
                 println!(
-                    "  \x1b[2mBot scored {:+} pts (now {})\x1b[0m",
+                    "  \x1b[2mPlayer {} scored {:+} pts (now {})\x1b[0m",
+                    active_player + 1,
                     points_diff,
                     after.count_points()
                 );
@@ -132,16 +138,17 @@ impl Game {
                 let before = self.players[opponent].state;
                 self.players[opponent].opponents_move(on_white, new_locked);
 
-                if self.verbose && opponent != self.players.len() - 1 {
+                if self.verbose && !self.players[opponent].is_interactive() {
                     let after = &self.players[opponent].state;
                     if after.count_points() != before.count_points() {
                         let diff = after.count_points() - before.count_points();
                         println!(
-                            "  \x1b[2mBot marked on white sum {on_white} ({:+} pts, now {})\x1b[0m",
-                            diff, after.count_points()
+                            "  \x1b[2mPlayer {} marked on white sum {on_white} ({:+} pts, now {})\x1b[0m",
+                            opponent + 1, diff, after.count_points()
                         );
                     } else {
-                        println!("  \x1b[2mBot skipped white sum {on_white}\x1b[0m");
+                        println!("  \x1b[2mPlayer {} skipped white sum {on_white}\x1b[0m",
+                            opponent + 1);
                     }
                 }
 
