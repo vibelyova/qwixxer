@@ -117,7 +117,8 @@ impl Game {
                     active_player + 1
                 );
                 println!("  \x1b[2m{}\x1b[0m", crate::state::format_dice(dice));
-                println!("  \x1b[2mPlayed: {mov}\x1b[0m");
+                println!("  \x1b[2mPlayed: {mov}\x1b[0m\n");
+                println!("{}", self.players[active_player].state);
             }
 
             let mut new_locked = self.players[active_player].state.locked();
