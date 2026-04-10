@@ -35,9 +35,11 @@ pub fn state_features(state: &State) -> [f32; NUM_FEATURES] {
 
     let mut features = [0.0f32; NUM_FEATURES];
     for i in 0..4 {
-        // Free pointer normalized (0-1), 0 if locked
+        // Row progress (0=start, 1=nearly done), 0 if locked
+        // Ascending (rows 0,1): (free-2)/10. Descending (rows 2,3): (12-free)/10.
         features[i] = match frees[i] {
-            Some(f) => (f as f32 - 2.0) / 10.0,
+            Some(f) if i < 2 => (f as f32 - 2.0) / 10.0,
+            Some(f) => (12.0 - f as f32) / 10.0,
             None => 0.0,
         };
         // Row mark count normalized
