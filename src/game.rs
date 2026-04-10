@@ -129,7 +129,21 @@ impl Game {
 
             for index in 1..self.players.len() {
                 let opponent = (active_player + index) % self.players.len();
+                let before = self.players[opponent].state;
                 self.players[opponent].opponents_move(on_white, new_locked);
+
+                if self.verbose && opponent != self.players.len() - 1 {
+                    let after = &self.players[opponent].state;
+                    if after.count_points() != before.count_points() {
+                        let diff = after.count_points() - before.count_points();
+                        println!(
+                            "  \x1b[2mBot marked on white sum {on_white} ({:+} pts, now {})\x1b[0m",
+                            diff, after.count_points()
+                        );
+                    } else {
+                        println!("  \x1b[2mBot skipped white sum {on_white}\x1b[0m");
+                    }
+                }
 
                 for (row, locked) in self.players[opponent].state.locked().iter().enumerate() {
                     new_locked[row] |= *locked;
