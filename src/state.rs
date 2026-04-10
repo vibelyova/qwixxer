@@ -344,7 +344,7 @@ impl fmt::Display for State {
             }
 
             if row.free.is_none() {
-                writeln!(f, "  {DIM}LOCKED{RESET}")?;
+                writeln!(f, "  {}{}{RESET} {DIM}LOCKED{RESET}", ROW_COLORS[i], row.total)?;
             } else {
                 writeln!(f, "  {}{}{RESET}", ROW_COLORS[i], row.total)?;
             }
@@ -398,13 +398,10 @@ const DICE_NAMES: [&str; 6] = ["W", "W", "R", "Y", "G", "B"];
 pub fn format_dice(dice: [u8; 6]) -> String {
     let mut s = String::from("  Dice  ");
     for (i, &d) in dice.iter().enumerate() {
-        s += &format!(
-            "{BOLD}{}{}:{}{RESET} ",
-            DICE_COLORS[i], DICE_NAMES[i], d
-        );
+        s += &format!("{BOLD}{}{d}{RESET} ", DICE_COLORS[i]);
     }
     let white_sum = dice[0] + dice[1];
-    s += &format!("  {DIM}(white sum: {BOLD}{white_sum}{RESET}{DIM}){RESET}");
+    s += &format!(" {DIM}(white sum: {BOLD}{white_sum}{RESET}{DIM}){RESET}");
     s
 }
 

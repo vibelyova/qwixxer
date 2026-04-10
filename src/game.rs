@@ -82,15 +82,16 @@ impl Player {
 pub struct Game {
     pub players: Vec<Player>,
     start_turn: Option<usize>,
+    pub verbose: bool,
 }
 
 impl Game {
     pub fn new(players: Vec<Player>) -> Self {
-        Self { players, start_turn: None }
+        Self { players, start_turn: None, verbose: false }
     }
 
     pub fn new_from_turn(players: Vec<Player>, start_turn: usize) -> Self {
-        Self { players, start_turn: Some(start_turn) }
+        Self { players, start_turn: Some(start_turn), verbose: false }
     }
 
     pub fn play(&mut self) {
@@ -99,7 +100,31 @@ impl Game {
             let dice = self.players[active_player].roll();
             let on_white = dice[0] + dice[1];
 
+            if self.verbose && active_player != self.players.len() - 1 {
+                // Bot's active turn — show dice and board before move
+                println!(
+                    "\n  \x1b[2m── Bot (Player {}) active turn ──\x1b[0m\n",
+                    active_player + 1
+                );
+                println!("{}", crate::state::format_dice(dice));
+                println!();
+                println!("{}", self.players[active_player].state);
+            }
+
+            let state_before = self.players[active_player].state;
             self.players[active_player].your_move(dice);
+
+            if self.verbose && active_player != self.players.len() - 1 {
+                // Show what the bot did
+                let state_after = &self.players[active_player].state;
+                let points_diff = state_after.count_points() - state_before.count_points();
+                println!(
+                    "  \x1b[2mBot scored {:+} pts (now {})\x1b[0m",
+                    points_diff,
+                    state_after.count_points()
+                );
+            }
+
             let mut new_locked = self.players[active_player].state.locked();
 
             for index in 1..self.players.len() {

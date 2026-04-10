@@ -344,6 +344,7 @@ fn main() {
         .expect("No champion.txt found. Run --train first.");
 
     let use_ga = std::env::args().any(|a| a == "--ga");
+    let verbose = std::env::args().any(|a| a == "--verbose");
 
     println!(
         "Playing against {} bot...\n",
@@ -363,6 +364,7 @@ fn main() {
             Box::new(SmallRng::from_entropy()),
         ),
     ]);
+    game.verbose = verbose;
 
     game.play();
     game.print_game_over();
