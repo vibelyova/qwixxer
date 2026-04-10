@@ -139,11 +139,11 @@ pub struct QwixxModelConfig {
 impl QwixxModelConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> QwixxModel<B> {
         QwixxModel {
-            layer1: LinearConfig::new(NUM_FEATURES, self.hidden1).with_bias(true).init(device),
+            layer1: LinearConfig::new(NUM_FEATURES, self.hidden1).with_bias(false).init(device),
             bn1: BatchNormConfig::new(self.hidden1).init(device),
-            layer2: LinearConfig::new(self.hidden1, self.hidden2).with_bias(true).init(device),
+            layer2: LinearConfig::new(self.hidden1, self.hidden2).with_bias(false).init(device),
             bn2: BatchNormConfig::new(self.hidden2).init(device),
-            output: LinearConfig::new(self.hidden2, 1).with_bias(true).init(device),
+            output: LinearConfig::new(self.hidden2, 1).with_bias(true).init(device), // output keeps bias (no BN after it)
             activation: Relu::new(),
         }
     }
