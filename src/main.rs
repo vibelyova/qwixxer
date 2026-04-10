@@ -394,14 +394,15 @@ fn main() {
         .expect("No champion.txt found. Run --train first.");
 
     let use_ga = std::env::args().any(|a| a == "--ga");
+    let use_dqn = std::env::args().any(|a| a == "--dqn");
     let verbose = std::env::args().any(|a| a == "--verbose");
 
-    println!(
-        "Playing against {} bot...\n",
-        if use_ga { "GA champion" } else { "MCTS (500 sims/move)" }
-    );
+    let bot_name = if use_dqn { "DQN" } else if use_ga { "GA champion" } else { "MCTS (500 sims/move)" };
+    println!("Playing against {bot_name} bot...\n");
 
-    let bot_strategy: Box<dyn strategy::Strategy> = if use_ga {
+    let bot_strategy: Box<dyn strategy::Strategy> = if use_dqn {
+        Box::new(dqn::DqnStrategy::load("dqn_model"))
+    } else if use_ga {
         Box::new(champion)
     } else {
         Box::new(mcts::MonteCarlo::new(500, champion))
