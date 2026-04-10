@@ -1,3 +1,4 @@
+mod blank;
 mod bot;
 mod game;
 mod mcts;
@@ -181,6 +182,7 @@ fn solo() {
             let c = champion.clone();
             move || Box::new(c.clone())
         })),
+        ("Blank S.B.", Box::new(|| Box::new(blank::BlankScoreBased))),
     ];
 
     println!("Single-player scores over {n} games:\n");
