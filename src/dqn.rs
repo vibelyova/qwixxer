@@ -195,11 +195,19 @@ pub fn generate_training_data(num_games: usize, mc_sims: usize) -> Vec<TrainingS
                     let mut all_moves = moves;
                     all_moves.push(Move::Strike);
 
-                    for &mov in &all_moves {
+                    // Evaluate all moves once, cache results
+                    let evaluated: Vec<(Move, f64)> = all_moves
+                        .iter()
+                        .map(|&mov| {
+                            let mc_value = mc.evaluate_move_public(&state, mov, &opponent_state);
+                            (mov, mc_value)
+                        })
+                        .collect();
+
+                    for &(mov, mc_value) in &evaluated {
                         let mut new_state = state;
                         new_state.apply_move(mov);
                         let features = state_features(&new_state);
-                        let mc_value = mc.evaluate_move_public(&state, mov, &opponent_state);
                         local_samples.push(TrainingSample {
                             features: features.to_vec(),
                             value: mc_value as f32,
@@ -207,15 +215,11 @@ pub fn generate_training_data(num_games: usize, mc_sims: usize) -> Vec<TrainingS
                     }
 
                     // Play the MC-best move
-                    let best_move = all_moves
+                    let best_move = evaluated
                         .iter()
-                        .max_by(|&&a, &&b| {
-                            let va = mc.evaluate_move_public(&state, a, &opponent_state);
-                            let vb = mc.evaluate_move_public(&state, b, &opponent_state);
-                            va.partial_cmp(&vb).unwrap()
-                        })
-                        .copied()
-                        .unwrap();
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                        .unwrap()
+                        .0;
                     state.apply_move(best_move);
                     let locked = state.locked();
                     let opp_mov = ga.opponents_move(&opponent_state, on_white, locked);
@@ -375,7 +379,6 @@ impl Strategy for DqnStrategy {
         }
 
         // Evaluate mark vs skip
-        let current_val = self.evaluate(state);
         let best = moves
             .into_iter()
             .max_by(|&a, &b| {

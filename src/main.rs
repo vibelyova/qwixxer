@@ -351,19 +351,16 @@ fn main() {
         let genes = Arc::new(bot::default_genes());
         let champion = bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt");
 
-        let n = 10_000;
+        let n = 1_000;
         let mut dqn_wins = 0u32;
         let mut ga_wins = 0u32;
         let mut ties = 0u32;
 
-        // We need DqnStrategy to be cloneable or shared, but it's not.
-        // Use Rc/RefCell or just recreate. For simplicity, benchmark GA vs Opportunist
-        // and DQN vs Opportunist separately.
         println!("DQN vs Opportunist ({n} games, alternating seats):\n");
         let mut dqn_total = 0i64;
         let mut opp_total = 0i64;
         for i in 0..n {
-            let mut dqn_bot = dqn::DqnStrategy::load("dqn_model");
+            let dqn_bot = dqn::DqnStrategy::load("dqn_model");
             let (d_seat, o_seat) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
             let mut players = vec![
                 Player::new(Box::new(dqn_bot) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
