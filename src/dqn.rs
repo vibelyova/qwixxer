@@ -35,12 +35,12 @@ pub fn state_features(state: &State) -> [f32; NUM_FEATURES] {
 
     let mut features = [0.0f32; NUM_FEATURES];
     for i in 0..4 {
-        // Row progress (0=start, 1=nearly done), 0 if locked
+        // Row progress (0=start, 1=done). Locked = 1.0 (completed).
         // Ascending (rows 0,1): (free-2)/10. Descending (rows 2,3): (12-free)/10.
         features[i] = match frees[i] {
             Some(f) if i < 2 => (f as f32 - 2.0) / 10.0,
             Some(f) => (12.0 - f as f32) / 10.0,
-            None => 0.0,
+            None => 1.0,
         };
         // Row mark count normalized
         features[4 + i] = totals[i] as f32 / 11.0;
