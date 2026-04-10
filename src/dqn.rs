@@ -580,8 +580,8 @@ fn self_play_game(
         .collect()
 }
 
-/// Self-play RL training loop.
-/// Uses the existing train() function at each iteration, loading/saving the model between rounds.
+/// Self-play RL training loop with replay buffer.
+/// Keeps samples from the last `buffer_iterations` rounds to prevent forgetting.
 pub fn self_play_train(
     artifact_dir: &str,
     num_iterations: usize,
@@ -589,6 +589,8 @@ pub fn self_play_train(
     epochs_per_iteration: usize,
 ) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+    let buffer_iterations = 5; // keep last 5 iterations of data
+    let mut replay_buffer: Vec<Vec<TrainingSample>> = Vec::new();
 
     for iteration in 0..num_iterations {
         let epsilon = (0.2 * (0.95f32).powi(iteration as i32)).max(0.05);
@@ -599,7 +601,6 @@ pub fn self_play_train(
 
         // Load current model for inference
         let model: QwixxModel<MyBackend> = if iteration == 0 {
-            // Try loading pretrained, fall back to random
             QwixxModelConfig::new()
                 .init::<MyBackend>(&device)
                 .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
@@ -616,17 +617,17 @@ pub fn self_play_train(
 
         // Generate self-play data
         let mut rng = SmallRng::from_entropy();
-        let mut all_samples = Vec::new();
+        let mut new_samples = Vec::new();
 
         for _ in 0..games_per_iteration {
             let samples = self_play_game(&model, &device, epsilon, &mut rng);
-            all_samples.extend(samples);
+            new_samples.extend(samples);
         }
 
-        // Compute avg score
+        // Compute avg score from this iteration's games
         let mut game_scores: Vec<f32> = Vec::new();
         let mut prev_val = f32::NAN;
-        for s in &all_samples {
+        for s in &new_samples {
             if s.value != prev_val {
                 game_scores.push(s.value);
                 prev_val = s.value;
@@ -637,12 +638,21 @@ pub fn self_play_train(
         } else {
             game_scores.iter().sum::<f32>() / game_scores.len() as f32
         };
+
+        // Update replay buffer
+        replay_buffer.push(new_samples);
+        if replay_buffer.len() > buffer_iterations {
+            replay_buffer.remove(0);
+        }
+
+        let all_samples: Vec<TrainingSample> = replay_buffer.iter().flatten().cloned().collect();
         println!(
-            "  Generated {} samples from {games_per_iteration} games (avg score: {avg_score:.1})",
+            "  Generated {} new samples (avg score: {avg_score:.1}), replay buffer: {} total",
+            replay_buffer.last().unwrap().len(),
             all_samples.len()
         );
 
-        // Train using the existing train function (handles model init, optimizer, epochs)
+        // Train on the full replay buffer
         train_with_epochs(all_samples, artifact_dir, epochs_per_iteration);
     }
 
