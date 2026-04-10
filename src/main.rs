@@ -105,8 +105,8 @@ enum Commands {
         #[arg(short, long, default_value = "10000")]
         num_games: usize,
     },
-    /// Train the GA champion
-    Train,
+    /// Evolve the GA champion via genetic algorithm
+    Evolve,
     /// Train DQN (MC-supervised)
     DqnTrain,
     /// DQN self-play reinforcement learning
@@ -262,7 +262,7 @@ fn main() {
         Some(Commands::Play { bots, verbose }) => run_play(bots, verbose),
         Some(Commands::Bench { bots, num_games }) => run_bench(bots, num_games),
         Some(Commands::Solo { num_games }) => run_solo(num_games),
-        Some(Commands::Train) => run_train(),
+        Some(Commands::Evolve) => run_train(),
         Some(Commands::DqnTrain) => run_dqn_train(),
         Some(Commands::DqnSelfplay) => run_dqn_selfplay(),
         None => {
