@@ -347,7 +347,7 @@ fn main() {
     }
 
     if std::env::args().any(|a| a == "--dqn-selfplay") {
-        dqn::self_play_train("dqn_model", 50, 1000, 10);
+        dqn::self_play_train("dqn_model", 20, 1000, 10);
         return;
     }
 
