@@ -352,40 +352,72 @@ fn main() {
     }
 
     if std::env::args().any(|a| a == "--dqn-bench") {
-        let dqn_bot = dqn::DqnStrategy::load("dqn_model");
         let genes = Arc::new(bot::default_genes());
         let champion = bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt");
 
         let n = 1_000;
-        let mut dqn_wins = 0u32;
-        let mut ga_wins = 0u32;
-        let mut ties = 0u32;
 
+        // DQN vs Opportunist
         println!("DQN vs Opportunist ({n} games, alternating seats):\n");
-        let mut dqn_total = 0i64;
-        let mut opp_total = 0i64;
-        for i in 0..n {
-            let dqn_bot = dqn::DqnStrategy::load("dqn_model");
-            let (d_seat, o_seat) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
-            let mut players = vec![
-                Player::new(Box::new(dqn_bot) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
-                Player::new(Box::<strategy::Opportunist>::default(), Box::new(SmallRng::from_entropy())),
-            ];
-            if d_seat == 1 { players.swap(0, 1); }
-            let mut game = game::Game::new(players);
-            game.play();
-            let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
-            dqn_total += scores[d_seat] as i64;
-            opp_total += scores[o_seat] as i64;
-            match scores[d_seat].cmp(&scores[o_seat]) {
-                std::cmp::Ordering::Greater => dqn_wins += 1,
-                std::cmp::Ordering::Less => ga_wins += 1,
-                std::cmp::Ordering::Equal => ties += 1,
+        {
+            let mut a_wins = 0u32;
+            let mut b_wins = 0u32;
+            let mut ties = 0u32;
+            let mut a_total = 0i64;
+            let mut b_total = 0i64;
+            for i in 0..n {
+                let (a_seat, b_seat) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
+                let mut players = vec![
+                    Player::new(Box::new(dqn::DqnStrategy::load("dqn_model")) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                    Player::new(Box::<strategy::Opportunist>::default(), Box::new(SmallRng::from_entropy())),
+                ];
+                if a_seat == 1 { players.swap(0, 1); }
+                let mut game = game::Game::new(players);
+                game.play();
+                let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+                a_total += scores[a_seat] as i64;
+                b_total += scores[b_seat] as i64;
+                match scores[a_seat].cmp(&scores[b_seat]) {
+                    std::cmp::Ordering::Greater => a_wins += 1,
+                    std::cmp::Ordering::Less => b_wins += 1,
+                    std::cmp::Ordering::Equal => ties += 1,
+                }
             }
+            println!("  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts", "DQN Bot", a_wins, a_wins as f64/n as f64*100.0, a_total as f64/n as f64);
+            println!("  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts", "Opportunist", b_wins, b_wins as f64/n as f64*100.0, b_total as f64/n as f64);
+            println!("  {:<14} {:>5}       ({:>4.1}%)", "Ties", ties, ties as f64/n as f64*100.0);
         }
-        println!("  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts", "DQN Bot", dqn_wins, dqn_wins as f64/n as f64*100.0, dqn_total as f64/n as f64);
-        println!("  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts", "Opportunist", ga_wins, ga_wins as f64/n as f64*100.0, opp_total as f64/n as f64);
-        println!("  {:<14} {:>5}       ({:>4.1}%)", "Ties", ties, ties as f64/n as f64*100.0);
+
+        // DQN vs GA Champion
+        println!("\nDQN vs GA Champion ({n} games, alternating seats):\n");
+        {
+            let mut a_wins = 0u32;
+            let mut b_wins = 0u32;
+            let mut ties = 0u32;
+            let mut a_total = 0i64;
+            let mut b_total = 0i64;
+            for i in 0..n {
+                let (a_seat, b_seat) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
+                let mut players = vec![
+                    Player::new(Box::new(dqn::DqnStrategy::load("dqn_model")) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                    Player::new(Box::new(champion.clone()) as Box<dyn strategy::Strategy>, Box::new(SmallRng::from_entropy())),
+                ];
+                if a_seat == 1 { players.swap(0, 1); }
+                let mut game = game::Game::new(players);
+                game.play();
+                let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+                a_total += scores[a_seat] as i64;
+                b_total += scores[b_seat] as i64;
+                match scores[a_seat].cmp(&scores[b_seat]) {
+                    std::cmp::Ordering::Greater => a_wins += 1,
+                    std::cmp::Ordering::Less => b_wins += 1,
+                    std::cmp::Ordering::Equal => ties += 1,
+                }
+            }
+            println!("  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts", "DQN Bot", a_wins, a_wins as f64/n as f64*100.0, a_total as f64/n as f64);
+            println!("  {:<14} {:>5} wins ({:>4.1}%)  avg {:.1} pts", "GA Champion", b_wins, b_wins as f64/n as f64*100.0, b_total as f64/n as f64);
+            println!("  {:<14} {:>5}       ({:>4.1}%)", "Ties", ties, ties as f64/n as f64*100.0);
+        }
         return;
     }
 
