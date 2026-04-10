@@ -580,7 +580,75 @@ fn self_play_game(
         .collect()
 }
 
-/// Self-play RL training loop with replay buffer.
+/// Play a game where DQN (player 0) plays against an arbitrary strategy (player 1).
+fn play_against_strategy(
+    model: &QwixxModel<MyBackend>,
+    device: &burn::backend::ndarray::NdArrayDevice,
+    opponent: &mut dyn Strategy,
+    epsilon: f32,
+    rng: &mut SmallRng,
+) -> Vec<TrainingSample> {
+    let mut states = [State::default(), State::default()];
+    let mut recorded_features: Vec<[f32; NUM_FEATURES]> = Vec::new();
+    let mut turn = 0u32;
+
+    loop {
+        if states[0].strikes >= 4 || states[1].strikes >= 4 { break; }
+        if states[0].count_locked() >= 2 || states[1].count_locked() >= 2 { break; }
+
+        let dice: [u8; 6] = core::array::from_fn(|_| rng.gen_range(1..=6));
+        let on_white = dice[0] + dice[1];
+        let active = (turn as usize) % 2;
+        let passive = 1 - active;
+
+        if active == 0 {
+            // DQN's active turn
+            let mut moves = states[0].generate_moves(dice);
+            moves.push(Move::Strike);
+            let mov = pick_move_with_model(model, device, &states[0], &moves, epsilon, rng);
+            let mut s = states[0];
+            s.apply_move(mov);
+            recorded_features.push(state_features(&s));
+            states[0].apply_move(mov);
+            let locked = states[0].locked();
+            // Opponent's passive turn
+            let opp_mov = opponent.opponents_move(&states[1], on_white, locked);
+            if let Some(mov) = opp_mov { states[1].apply_move(mov); }
+            states[1].lock(locked);
+            states[0].lock(states[1].locked());
+        } else {
+            // Opponent's active turn
+            let opp_mov = opponent.your_move(&states[1], dice);
+            states[1].apply_move(opp_mov);
+            let locked = states[1].locked();
+            // DQN's passive turn
+            let our_mov = pick_passive_move_with_model(model, device, &states[0], on_white, locked);
+            if let Some(mov) = our_mov {
+                let mut s = states[0];
+                s.apply_move(mov);
+                s.lock(locked);
+                recorded_features.push(state_features(&s));
+                states[0].apply_move(mov);
+            }
+            states[0].lock(locked);
+            states[1].lock(states[0].locked());
+        }
+
+        turn += 1;
+        if turn > 200 { break; }
+    }
+
+    let final_score = states[0].count_points() as f32;
+    recorded_features
+        .into_iter()
+        .map(|features| TrainingSample {
+            features: features.to_vec(),
+            value: final_score,
+        })
+        .collect()
+}
+
+/// Self-play RL training loop with replay buffer and mixed opponents.
 /// Keeps samples from the last `buffer_iterations` rounds to prevent forgetting.
 pub fn self_play_train(
     artifact_dir: &str,
@@ -615,13 +683,26 @@ pub fn self_play_train(
                 .expect("Failed to load model")
         };
 
-        // Generate self-play data
+        // Generate mixed training data: self-play + vs GA champion + vs Opportunist
+        let genes = Arc::new(bot::default_genes());
+        let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
         let mut rng = SmallRng::from_entropy();
         let mut new_samples = Vec::new();
+        let games_each = games_per_iteration / 3;
 
-        for _ in 0..games_per_iteration {
-            let samples = self_play_game(&model, &device, epsilon, &mut rng);
-            new_samples.extend(samples);
+        // 1/3: self-play
+        for _ in 0..games_each {
+            new_samples.extend(self_play_game(&model, &device, epsilon, &mut rng));
+        }
+        // 1/3: vs GA champion
+        for _ in 0..games_each {
+            let mut opp = champion.clone();
+            new_samples.extend(play_against_strategy(&model, &device, &mut opp, epsilon, &mut rng));
+        }
+        // 1/3: vs Opportunist
+        for _ in 0..games_each {
+            let mut opp = crate::strategy::Opportunist;
+            new_samples.extend(play_against_strategy(&model, &device, &mut opp, epsilon, &mut rng));
         }
 
         // Compute avg score from this iteration's games
