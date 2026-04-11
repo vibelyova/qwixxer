@@ -8,6 +8,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, ValueEnum)]
 enum BotType {
     Ga,
+    #[cfg(feature = "dqn")]
     Dqn,
     Mcts,
     Opportunist,
@@ -22,6 +23,7 @@ impl std::fmt::Display for BotType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             BotType::Ga => write!(f, "GA"),
+            #[cfg(feature = "dqn")]
             BotType::Dqn => write!(f, "DQN"),
             BotType::Mcts => write!(f, "MCTS"),
             BotType::Opportunist => write!(f, "Opportunist"),
@@ -42,6 +44,7 @@ fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
                 .expect("No champion.txt found. Run `train ga` first.");
             Box::new(champion)
         }
+        #[cfg(feature = "dqn")]
         BotType::Dqn => Box::new(dqn::DqnStrategy::load("dqn_model")),
         BotType::Mcts => {
             let champion = bot::DNA::load_weights("champion.txt", genes)
@@ -101,8 +104,10 @@ enum Commands {
     /// Evolve the GA champion via genetic algorithm
     Evolve,
     /// Train DQN (MC-supervised)
+    #[cfg(feature = "dqn")]
     DqnTrain,
     /// DQN self-play reinforcement learning
+    #[cfg(feature = "dqn")]
     DqnSelfplay,
 }
 
@@ -201,8 +206,14 @@ fn run_solo(num_games: usize) {
         (BotType::Ga, champion.is_some()),
         (BotType::BlankSb, true),
         (BotType::BlankRtl, true),
-        (BotType::Dqn, std::path::Path::new("dqn_model/model.mpk").exists()),
     ];
+
+    #[cfg(feature = "dqn")]
+    let all_bots = {
+        let mut v = all_bots;
+        v.push((BotType::Dqn, std::path::Path::new("dqn_model/model.mpk").exists()));
+        v
+    };
 
     println!("Single-player scores over {num_games} games:\n");
     for (bot, available) in &all_bots {
@@ -238,11 +249,13 @@ fn run_train() {
     run_bench(vec![BotType::Ga, BotType::Opportunist], 10_000);
 }
 
+#[cfg(feature = "dqn")]
 fn run_dqn_train() {
     let samples = dqn::generate_training_data(500, 200);
     dqn::train(samples, "dqn_model");
 }
 
+#[cfg(feature = "dqn")]
 fn run_dqn_selfplay() {
     dqn::self_play_train("dqn_model", 80, 3000, 10);
 }
@@ -255,7 +268,9 @@ fn main() {
         Some(Commands::Bench { bots, num_games }) => run_bench(bots, num_games),
         Some(Commands::Solo { num_games }) => run_solo(num_games),
         Some(Commands::Evolve) => run_train(),
+        #[cfg(feature = "dqn")]
         Some(Commands::DqnTrain) => run_dqn_train(),
+        #[cfg(feature = "dqn")]
         Some(Commands::DqnSelfplay) => run_dqn_selfplay(),
         None => {
             // Default: play against MCTS

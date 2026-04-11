@@ -193,6 +193,16 @@ impl DNA {
         Ok(DNA { weights, genes })
     }
 
+    pub fn load_weights_from_bytes(bytes: &[u8], genes: Arc<Vec<GeneFn>>) -> Self {
+        let content = std::str::from_utf8(bytes).expect("Invalid UTF-8");
+        let weights: Vec<f64> = content
+            .lines()
+            .map(|line| line.split_whitespace().last().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(weights.len(), genes.len(), "Weight count mismatch");
+        DNA { weights, genes }
+    }
+
     pub fn instinct(&self, state: &State) -> f64 {
         self.genes
             .iter()

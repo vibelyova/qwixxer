@@ -11,12 +11,16 @@ path = "src/lib.rs"
 name = "qwixxer"
 path = "src/main.rs"
 
+[features]
+default = ["dqn"]
+dqn = ["burn", "serde"]
+
 [dependencies]
 anyhow = "1"
-burn = { version = "0.20.1", features = ["train", "ndarray"] }
+burn = { version = "0.20.1", features = ["train", "ndarray"], optional = true }
 clap = { version = "4.6.0", features = ["derive"] }
 env_logger = "0.11.8"
 itertools = "0.12"
 rand = { version = "0.8", features = ["small_rng"] }
 rayon = "1"
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"], optional = true }
