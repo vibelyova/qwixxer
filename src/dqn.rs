@@ -24,7 +24,7 @@ type MyBackend = NdArray;
 type MyAutodiffBackend = Autodiff<MyBackend>;
 
 /// Number of input features for the state representation.
-pub const NUM_FEATURES: usize = 21;
+pub const NUM_FEATURES: usize = 17;
 
 /// Context about opponents, updated via observe_opponents.
 #[derive(Clone, Debug, Default)]
@@ -53,23 +53,44 @@ pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURE
         features[4 + i] = totals[i] as f32 / 11.0;
         // Row locked
         features[8 + i] = if locked[i] { 1.0 } else { 0.0 };
-        // Per-row weighted probability: P(free) * (total+1), normalized
-        features[12 + i] = match frees[i] {
-            Some(f) => {
-                let ways = 6.0 - (7.0f32 - f as f32).abs();
-                (ways / 6.0) * (totals[i] as f32 + 1.0) / 11.0
-            }
-            None => 0.0,
-        };
     }
+
+    // Aggregated weighted probability: for each possible white sum (2-12),
+    // find the best mark value across all markable rows, weight by P(sum).
+    // Correctly handles overlapping free pointers.
+    let mut agg_wp = 0.0f32;
+    for white_sum in 2..=12u8 {
+        let ways = 6.0 - (7.0f32 - white_sum as f32).abs();
+        let prob = ways / 36.0;
+
+        // Best value from marking this sum across all rows
+        let mut best_value = 0.0f32;
+        for i in 0..4 {
+            let Some(free) = frees[i] else { continue };
+            let can_mark = if i < 2 {
+                white_sum >= free
+            } else {
+                white_sum <= free
+            };
+            if can_mark {
+                // Lock requires 5+ marks
+                let is_lock = (i < 2 && white_sum == 12) || (i >= 2 && white_sum == 2);
+                if is_lock && totals[i] < 5 { continue; }
+                let value = (totals[i] as f32 + 1.0) / 11.0;
+                best_value = best_value.max(value);
+            }
+        }
+        agg_wp += prob * best_value;
+    }
+    features[12] = agg_wp;
+
     // Strikes normalized
-    features[16] = state.strikes as f32 / 4.0;
+    features[13] = state.strikes as f32 / 4.0;
     // Blanks normalized
-    features[17] = state.blanks() as f32 / 40.0;
+    features[14] = state.blanks() as f32 / 40.0;
     // Opponent context
-    features[18] = ctx.num_opponents as f32 / 4.0;
-    features[19] = ctx.max_opponent_strikes as f32 / 4.0;
-    features[20] = (ctx.score_gap_to_leader as f32 / 100.0).clamp(-1.0, 1.0);
+    features[15] = ctx.num_opponents as f32 / 4.0;
+    features[16] = ctx.max_opponent_strikes as f32 / 4.0;
 
     features
 }
