@@ -130,7 +130,10 @@ function createRow(
         }
 
         // Interactive states (only for player board)
-        if (!isOpponent && clickableCells && clickableCells.has(cellKey)) {
+        const isClickable = !isOpponent && clickableCells && clickableCells.has(cellKey);
+        const isSelected = !isOpponent && selectedCells && selectedCells.has(cellKey);
+
+        if (isClickable || isSelected) {
             cell.classList.add('clickable');
             cell.addEventListener('click', () => {
                 if (onCellClick) {
@@ -139,7 +142,7 @@ function createRow(
             });
         }
 
-        if (!isOpponent && selectedCells && selectedCells.has(cellKey)) {
+        if (isSelected) {
             cell.classList.add('selected');
         }
 
