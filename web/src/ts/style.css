@@ -1,0 +1,494 @@
+/* ---- Reset & Base ---- */
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+:root {
+    --red: #ef4444;
+    --yellow: #eab308;
+    --green: #22c55e;
+    --blue: #3b82f6;
+    --bg: #1a1a2e;
+    --surface: #16213e;
+    --surface-light: #1f3056;
+    --text: #e2e8f0;
+    --text-dim: #64748b;
+    --text-bright: #f8fafc;
+    --danger: #ef4444;
+    --cell-size: 38px;
+    --cell-gap: 3px;
+}
+
+body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+}
+
+#app {
+    width: 100%;
+    max-width: 640px;
+    padding: 12px 8px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+/* ---- Header ---- */
+header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 4px;
+}
+
+header h1 {
+    font-size: 1.5rem;
+    font-weight: 800;
+    letter-spacing: -0.5px;
+    background: linear-gradient(135deg, var(--red), var(--yellow), var(--green), var(--blue));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+
+#controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+#controls label {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+}
+
+#bot-select {
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--surface-light);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 0.8rem;
+    cursor: pointer;
+}
+
+#new-game-btn {
+    background: var(--surface-light);
+    color: var(--text);
+    border: 1px solid #334155;
+    border-radius: 6px;
+    padding: 4px 12px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+#new-game-btn:hover {
+    background: #334155;
+}
+
+/* ---- Board Sections ---- */
+.board-section {
+    background: var(--surface);
+    border-radius: 10px;
+    padding: 10px 12px;
+    position: relative;
+}
+
+.board-section.opponent {
+    opacity: 0.7;
+    transform: scale(0.92);
+    transform-origin: top center;
+}
+
+.board-section.opponent:hover {
+    opacity: 0.9;
+}
+
+.board-label {
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+}
+
+/* ---- Scoresheet Row ---- */
+.score-row {
+    display: flex;
+    align-items: center;
+    gap: var(--cell-gap);
+    margin-bottom: var(--cell-gap);
+}
+
+.score-row:last-child {
+    margin-bottom: 0;
+}
+
+.cell {
+    width: var(--cell-size);
+    height: var(--cell-size);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 5px;
+    font-size: 0.85rem;
+    font-weight: 700;
+    position: relative;
+    flex-shrink: 0;
+    transition: opacity 0.15s, transform 0.1s;
+}
+
+/* Color backgrounds */
+.cell.red { background: var(--red); color: #fff; }
+.cell.yellow { background: var(--yellow); color: #1a1a2e; }
+.cell.green { background: var(--green); color: #fff; }
+.cell.blue { background: var(--blue); color: #fff; }
+
+/* Marked cells: bright with checkmark overlay */
+.cell.marked {
+    opacity: 1;
+}
+
+.cell.marked::after {
+    content: '\2717';
+    position: absolute;
+    font-size: 1.3rem;
+    font-weight: 900;
+    color: rgba(0, 0, 0, 0.45);
+}
+
+/* Past cells (before free pointer, not yet marked) */
+.cell.past {
+    opacity: 0.25;
+}
+
+/* Available cells */
+.cell.available {
+    opacity: 1;
+}
+
+/* Lock cell (12 or 2 at the end) */
+.cell.lock-cell {
+    position: relative;
+}
+
+.cell.lock-unavailable {
+    opacity: 0.3;
+}
+
+.cell.lock-unavailable::after {
+    content: '\1F512';
+    position: absolute;
+    font-size: 0.6rem;
+    bottom: 1px;
+    right: 2px;
+}
+
+/* Locked row */
+.score-row.locked-row .cell {
+    opacity: 0.3;
+}
+
+.score-row.locked-row .cell.marked {
+    opacity: 0.5;
+}
+
+/* ---- Row info (count + score area) ---- */
+.row-info {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: 6px;
+    min-width: 30px;
+}
+
+.row-count {
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--text-dim);
+    white-space: nowrap;
+}
+
+/* ---- Strikes & Score Footer ---- */
+.sheet-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid var(--surface-light);
+}
+
+.strikes-area {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.strikes-label {
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.strike-box {
+    width: 24px;
+    height: 24px;
+    border: 2px solid var(--surface-light);
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.9rem;
+    font-weight: 900;
+    color: transparent;
+}
+
+.strike-box.struck {
+    color: var(--danger);
+    border-color: var(--danger);
+    background: rgba(239, 68, 68, 0.1);
+}
+
+.total-score {
+    font-size: 1.1rem;
+    font-weight: 800;
+    color: var(--text-bright);
+}
+
+.total-score span {
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--text-dim);
+    margin-right: 4px;
+}
+
+/* ---- Dice Area ---- */
+#dice-area {
+    display: flex;
+    justify-content: center;
+    padding: 4px 0;
+}
+
+#dice-container {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: center;
+}
+
+.die {
+    width: 44px;
+    height: 44px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.3rem;
+    font-weight: 800;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    position: relative;
+}
+
+.die.white {
+    background: #f1f5f9;
+    color: #1e293b;
+}
+
+.die.red { background: var(--red); color: #fff; }
+.die.yellow { background: var(--yellow); color: #1a1a2e; }
+.die.green { background: var(--green); color: #fff; }
+.die.blue { background: var(--blue); color: #fff; }
+
+.die-label {
+    position: absolute;
+    bottom: -14px;
+    font-size: 0.55rem;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.white-sum {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin-left: 8px;
+    padding: 4px 12px;
+    background: var(--surface);
+    border-radius: 8px;
+    border: 1px solid var(--surface-light);
+}
+
+.white-sum-label {
+    font-size: 0.6rem;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.white-sum-value {
+    font-size: 1.4rem;
+    font-weight: 800;
+    color: var(--text-bright);
+}
+
+/* ---- Message Area ---- */
+#message-area {
+    text-align: center;
+    padding: 2px 0;
+}
+
+#message {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text);
+    min-height: 1.3em;
+}
+
+#message.game-over {
+    font-size: 1.1rem;
+    color: var(--text-bright);
+    padding: 8px;
+    background: var(--surface);
+    border-radius: 8px;
+    border: 1px solid var(--surface-light);
+}
+
+/* ---- Moves Area ---- */
+#moves-area {
+    display: flex;
+    justify-content: center;
+    padding: 2px 0;
+}
+
+#moves-container {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    justify-content: center;
+    max-width: 100%;
+}
+
+.move-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    justify-content: center;
+    width: 100%;
+}
+
+.move-btn {
+    padding: 8px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--surface-light);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+}
+
+.move-btn:hover {
+    background: var(--surface-light);
+    transform: translateY(-1px);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+}
+
+.move-btn:active {
+    transform: translateY(0);
+}
+
+.move-btn.single {
+    border-left: 3px solid var(--text-dim);
+}
+
+.move-btn.double {
+    border-left: 3px solid var(--yellow);
+}
+
+.move-btn.strike {
+    border-left: 3px solid var(--danger);
+    color: var(--danger);
+}
+
+.move-btn.skip {
+    border-left: 3px solid var(--text-dim);
+    color: var(--text-dim);
+}
+
+.move-btn.pass {
+    border-left: 3px solid var(--text-dim);
+    color: var(--text-dim);
+}
+
+/* Color accents on move buttons */
+.move-btn[data-color="red"] { border-left-color: var(--red); }
+.move-btn[data-color="yellow"] { border-left-color: var(--yellow); }
+.move-btn[data-color="green"] { border-left-color: var(--green); }
+.move-btn[data-color="blue"] { border-left-color: var(--blue); }
+
+.no-moves-msg {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    font-style: italic;
+}
+
+/* ---- Responsive ---- */
+@media (max-width: 500px) {
+    :root {
+        --cell-size: 28px;
+        --cell-gap: 2px;
+    }
+
+    header h1 {
+        font-size: 1.2rem;
+    }
+
+    .cell {
+        font-size: 0.7rem;
+    }
+
+    .cell.marked::after {
+        font-size: 1rem;
+    }
+
+    .die {
+        width: 36px;
+        height: 36px;
+        font-size: 1.1rem;
+    }
+
+    .move-btn {
+        padding: 6px 10px;
+        font-size: 0.75rem;
+    }
+
+    .board-section {
+        padding: 8px 6px;
+    }
+}
+
+@media (max-width: 380px) {
+    :root {
+        --cell-size: 24px;
+        --cell-gap: 1px;
+    }
+
+    .cell {
+        font-size: 0.6rem;
+        border-radius: 3px;
+    }
+}

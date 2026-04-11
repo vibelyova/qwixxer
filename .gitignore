@@ -8,3 +8,6 @@ champion-*.txt
 champion_finetuned.txt
 divergences.txt
 *.pdf
+web/pkg/
+web/node_modules/
+web/dist/

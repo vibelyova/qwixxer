@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Qwixxer</title>
+    <link rel="stylesheet" href="/src/ts/style.css" />
+</head>
+<body>
+    <div id="app">
+        <header>
+            <h1>Qwixxer</h1>
+            <div id="controls">
+                <label for="bot-select">Bot:</label>
+                <select id="bot-select">
+                    <option value="ga" selected>GA Champion</option>
+                    <option value="opportunist">Opportunist</option>
+                    <option value="conservative">Conservative</option>
+                    <option value="rusher">Rusher</option>
+                    <option value="random">Random</option>
+                </select>
+                <button id="new-game-btn">New Game</button>
+            </div>
+        </header>
+
+        <section id="bot-area" class="board-section opponent">
+            <div class="board-label">Bot</div>
+            <div id="bot-board"></div>
+        </section>
+
+        <section id="dice-area">
+            <div id="dice-container"></div>
+        </section>
+
+        <section id="message-area">
+            <div id="message"></div>
+        </section>
+
+        <section id="moves-area">
+            <div id="moves-container"></div>
+        </section>
+
+        <section id="player-area" class="board-section player">
+            <div class="board-label">You</div>
+            <div id="player-board"></div>
+        </section>
+    </div>
+
+    <script type="module" src="/src/ts/main.ts"></script>
+</body>
+</html>
