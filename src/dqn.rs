@@ -24,7 +24,7 @@ type MyBackend = NdArray;
 type MyAutodiffBackend = Autodiff<MyBackend>;
 
 /// Number of input features for the state representation.
-pub const NUM_FEATURES: usize = 21;
+pub const NUM_FEATURES: usize = 22;
 
 /// Context about opponents, updated via observe_opponents.
 #[derive(Clone, Debug, Default)]
@@ -99,6 +99,7 @@ pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURE
     // Opponent context
     features[19] = ctx.num_opponents as f32 / 4.0;
     features[20] = ctx.max_opponent_strikes as f32 / 4.0;
+    features[21] = (ctx.score_gap_to_leader as f32 / 100.0).clamp(-1.0, 1.0);
 
     features
 }

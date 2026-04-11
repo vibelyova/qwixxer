@@ -258,7 +258,7 @@ fn run_dqn_train() {
 }
 
 fn run_dqn_selfplay() {
-    dqn::self_play_train("dqn_model", 200, 3000, 10);
+    dqn::self_play_train("dqn_model", 64, 3000, 10);
 }
 
 fn main() {
