@@ -117,16 +117,9 @@ function createRow(
         }
 
         // Lock cell treatment (last number: 12 for ascending, 2 for descending)
-        if (isLastNumber) {
+        if (isLastNumber && !row.locked && row.total < 5 && !isMarked) {
             cell.classList.add('lock-cell');
-            const lockIcon = document.createElement('span');
-            lockIcon.className = 'lock-icon';
-            lockIcon.textContent = '\u{1F512}';
-            cell.appendChild(lockIcon);
-
-            if (!row.locked && row.total < 5 && !isMarked) {
-                cell.classList.add('lock-unavailable');
-            }
+            cell.classList.add('lock-unavailable');
         }
 
         // Interactive states (only for player board)
