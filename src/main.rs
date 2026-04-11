@@ -3,6 +3,7 @@ mod bot;
 mod dqn;
 mod game;
 mod mcts;
+mod policy;
 mod race_to_lock;
 mod state;
 mod strategy;
@@ -17,6 +18,7 @@ use std::sync::Arc;
 enum BotType {
     Ga,
     Dqn,
+    Policy,
     Mcts,
     Opportunist,
     Conservative,
@@ -30,6 +32,7 @@ impl std::fmt::Display for BotType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             BotType::Ga => write!(f, "GA"),
+            BotType::Policy => write!(f, "Policy"),
             BotType::Dqn => write!(f, "DQN"),
             BotType::Mcts => write!(f, "MCTS"),
             BotType::Opportunist => write!(f, "Opportunist"),
@@ -51,6 +54,7 @@ fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
             Box::new(champion)
         }
         BotType::Dqn => Box::new(dqn::DqnStrategy::load("dqn_model")),
+        BotType::Policy => Box::new(policy::PolicyStrategy::load("policy_model")),
         BotType::Mcts => {
             let champion = bot::DNA::load_weights("champion.txt", genes)
                 .expect("No champion.txt found. Run `train ga` first.");
@@ -112,6 +116,8 @@ enum Commands {
     DqnTrain,
     /// DQN self-play reinforcement learning
     DqnSelfplay,
+    /// Policy net self-play training
+    PolicyTrain,
 }
 
 fn run_play(bots: Vec<BotType>, verbose: bool) {
@@ -265,6 +271,7 @@ fn main() {
         Some(Commands::Evolve) => run_train(),
         Some(Commands::DqnTrain) => run_dqn_train(),
         Some(Commands::DqnSelfplay) => run_dqn_selfplay(),
+        Some(Commands::PolicyTrain) => policy::self_play_train("policy_model", 80, 3000, 10),
         None => {
             // Default: play against MCTS
             run_play(vec![BotType::Mcts], false);
