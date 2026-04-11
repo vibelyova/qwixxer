@@ -1,37 +1,260 @@
-import { MoveView } from './types';
+import { MoveView, MoveTarget, ParsedMove, SelectionState } from './types';
+import { targetKey } from './board';
 
 /**
- * Detect the primary color from a move description like "RED 7" or "RED 7 + GRN 10".
+ * Color name abbreviation to row index mapping.
  */
-function detectColor(description: string): string | null {
-    const map: Record<string, string> = {
-        'RED': 'red',
-        'YLW': 'yellow',
-        'GRN': 'green',
-        'BLU': 'blue',
-    };
-    for (const [key, val] of Object.entries(map)) {
-        if (description.startsWith(key)) return val;
+const COLOR_TO_ROW: Record<string, number> = {
+    'RED': 0,
+    'YLW': 1,
+    'GRN': 2,
+    'BLU': 3,
+};
+
+/**
+ * Parse a move description into structured targets.
+ *
+ * Examples:
+ *   "RED 7"         -> [{ row: 0, number: 7 }]
+ *   "RED 7 + GRN 10" -> [{ row: 0, number: 7 }, { row: 2, number: 10 }]
+ *   "Strike"        -> [] (isStrike = true)
+ */
+export function parseMove(move: MoveView): ParsedMove {
+    if (move.is_strike) {
+        return { moveIndex: move.index, targets: [], isStrike: true, isPass: false };
     }
+    if (move.is_pass) {
+        return { moveIndex: move.index, targets: [], isStrike: false, isPass: true };
+    }
+
+    const targets: MoveTarget[] = [];
+    const parts = move.description.split(' + ');
+
+    for (const part of parts) {
+        const tokens = part.trim().split(' ');
+        if (tokens.length >= 2) {
+            const colorKey = tokens[0];
+            const number = parseInt(tokens[1], 10);
+            const row = COLOR_TO_ROW[colorKey];
+            if (row !== undefined && !isNaN(number)) {
+                targets.push({ row, number });
+            }
+        }
+    }
+
+    return { moveIndex: move.index, targets, isStrike: false, isPass: false };
+}
+
+/**
+ * Get the set of all clickable cell keys from the available moves.
+ * A cell is clickable if any non-strike, non-pass move targets it.
+ */
+export function getClickableCells(parsedMoves: ParsedMove[]): Set<string> {
+    const clickable = new Set<string>();
+    for (const pm of parsedMoves) {
+        if (pm.isStrike || pm.isPass) continue;
+        for (const t of pm.targets) {
+            clickable.add(targetKey(t));
+        }
+    }
+    return clickable;
+}
+
+/**
+ * Get the set of clickable cells given current selection state.
+ * After selecting one cell, only cells from compatible moves remain clickable.
+ */
+export function getClickableCellsForSelection(
+    parsedMoves: ParsedMove[],
+    selection: SelectionState
+): Set<string> {
+    if (selection.selected.length === 0) {
+        return getClickableCells(parsedMoves);
+    }
+
+    // Filter to moves compatible with current selection
+    const compatible = parsedMoves.filter(pm =>
+        selection.compatibleMoves.includes(pm.moveIndex)
+    );
+
+    const clickable = new Set<string>();
+    const selectedKeys = new Set(selection.selected.map(t => targetKey(t)));
+
+    for (const pm of compatible) {
+        for (const t of pm.targets) {
+            const key = targetKey(t);
+            if (!selectedKeys.has(key)) {
+                clickable.add(key);
+            }
+        }
+    }
+
+    return clickable;
+}
+
+/**
+ * Given a cell click (row, number), update the selection state.
+ * Returns the new selection state and optionally a move index to auto-confirm.
+ */
+export function handleCellClick(
+    row: number,
+    number: number,
+    parsedMoves: ParsedMove[],
+    currentSelection: SelectionState
+): { newSelection: SelectionState; autoConfirmMove: number | null } {
+    const clickedTarget: MoveTarget = { row, number };
+    const clickedKey = targetKey(clickedTarget);
+
+    // If clicking an already-selected cell, deselect it
+    const existingIdx = currentSelection.selected.findIndex(
+        t => targetKey(t) === clickedKey
+    );
+    if (existingIdx !== -1) {
+        const newSelected = [...currentSelection.selected];
+        newSelected.splice(existingIdx, 1);
+
+        if (newSelected.length === 0) {
+            return {
+                newSelection: {
+                    selected: [],
+                    compatibleMoves: parsedMoves
+                        .filter(pm => !pm.isStrike && !pm.isPass)
+                        .map(pm => pm.moveIndex),
+                    phase: currentSelection.phase,
+                },
+                autoConfirmMove: null,
+            };
+        }
+
+        // Recompute compatible moves for remaining selection
+        const compatible = findCompatibleMoves(newSelected, parsedMoves);
+        return {
+            newSelection: {
+                selected: newSelected,
+                compatibleMoves: compatible,
+                phase: currentSelection.phase,
+            },
+            autoConfirmMove: null,
+        };
+    }
+
+    // Add the clicked cell to the selection
+    const newSelected = [...currentSelection.selected, clickedTarget];
+
+    // Find moves that match ALL selected targets
+    const compatible = findCompatibleMoves(newSelected, parsedMoves);
+
+    if (compatible.length === 0) {
+        // No moves match this combination -- ignore the click
+        return { newSelection: currentSelection, autoConfirmMove: null };
+    }
+
+    // Check if exactly one move is fully matched (all targets selected)
+    const exactMatch = compatible.find(moveIdx => {
+        const pm = parsedMoves.find(p => p.moveIndex === moveIdx);
+        if (!pm) return false;
+        return pm.targets.length === newSelected.length;
+    });
+
+    // If there is exactly one compatible move and all its targets are selected, auto-confirm
+    if (exactMatch !== undefined) {
+        const pm = parsedMoves.find(p => p.moveIndex === exactMatch);
+        if (pm && compatible.length === 1) {
+            // Only one possible move and it's fully specified
+            return {
+                newSelection: {
+                    selected: newSelected,
+                    compatibleMoves: compatible,
+                    phase: currentSelection.phase,
+                },
+                autoConfirmMove: exactMatch,
+            };
+        }
+    }
+
+    return {
+        newSelection: {
+            selected: newSelected,
+            compatibleMoves: compatible,
+            phase: currentSelection.phase,
+        },
+        autoConfirmMove: null,
+    };
+}
+
+/**
+ * Find move indices whose targets are a superset of the given selected targets.
+ */
+function findCompatibleMoves(
+    selected: MoveTarget[],
+    parsedMoves: ParsedMove[]
+): number[] {
+    const selectedKeys = new Set(selected.map(t => targetKey(t)));
+
+    return parsedMoves
+        .filter(pm => {
+            if (pm.isStrike || pm.isPass) return false;
+            // Every selected target must appear in this move's targets
+            for (const key of selectedKeys) {
+                if (!pm.targets.some(t => targetKey(t) === key)) {
+                    return false;
+                }
+            }
+            // The move must have at least as many targets as what's selected
+            return pm.targets.length >= selected.length;
+        })
+        .map(pm => pm.moveIndex);
+}
+
+/**
+ * Find the unique move that exactly matches the current selection.
+ * Returns the move index or null if ambiguous/none.
+ */
+export function findExactMove(
+    selection: SelectionState,
+    parsedMoves: ParsedMove[]
+): number | null {
+    const selectedKeys = new Set(selection.selected.map(t => targetKey(t)));
+
+    const exactMatches = parsedMoves.filter(pm => {
+        if (pm.isStrike || pm.isPass) return false;
+        if (pm.targets.length !== selection.selected.length) return false;
+        return pm.targets.every(t => selectedKeys.has(targetKey(t)));
+    });
+
+    if (exactMatches.length === 1) {
+        return exactMatches[0].moveIndex;
+    }
+
     return null;
 }
 
 /**
- * Check if a move description is a double (contains " + ").
+ * Create the initial (empty) selection state.
  */
-function isDouble(description: string): boolean {
-    return description.includes(' + ');
+export function emptySelection(phase: string, parsedMoves: ParsedMove[]): SelectionState {
+    return {
+        selected: [],
+        compatibleMoves: parsedMoves
+            .filter(pm => !pm.isStrike && !pm.isPass)
+            .map(pm => pm.moveIndex),
+        phase,
+    };
 }
 
 /**
- * Render available moves as clickable buttons.
+ * Render the action buttons (Confirm, Strike, Skip, Reset).
  */
-export function renderMoves(
+export function renderActionButtons(
     containerId: string,
-    moves: MoveView[],
     phase: string,
-    onMove: (index: number) => void,
-    onSkip: () => void
+    selection: SelectionState,
+    parsedMoves: ParsedMove[],
+    moves: MoveView[],
+    onConfirm: (moveIndex: number) => void,
+    onStrike: (moveIndex: number) => void,
+    onSkip: () => void,
+    onReset: () => void
 ): void {
     const container = document.getElementById(containerId);
     if (!container) return;
@@ -39,101 +262,53 @@ export function renderMoves(
     container.innerHTML = '';
 
     const isPlayerTurn = phase === 'player_passive' || phase === 'player_active';
+    if (!isPlayerTurn) return;
 
-    if (!isPlayerTurn) {
-        // Nothing to show during bot turns or game over with no moves
-        return;
-    }
+    // Find strike move
+    const strikeMove = moves.find(m => m.is_strike);
 
-    if (moves.length === 0 && phase === 'player_passive') {
-        // No passive moves, show skip only
-        const skipBtn = createButton('Skip (no moves)', 'skip', () => onSkip());
-        const group = document.createElement('div');
-        group.className = 'move-group';
-        group.appendChild(skipBtn);
-        container.appendChild(group);
-        return;
-    }
+    // Check if there is a confirmable selection
+    const exactMove = findExactMove(selection, parsedMoves);
+    const hasSelection = selection.selected.length > 0;
 
-    if (moves.length === 0) {
-        const msg = document.createElement('div');
-        msg.className = 'no-moves-msg';
-        msg.textContent = 'Waiting...';
-        container.appendChild(msg);
-        return;
-    }
-
-    // Separate moves into categories
-    const singles: MoveView[] = [];
-    const doubles: MoveView[] = [];
-    let strikeMove: MoveView | null = null;
-
-    for (const move of moves) {
-        if (move.is_strike) {
-            strikeMove = move;
-        } else if (isDouble(move.description)) {
-            doubles.push(move);
+    // Confirm button
+    if (hasSelection) {
+        const confirmBtn = document.createElement('button');
+        confirmBtn.className = 'action-btn confirm';
+        confirmBtn.textContent = 'Confirm';
+        if (exactMove !== null) {
+            confirmBtn.addEventListener('click', () => onConfirm(exactMove));
         } else {
-            singles.push(move);
+            confirmBtn.disabled = true;
+            confirmBtn.title = 'Select all required squares first';
         }
+        container.appendChild(confirmBtn);
     }
 
-    // Singles row
-    if (singles.length > 0) {
-        const group = document.createElement('div');
-        group.className = 'move-group';
-        for (const move of singles) {
-            const color = detectColor(move.description);
-            const btn = createButton(move.description, 'single', () => onMove(move.index));
-            if (color) btn.setAttribute('data-color', color);
-            group.appendChild(btn);
-        }
-        container.appendChild(group);
+    // Reset selection
+    if (hasSelection) {
+        const resetBtn = document.createElement('button');
+        resetBtn.className = 'action-btn reset-selection';
+        resetBtn.textContent = 'Clear';
+        resetBtn.addEventListener('click', onReset);
+        container.appendChild(resetBtn);
     }
 
-    // Doubles row
-    if (doubles.length > 0) {
-        const group = document.createElement('div');
-        group.className = 'move-group';
-        for (const move of doubles) {
-            const btn = createButton(move.description, 'double', () => onMove(move.index));
-            group.appendChild(btn);
-        }
-        container.appendChild(group);
-    }
-
-    // Strike / Skip row
-    const actionGroup = document.createElement('div');
-    actionGroup.className = 'move-group';
-
+    // Skip button (passive turn only)
     if (phase === 'player_passive') {
-        // Can skip on passive turn without penalty
-        const skipBtn = createButton('Skip', 'skip', () => onSkip());
-        actionGroup.appendChild(skipBtn);
+        const skipBtn = document.createElement('button');
+        skipBtn.className = 'action-btn skip';
+        skipBtn.textContent = 'Skip';
+        skipBtn.addEventListener('click', onSkip);
+        container.appendChild(skipBtn);
     }
 
-    if (strikeMove) {
-        const btn = createButton(
-            phase === 'player_active' ? 'Strike (-5)' : strikeMove.description,
-            'strike',
-            () => onMove(strikeMove!.index)
-        );
-        actionGroup.appendChild(btn);
+    // Strike button (active turn only)
+    if (phase === 'player_active' && strikeMove) {
+        const strikeBtn = document.createElement('button');
+        strikeBtn.className = 'action-btn strike';
+        strikeBtn.textContent = 'Strike (-5)';
+        strikeBtn.addEventListener('click', () => onStrike(strikeMove.index));
+        container.appendChild(strikeBtn);
     }
-
-    if (actionGroup.children.length > 0) {
-        container.appendChild(actionGroup);
-    }
-}
-
-function createButton(
-    text: string,
-    type: string,
-    onClick: () => void
-): HTMLButtonElement {
-    const btn = document.createElement('button');
-    btn.className = `move-btn ${type}`;
-    btn.textContent = text;
-    btn.addEventListener('click', onClick);
-    return btn;
 }

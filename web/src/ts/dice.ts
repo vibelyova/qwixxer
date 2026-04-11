@@ -34,7 +34,7 @@ export function renderDice(
 
     const sumLabel = document.createElement('span');
     sumLabel.className = 'white-sum-label';
-    sumLabel.textContent = 'Sum';
+    sumLabel.textContent = 'White';
     sumBox.appendChild(sumLabel);
 
     const sumValue = document.createElement('span');
