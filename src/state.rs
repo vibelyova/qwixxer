@@ -88,6 +88,56 @@ impl State {
             .for_each(|(row, _)| row.free = None);
     }
 
+    /// Reconstruct a State from a marks array and strike count.
+    /// marks[row][i] corresponds to the numbers in display order:
+    ///   rows 0,1 (ascending): index 0=number 2, index 10=number 12
+    ///   rows 2,3 (descending): index 0=number 12, index 10=number 2
+    pub fn from_marks(marks: &[[bool; 11]; 4], strikes: u8) -> State {
+        let mut rows = [Row::default(); 4];
+        for (i, row_marks) in marks.iter().enumerate() {
+            let ascending = i < 2;
+            let total: u8 = row_marks.iter().filter(|&&m| m).count() as u8;
+
+            // Find the free pointer: one past the rightmost marked number.
+            // For ascending rows: numbers are 2..=12 (indices 0..=10)
+            // For descending rows: numbers are 12..=2 (indices 0..=10, so index 0=12, index 10=2)
+            let last_marked_index = row_marks.iter().rposition(|&m| m);
+
+            let lock_number_index = 10; // last position is always the lock number
+            let is_locked = last_marked_index == Some(lock_number_index) && total >= 5;
+
+            let free = if is_locked {
+                None
+            } else if let Some(last_idx) = last_marked_index {
+                // Convert index to number
+                let last_number = if ascending {
+                    (last_idx as u8) + 2
+                } else {
+                    12 - (last_idx as u8)
+                };
+                // Free is one past the last marked number
+                if ascending {
+                    Some(last_number + 1)
+                } else {
+                    Some(last_number - 1)
+                }
+            } else {
+                // No marks: default free pointer
+                if ascending { Some(2) } else { Some(12) }
+            };
+
+            // If locked, add 1 to total for the lock bonus (the lock symbol)
+            let total = if is_locked { total + 1 } else { total };
+
+            rows[i] = Row {
+                ascending,
+                total,
+                free,
+            };
+        }
+        State { strikes, rows }
+    }
+
     pub fn count_points(&self) -> isize {
         self.rows
             .iter()

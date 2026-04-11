@@ -668,3 +668,133 @@ header h1 {
         display: none;
     }
 }
+
+/* ---- State Explorer ---- */
+
+#slider-area {
+    display: flex;
+    gap: 24px;
+    justify-content: center;
+    padding: 8px 16px;
+    background: var(--surface);
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    flex-wrap: wrap;
+}
+
+.slider-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 180px;
+}
+
+.slider-group label {
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: var(--text);
+}
+
+.slider-group input[type="range"] {
+    width: 100%;
+    accent-color: var(--text-bright);
+}
+
+#eval-area {
+    background: var(--surface);
+}
+
+.eval-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    margin-bottom: 14px;
+}
+
+.eval-item {
+    text-align: center;
+    padding: 8px 6px;
+    background: #f8f8f5;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+}
+
+.eval-label {
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 2px;
+}
+
+.eval-value {
+    font-size: 1.1rem;
+    font-weight: 900;
+    color: var(--text-bright);
+}
+
+.eval-section-heading {
+    font-size: 0.75rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+    margin-top: 4px;
+}
+
+.gene-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+}
+
+.gene-table th {
+    text-align: left;
+    padding: 4px 8px;
+    border-bottom: 2px solid var(--border);
+    font-size: 0.7rem;
+    font-weight: 700;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.gene-table td {
+    padding: 4px 8px;
+    border-bottom: 1px solid #eee;
+}
+
+.gene-name {
+    font-weight: 700;
+    color: var(--text);
+}
+
+.gene-num {
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    text-align: right;
+    color: var(--text);
+}
+
+.gene-total-row td {
+    border-top: 2px solid var(--border);
+    border-bottom: none;
+    padding-top: 6px;
+}
+
+@media (max-width: 560px) {
+    .eval-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (max-width: 400px) {
+    .eval-grid {
+        grid-template-columns: 1fr 1fr;
+    }
+
+    .slider-group {
+        min-width: 140px;
+    }
+}

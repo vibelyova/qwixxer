@@ -443,6 +443,107 @@ impl WebGame {
     }
 }
 
+// ---- State Explorer ----
+
+#[derive(Serialize)]
+struct ExplorerResult {
+    ga_value: f64,
+    dqn_value: f32,
+    score: isize,
+    blanks: u8,
+    probability: f32,
+    weighted_probability: f32,
+    gene_breakdown: Vec<GeneContribution>,
+}
+
+#[derive(Serialize)]
+struct GeneContribution {
+    name: String,
+    raw_value: f64,
+    weight: f64,
+    contribution: f64,
+}
+
+#[derive(serde::Deserialize)]
+struct ExplorerInput {
+    marks: [[bool; 11]; 4],
+    strikes: u8,
+    num_opponents: u8,
+    score_gap: isize,
+}
+
+#[wasm_bindgen]
+pub struct StateExplorer {
+    ga_champion: bot::DNA,
+    dqn: qwixxer::dqn::DqnStrategy,
+}
+
+#[wasm_bindgen]
+impl StateExplorer {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        let genes = Arc::new(bot::default_genes());
+        let ga_champion = bot::DNA::load_weights_from_bytes(CHAMPION_BYTES, genes);
+        let dqn = qwixxer::dqn::DqnStrategy::load_from_bytes(DQN_MODEL_BYTES);
+
+        StateExplorer {
+            ga_champion,
+            dqn,
+        }
+    }
+
+    pub fn evaluate(&self, state_json: &str) -> String {
+        let input: ExplorerInput = serde_json::from_str(state_json)
+            .expect("Invalid state JSON");
+
+        let state = State::from_marks(&input.marks, input.strikes);
+
+        // GA evaluation
+        let ga_value = self.ga_champion.instinct(&state);
+        let gene_breakdown: Vec<GeneContribution> = self.ga_champion.gene_contributions(&state)
+            .into_iter()
+            .map(|(name, raw, weight, contribution)| GeneContribution {
+                name: name.to_string(),
+                raw_value: raw,
+                weight,
+                contribution,
+            })
+            .collect();
+
+        // DQN evaluation
+        let ctx = qwixxer::dqn::OpponentContext {
+            num_opponents: input.num_opponents,
+            max_opponent_strikes: 0,
+            score_gap_to_leader: input.score_gap,
+        };
+        let dqn_value = self.dqn.evaluate_with_context(&state, &ctx);
+
+        // Compute weighted probability: sum of P(free) * (total+1) per row
+        let totals = state.row_totals();
+        let frees = state.row_free_values();
+        let weighted_probability: f32 = frees.iter()
+            .zip(totals.iter())
+            .map(|(&free, &total)| {
+                let Some(f) = free else { return 0.0 };
+                let ways = 6.0 - (7.0f32 - f as f32).abs();
+                ways / 36.0 * (total as f32 + 1.0)
+            })
+            .sum();
+
+        let result = ExplorerResult {
+            ga_value,
+            dqn_value,
+            score: state.count_points(),
+            blanks: state.blanks(),
+            probability: state.probability(),
+            weighted_probability,
+            gene_breakdown,
+        };
+
+        serde_json::to_string(&result).unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

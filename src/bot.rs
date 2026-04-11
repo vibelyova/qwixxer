@@ -211,6 +211,19 @@ impl DNA {
             .map(|(gene, weight)| gene(state) * weight)
             .sum()
     }
+
+    /// Return individual gene contributions: (gene_name, raw_value, weight, weighted_value)
+    pub fn gene_contributions(&self, state: &State) -> Vec<(&'static str, f64, f64, f64)> {
+        self.genes
+            .iter()
+            .zip(self.weights.iter())
+            .enumerate()
+            .map(|(i, (gene, &weight))| {
+                let raw = gene(state);
+                (GENE_NAMES[i], raw, weight, raw * weight)
+            })
+            .collect()
+    }
 }
 
 #[allow(dead_code)]

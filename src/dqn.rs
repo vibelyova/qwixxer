@@ -218,8 +218,15 @@ impl DqnStrategy {
         DqnStrategy { model, device, context: OpponentContext::default() }
     }
 
-    fn evaluate(&self, state: &State) -> f32 {
+    /// Evaluate a state using the DQN model with the current context.
+    pub fn evaluate(&self, state: &State) -> f32 {
         let features = state_features(state, &self.context);
+        self.model.evaluate_state(&features, &self.device)
+    }
+
+    /// Evaluate a state with a custom opponent context.
+    pub fn evaluate_with_context(&self, state: &State, ctx: &OpponentContext) -> f32 {
+        let features = state_features(state, ctx);
         self.model.evaluate_state(&features, &self.device)
     }
 
