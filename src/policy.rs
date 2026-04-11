@@ -158,37 +158,6 @@ pub fn pass_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURES
     f
 }
 
-// ---- Training data ----
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct TrainingSample {
-    pub features: Vec<f32>,
-    pub value: f32,
-}
-
-#[derive(Clone)]
-pub struct PolicyBatcher<B: Backend> {
-    _phantom: std::marker::PhantomData<B>,
-}
-
-#[derive(Clone, Debug)]
-pub struct PolicyBatch<B: Backend> {
-    pub inputs: Tensor<B, 2>,
-    pub targets: Tensor<B, 1>,
-}
-
-impl<B: Backend> Batcher<B, TrainingSample, PolicyBatch<B>> for PolicyBatcher<B> {
-    fn batch(&self, items: Vec<TrainingSample>, device: &B::Device) -> PolicyBatch<B> {
-        let batch_size = items.len();
-        let inputs: Vec<f32> = items.iter().flat_map(|s| s.features.iter().copied()).collect();
-        let targets: Vec<f32> = items.iter().map(|s| s.value).collect();
-        let inputs = Tensor::<B, 1>::from_floats(inputs.as_slice(), device)
-            .reshape([batch_size, NUM_FEATURES]);
-        let targets = Tensor::<B, 1>::from_floats(targets.as_slice(), device);
-        PolicyBatch { inputs, targets }
-    }
-}
-
 // ---- Model ----
 
 #[derive(Module, Debug)]
@@ -225,35 +194,11 @@ impl<B: Backend> PolicyModel<B> {
         self.output.forward(x)
     }
 
-    pub fn forward_step(&self, batch: PolicyBatch<B>) -> RegressionOutput<B> {
-        let targets = batch.targets.clone().unsqueeze_dim(1);
-        let output = self.forward(batch.inputs);
-        let loss = MseLoss::new().forward(output.clone(), targets.clone(), Mean);
-        RegressionOutput { loss, output, targets }
-    }
-
     pub fn evaluate(&self, features: &[f32; NUM_FEATURES], device: &B::Device) -> f32 {
         let input = Tensor::<B, 1>::from_floats(features.as_slice(), device)
             .reshape([1, NUM_FEATURES]);
         let output = self.forward(input);
         output.into_data().to_vec::<f32>().unwrap()[0]
-    }
-}
-
-impl<B: AutodiffBackend> TrainStep for PolicyModel<B> {
-    type Input = PolicyBatch<B>;
-    type Output = RegressionOutput<B>;
-    fn step(&self, batch: PolicyBatch<B>) -> TrainOutput<RegressionOutput<B>> {
-        let item = self.forward_step(batch);
-        TrainOutput::new(self, item.loss.backward(), item)
-    }
-}
-
-impl<B: Backend> InferenceStep for PolicyModel<B> {
-    type Input = PolicyBatch<B>;
-    type Output = RegressionOutput<B>;
-    fn step(&self, batch: PolicyBatch<B>) -> RegressionOutput<B> {
-        self.forward_step(batch)
     }
 }
 
@@ -352,6 +297,7 @@ fn make_opponent_context(all_states: &[State]) -> OpponentContext {
 }
 
 /// Pick move using the policy model with epsilon-greedy.
+#[allow(dead_code)]
 fn pick_move_with_policy(
     model: &PolicyModel<MyBackend>,
     device: &burn::backend::ndarray::NdArrayDevice,
@@ -380,6 +326,7 @@ fn pick_move_with_policy(
 }
 
 /// Pick passive move using the policy model.
+#[allow(dead_code)]
 fn pick_passive_with_policy(
     model: &PolicyModel<MyBackend>,
     device: &burn::backend::ndarray::NdArrayDevice,
