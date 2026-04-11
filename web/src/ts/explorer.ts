@@ -33,6 +33,7 @@ const marks: boolean[][] = [
 ];
 let strikes = 0;
 let numOpponents = 1;
+let maxOppStrikes = 0;
 let scoreGap = 0;
 
 let explorer: StateExplorer | null = null;
@@ -173,6 +174,7 @@ function evaluate(): void {
         marks,
         strikes,
         num_opponents: numOpponents,
+        max_opponent_strikes: maxOppStrikes,
         score_gap: scoreGap,
     });
 
@@ -302,6 +304,14 @@ async function main(): Promise<void> {
     oppSlider.addEventListener('input', () => {
         numOpponents = parseInt(oppSlider.value);
         oppValue.textContent = oppSlider.value;
+        evaluate();
+    });
+
+    const oppStrikesSlider = document.getElementById('opp-strikes-slider') as HTMLInputElement;
+    const oppStrikesValue = document.getElementById('opp-strikes-value')!;
+    oppStrikesSlider.addEventListener('input', () => {
+        maxOppStrikes = parseInt(oppStrikesSlider.value);
+        oppStrikesValue.textContent = oppStrikesSlider.value;
         evaluate();
     });
 

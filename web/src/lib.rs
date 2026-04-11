@@ -469,6 +469,7 @@ struct ExplorerInput {
     marks: [[bool; 11]; 4],
     strikes: u8,
     num_opponents: u8,
+    max_opponent_strikes: u8,
     score_gap: isize,
 }
 
@@ -513,7 +514,7 @@ impl StateExplorer {
         // DQN evaluation
         let ctx = qwixxer::dqn::OpponentContext {
             num_opponents: input.num_opponents,
-            max_opponent_strikes: 0,
+            max_opponent_strikes: input.max_opponent_strikes,
             score_gap_to_leader: input.score_gap,
         };
         let dqn_value = self.dqn.evaluate_with_context(&state, &ctx);
