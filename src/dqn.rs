@@ -24,7 +24,7 @@ type MyBackend = NdArray;
 type MyAutodiffBackend = Autodiff<MyBackend>;
 
 /// Number of input features for the state representation.
-pub const NUM_FEATURES: usize = 17;
+pub const NUM_FEATURES: usize = 21;
 
 /// Context about opponents, updated via observe_opponents.
 #[derive(Clone, Debug, Default)]
@@ -53,9 +53,17 @@ pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURE
         features[4 + i] = totals[i] as f32 / 11.0;
         // Row locked
         features[8 + i] = if locked[i] { 1.0 } else { 0.0 };
+        // Per-row weighted probability (may double-count overlaps)
+        features[12 + i] = match frees[i] {
+            Some(f) => {
+                let ways = 6.0 - (7.0f32 - f as f32).abs();
+                (ways / 6.0) * (totals[i] as f32 + 1.0) / 11.0
+            }
+            None => 0.0,
+        };
     }
 
-    // Aggregated weighted probability: for each possible white sum (2-12),
+    // Aggregated weighted probability (correct, no double-counting):
     // find the best mark value across all markable rows, weight by P(sum).
     // Correctly handles overlapping free pointers.
     let mut agg_wp = 0.0f32;
@@ -82,15 +90,15 @@ pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURE
         }
         agg_wp += prob * best_value;
     }
-    features[12] = agg_wp;
+    features[16] = agg_wp;
 
     // Strikes normalized
-    features[13] = state.strikes as f32 / 4.0;
+    features[17] = state.strikes as f32 / 4.0;
     // Blanks normalized
-    features[14] = state.blanks() as f32 / 40.0;
+    features[18] = state.blanks() as f32 / 40.0;
     // Opponent context
-    features[15] = ctx.num_opponents as f32 / 4.0;
-    features[16] = ctx.max_opponent_strikes as f32 / 4.0;
+    features[19] = ctx.num_opponents as f32 / 4.0;
+    features[20] = ctx.max_opponent_strikes as f32 / 4.0;
 
     features
 }
@@ -734,8 +742,14 @@ pub fn self_play_train(
     epochs_per_iteration: usize,
 ) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-    let buffer_iterations = 5; // keep last 5 iterations of data
+    let buffer_iterations = 5;
     let mut replay_buffer: Vec<Vec<TrainingSample>> = Vec::new();
+
+    // CSV logging
+    let csv_path = format!("{artifact_dir}/training_log.csv");
+    let mut csv = std::fs::File::create(&csv_path).expect("Failed to create CSV");
+    use std::io::Write;
+    writeln!(csv, "iteration,avg_score,num_samples,epsilon").unwrap();
 
     for iteration in 0..num_iterations {
         let epsilon = (0.2 * (0.95f32).powi(iteration as i32)).max(0.05);
@@ -819,11 +833,13 @@ pub fn self_play_train(
         }
 
         let all_samples: Vec<TrainingSample> = replay_buffer.iter().flatten().cloned().collect();
+        let num_new = replay_buffer.last().unwrap().len();
         println!(
-            "  Generated {} new samples (avg score: {avg_score:.1}), replay buffer: {} total",
-            replay_buffer.last().unwrap().len(),
+            "  Generated {num_new} new samples (avg score: {avg_score:.1}), replay buffer: {} total",
             all_samples.len()
         );
+        writeln!(csv, "{},{avg_score:.2},{num_new},{epsilon:.4}", iteration + 1).unwrap();
+        csv.flush().unwrap();
 
         // Train on the full replay buffer
         train_with_epochs(all_samples, artifact_dir, epochs_per_iteration);
