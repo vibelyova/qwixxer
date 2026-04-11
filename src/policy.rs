@@ -522,6 +522,126 @@ fn reinforce_update<O: burn::optim::Optimizer<PolicyModel<MyAutodiffBackend>, My
     }
 }
 
+/// MSE pretrain: play games using GA champion, record (move_features, final_score),
+/// train the policy net via regression so it starts from a reasonable policy.
+fn pretrain(artifact_dir: &str, num_games: usize) {
+    use burn::nn::loss::{MseLoss, Reduction::Mean};
+
+    let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+    let genes = Arc::new(bot::default_genes());
+    let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
+
+    println!("Pretraining policy net with {num_games} GA champion games...\n");
+
+    // Play games with GA champion, record (chosen_move_features, final_score)
+    let samples: Vec<(Vec<f32>, f32)> = (0..num_games)
+        .into_par_iter()
+        .flat_map(|_| {
+            let mut ga = champion.clone();
+            let mut rng = SmallRng::from_entropy();
+            let num_opps = if rng.gen_bool(0.5) { 2 } else { 3 };
+            let mut states: Vec<State> = (0..num_opps + 1).map(|_| State::default()).collect();
+            let mut features_list: Vec<Vec<f32>> = Vec::new();
+            let mut turn = 0u32;
+
+            loop {
+                if states.iter().any(|s| s.strikes >= 4) { break; }
+                if states.iter().any(|s| s.count_locked() >= 2) { break; }
+
+                let dice: [u8; 6] = core::array::from_fn(|_| rng.gen_range(1..=6));
+                let on_white = dice[0] + dice[1];
+                let active = (turn as usize) % states.len();
+
+                // All players use GA champion
+                let mov = ga.your_move(&states[active], dice);
+                if active == 0 {
+                    let ctx = OpponentContext {
+                        num_opponents: num_opps as u8,
+                        max_opponent_strikes: states[1..].iter().map(|s| s.strikes).max().unwrap_or(0),
+                    };
+                    features_list.push(move_features(&states[0], mov, &ctx).to_vec());
+                }
+                states[active].apply_move(mov);
+
+                let mut new_locked = states[active].locked();
+                for idx in 1..states.len() {
+                    let passive = (active + idx) % states.len();
+                    let pmov = ga.opponents_move(&states[passive], on_white, new_locked);
+                    if active != 0 && passive == 0 {
+                        if let Some(m) = pmov {
+                            let ctx = OpponentContext {
+                                num_opponents: num_opps as u8,
+                                max_opponent_strikes: states[1..].iter().map(|s| s.strikes).max().unwrap_or(0),
+                            };
+                            features_list.push(move_features(&states[0], m, &ctx).to_vec());
+                        }
+                    }
+                    if let Some(m) = pmov { states[passive].apply_move(m); }
+                    for (row, l) in states[passive].locked().iter().enumerate() {
+                        new_locked[row] |= *l;
+                    }
+                }
+                for s in states.iter_mut() { s.lock(new_locked); }
+                turn += 1;
+                if turn > 200 { break; }
+            }
+
+            let final_score = states[0].count_points() as f32;
+            features_list.into_iter().map(|f| (f, final_score)).collect::<Vec<_>>()
+        })
+        .collect();
+
+    println!("  Collected {} samples", samples.len());
+
+    // Train with MSE
+    use burn::optim::Optimizer;
+    let mut model: PolicyModel<MyAutodiffBackend> = PolicyModelConfig::new().init(&device);
+    let mut optimizer = AdamConfig::new().init();
+    let lr = 1e-3;
+
+    for epoch in 0..30 {
+        let mut total_loss = 0.0f32;
+        let mut n_batches = 0u32;
+
+        for batch_start in (0..samples.len()).step_by(256) {
+            let batch_end = (batch_start + 256).min(samples.len());
+            let batch = &samples[batch_start..batch_end];
+            let bs = batch.len();
+
+            let inputs: Vec<f32> = batch.iter().flat_map(|(f, _)| f.iter().copied()).collect();
+            let targets: Vec<f32> = batch.iter().map(|(_, t)| *t).collect();
+
+            let input_tensor = Tensor::<MyAutodiffBackend, 1>::from_floats(inputs.as_slice(), &device)
+                .reshape([bs, NUM_FEATURES]);
+            let target_tensor = Tensor::<MyAutodiffBackend, 1>::from_floats(targets.as_slice(), &device)
+                .unsqueeze_dim(1);
+
+            let output = model.forward(input_tensor);
+            let loss = MseLoss::new().forward(output, target_tensor, Mean);
+
+            let loss_val = loss.clone().into_data().to_vec::<f32>().unwrap()[0];
+            total_loss += loss_val;
+            n_batches += 1;
+
+            let grads = loss.backward();
+            let grads = burn::optim::GradientsParams::from_grads(grads, &model);
+            model = optimizer.step(lr, model, grads);
+        }
+
+        if epoch % 5 == 0 || epoch == 29 {
+            println!("  Epoch {}/30: loss={:.2}", epoch + 1, total_loss / n_batches as f32);
+        }
+    }
+
+    {
+        use burn::module::AutodiffModule;
+        model.valid()
+            .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
+            .expect("Failed to save pretrained model");
+    }
+    println!("  Pretrained model saved.\n");
+}
+
 /// Self-play REINFORCE training for the policy net.
 pub fn self_play_train(
     artifact_dir: &str,
@@ -530,10 +650,15 @@ pub fn self_play_train(
     _epochs_per_iteration: usize,
 ) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-    let mut baseline = 50.0f32; // moving average baseline
+    let mut baseline = 50.0f32;
     let baseline_decay = 0.99f32;
 
     std::fs::create_dir_all(artifact_dir).ok();
+
+    // Pretrain if no model exists
+    if !std::path::Path::new(&format!("{artifact_dir}/model.mpk")).exists() {
+        pretrain(artifact_dir, 2000);
+    }
 
     for iteration in 0..num_iterations {
         let epsilon = (0.3 * (0.97f32).powi(iteration as i32)).max(0.05);
