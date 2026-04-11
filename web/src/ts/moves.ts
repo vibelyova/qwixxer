@@ -243,18 +243,21 @@ export function emptySelection(phase: string, parsedMoves: ParsedMove[]): Select
 }
 
 /**
- * Render the action buttons (Confirm, Strike, Skip, Reset).
+ * Render the action buttons (Confirm, Skip).
+ * Strike is now handled via clickable strike boxes on the scoresheet.
+ * Clear is removed; clicking a selected cell deselects it.
  */
 export function renderActionButtons(
     containerId: string,
     phase: string,
     selection: SelectionState,
     parsedMoves: ParsedMove[],
-    moves: MoveView[],
+    _moves: MoveView[],
     onConfirm: (moveIndex: number) => void,
-    onStrike: (moveIndex: number) => void,
+    _onStrike: (moveIndex: number) => void,
     onSkip: () => void,
-    onReset: () => void
+    _onReset: () => void,
+    strikeSelected?: boolean
 ): void {
     const container = document.getElementById(containerId);
     if (!container) return;
@@ -264,15 +267,12 @@ export function renderActionButtons(
     const isPlayerTurn = phase === 'player_passive' || phase === 'player_active';
     if (!isPlayerTurn) return;
 
-    // Find strike move
-    const strikeMove = moves.find(m => m.is_strike);
-
     // Check if there is a confirmable selection
     const exactMove = findExactMove(selection, parsedMoves);
     const hasSelection = selection.selected.length > 0;
 
-    // Confirm button
-    if (hasSelection) {
+    // Confirm button (for cell selections)
+    if (hasSelection && !strikeSelected) {
         const confirmBtn = document.createElement('button');
         confirmBtn.className = 'action-btn confirm';
         confirmBtn.textContent = 'Confirm';
@@ -285,15 +285,6 @@ export function renderActionButtons(
         container.appendChild(confirmBtn);
     }
 
-    // Reset selection
-    if (hasSelection) {
-        const resetBtn = document.createElement('button');
-        resetBtn.className = 'action-btn reset-selection';
-        resetBtn.textContent = 'Clear';
-        resetBtn.addEventListener('click', onReset);
-        container.appendChild(resetBtn);
-    }
-
     // Skip button (passive turn only)
     if (phase === 'player_passive') {
         const skipBtn = document.createElement('button');
@@ -301,14 +292,5 @@ export function renderActionButtons(
         skipBtn.textContent = 'Skip';
         skipBtn.addEventListener('click', onSkip);
         container.appendChild(skipBtn);
-    }
-
-    // Strike button (active turn only)
-    if (phase === 'player_active' && strikeMove) {
-        const strikeBtn = document.createElement('button');
-        strikeBtn.className = 'action-btn strike';
-        strikeBtn.textContent = 'Strike (-5)';
-        strikeBtn.addEventListener('click', () => onStrike(strikeMove.index));
-        container.appendChild(strikeBtn);
     }
 }

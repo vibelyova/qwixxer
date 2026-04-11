@@ -21,8 +21,8 @@
     --text-dim: #888;
     --text-bright: #111;
     --danger: #e74c3c;
-    --cell-size: 45px;
-    --cell-gap: 4px;
+    --cell-size: 46px;
+    --cell-gap: 3px;
 }
 
 body {
@@ -36,7 +36,7 @@ body {
 
 #app {
     width: 100%;
-    max-width: 680px;
+    max-width: 700px;
     padding: 12px 8px 24px;
     display: flex;
     flex-direction: column;
@@ -115,17 +115,17 @@ header h1 {
 }
 
 .die {
-    width: 48px;
-    height: 48px;
+    width: 54px;
+    height: 54px;
     border-radius: 10px;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 1.5rem;
+    font-size: 1.7rem;
     font-weight: 900;
-    box-shadow: 0 2px 6px rgba(0,0,0,0.15), inset 0 1px 0 rgba(255,255,255,0.3);
+    box-shadow: 0 3px 8px rgba(0,0,0,0.18), inset 0 1px 0 rgba(255,255,255,0.3);
     position: relative;
-    border: 2px solid rgba(0,0,0,0.1);
+    border: 2px solid rgba(0,0,0,0.12);
 }
 
 .die.white {
@@ -153,11 +153,12 @@ header h1 {
     display: flex;
     flex-direction: column;
     align-items: center;
-    margin-left: 12px;
-    padding: 6px 16px;
+    margin-left: 14px;
+    padding: 8px 18px;
     background: var(--surface);
     border-radius: 10px;
     border: 2px solid var(--border);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.08);
 }
 
 .white-sum-label {
@@ -169,7 +170,7 @@ header h1 {
 }
 
 .white-sum-value {
-    font-size: 1.5rem;
+    font-size: 1.7rem;
     font-weight: 900;
     color: var(--text-bright);
 }
@@ -206,13 +207,13 @@ header h1 {
 }
 
 .board-section.opponent {
-    opacity: 0.7;
+    opacity: 0.75;
     transform: scale(0.88);
     transform-origin: top center;
 }
 
 .board-section.opponent:hover {
-    opacity: 0.9;
+    opacity: 0.95;
 }
 
 .board-label {
@@ -243,14 +244,15 @@ header h1 {
     display: flex;
     align-items: center;
     justify-content: center;
-    border-radius: 7px;
-    font-size: 0.95rem;
+    border-radius: 6px;
+    font-size: 1rem;
     font-weight: 800;
     position: relative;
     flex-shrink: 0;
     transition: opacity 0.15s, transform 0.1s, box-shadow 0.15s;
     cursor: default;
     user-select: none;
+    border: 2px solid rgba(0,0,0,0.08);
 }
 
 /* Row color backgrounds */
@@ -259,31 +261,43 @@ header h1 {
 .cell.green { background: var(--green); color: #fff; }
 .cell.blue { background: var(--blue); color: #fff; }
 
-/* Marked cells: big X overlay */
+/* Number text inside cells */
+.cell-number {
+    position: relative;
+    z-index: 1;
+    line-height: 1;
+}
+
+/* ---- Marked cells: bold X overlay, number faintly visible ---- */
 .cell.marked {
-    opacity: 0.85;
+    opacity: 0.9;
 }
 
-.cell.marked::after {
-    content: '\2717';
-    position: absolute;
-    font-size: 1.6rem;
-    font-weight: 900;
-    color: rgba(0, 0, 0, 0.5);
-    text-shadow: 0 0 2px rgba(255,255,255,0.3);
-}
-
-/* Past cells (skipped over) */
-.cell.past {
+.cell.marked .cell-number {
     opacity: 0.25;
 }
 
-/* Available cells (can still be reached) */
+.cell-x {
+    position: absolute;
+    font-size: 1.5rem;
+    font-weight: 900;
+    color: rgba(0, 0, 0, 0.6);
+    text-shadow: 0 0 2px rgba(255,255,255,0.4);
+    z-index: 2;
+    line-height: 1;
+}
+
+/* ---- Skipped cells (blanks before free pointer, NOT marked) ---- */
+.cell.skipped {
+    opacity: 0.3;
+}
+
+/* ---- Available cells (can still be reached) ---- */
 .cell.available {
     opacity: 1;
 }
 
-/* Clickable cells glow */
+/* ---- Clickable cells glow ---- */
 .cell.clickable {
     cursor: pointer;
     box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.8), 0 0 8px rgba(0,0,0,0.2);
@@ -301,7 +315,7 @@ header h1 {
     animation: none;
 }
 
-/* Selected cell */
+/* ---- Selected cell ---- */
 .cell.selected {
     box-shadow: 0 0 0 3px #111, 0 0 0 5px #fff;
     transform: scale(1.1);
@@ -309,17 +323,17 @@ header h1 {
     z-index: 2;
 }
 
-/* Lock cell: last number in the row */
+/* ---- Lock cell: last number in the row ---- */
 .cell.lock-cell {
     position: relative;
 }
 
 .cell.lock-cell .lock-icon {
-    font-size: 0.5rem;
+    font-size: 0.45rem;
     position: absolute;
     bottom: 1px;
-    right: 3px;
-    opacity: 0.7;
+    right: 2px;
+    opacity: 0.6;
 }
 
 .cell.lock-unavailable {
@@ -388,8 +402,8 @@ header h1 {
 }
 
 .strike-box {
-    width: 26px;
-    height: 26px;
+    width: 28px;
+    height: 28px;
     border: 2px solid #ccc;
     border-radius: 5px;
     display: flex;
@@ -399,12 +413,43 @@ header h1 {
     font-weight: 900;
     color: transparent;
     background: #fafafa;
+    transition: all 0.15s;
 }
 
 .strike-box.struck {
     color: var(--danger);
     border-color: var(--danger);
     background: rgba(231, 76, 60, 0.08);
+}
+
+/* Clickable strike box (next empty one during active turn) */
+.strike-box.strike-clickable {
+    cursor: pointer;
+    border-color: var(--danger);
+    border-style: dashed;
+    animation: strike-pulse 2s ease-in-out infinite;
+}
+
+.strike-box.strike-clickable:hover {
+    background: rgba(231, 76, 60, 0.12);
+    border-style: solid;
+    transform: scale(1.1);
+}
+
+@keyframes strike-pulse {
+    0%, 100% { border-color: rgba(231, 76, 60, 0.4); }
+    50% { border-color: rgba(231, 76, 60, 0.8); }
+}
+
+/* Strike selected (toggled on) */
+.strike-box.strike-selected {
+    color: var(--danger);
+    border-color: var(--danger);
+    border-style: solid;
+    background: rgba(231, 76, 60, 0.15);
+    transform: scale(1.1);
+    box-shadow: 0 0 0 2px rgba(231, 76, 60, 0.3);
+    animation: none;
 }
 
 .strikes-penalty {
@@ -509,16 +554,6 @@ header h1 {
     background: #2ecc71;
 }
 
-.action-btn.strike {
-    background: #fff;
-    color: var(--danger);
-    border-color: var(--danger);
-}
-
-.action-btn.strike:hover:not(:disabled) {
-    background: #fef2f2;
-}
-
 .action-btn.skip {
     background: #fff;
     color: var(--text-dim);
@@ -527,14 +562,6 @@ header h1 {
 
 .action-btn.skip:hover:not(:disabled) {
     background: #f8f8f8;
-}
-
-.action-btn.reset-selection {
-    background: #fff;
-    color: var(--text-dim);
-    border-color: #ccc;
-    font-size: 0.75rem;
-    padding: 8px 14px;
 }
 
 /* ---- Scoring Reference ---- */
@@ -586,14 +613,14 @@ header h1 {
         border-radius: 5px;
     }
 
-    .cell.marked::after {
+    .cell-x {
         font-size: 1.1rem;
     }
 
     .die {
-        width: 38px;
-        height: 38px;
-        font-size: 1.2rem;
+        width: 42px;
+        height: 42px;
+        font-size: 1.3rem;
     }
 
     .action-btn {
@@ -622,14 +649,14 @@ header h1 {
         border-radius: 4px;
     }
 
-    .cell.marked::after {
+    .cell-x {
         font-size: 0.9rem;
     }
 
     .die {
-        width: 32px;
-        height: 32px;
-        font-size: 1rem;
+        width: 34px;
+        height: 34px;
+        font-size: 1.1rem;
     }
 
     .lock-label {

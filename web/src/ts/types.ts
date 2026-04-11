@@ -22,6 +22,7 @@ export interface RowView {
     locked: boolean;
     ascending: boolean;
     color: string;
+    marks: boolean[];
 }
 
 export interface MoveView {

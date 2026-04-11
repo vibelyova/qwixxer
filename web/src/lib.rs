@@ -41,6 +41,7 @@ pub struct RowView {
     locked: bool,
     ascending: bool,
     color: String,
+    marks: Vec<bool>,
 }
 
 #[derive(Serialize)]
@@ -89,10 +90,44 @@ pub struct WebGame {
     message: String,
     /// Moves available in the current phase for the player
     available_moves: Vec<Move>,
+    /// Per-cell mark tracking: [row][number_index] = true if marked
+    player_marks: [[bool; 11]; 4],
+    bot_marks: [[bool; 11]; 4],
 }
 
 fn roll_dice(rng: &mut SmallRng) -> [u8; 6] {
     core::array::from_fn(|_| rng.gen_range(1..=6))
+}
+
+/// Convert a (row, number) into the index into the 11-element marks array.
+fn mark_index(row: usize, number: u8) -> usize {
+    if row < 2 {
+        // ascending rows: 2..=12 maps to indices 0..=10
+        (number - 2) as usize
+    } else {
+        // descending rows: 12..=2 maps to indices 0..=10
+        (12 - number) as usize
+    }
+}
+
+/// Record marks from a Move into the given marks array.
+fn record_marks(marks: &mut [[bool; 11]; 4], mov: Move) {
+    match mov {
+        Move::Strike => {}
+        Move::Single(m) => {
+            marks[m.row][mark_index(m.row, m.number)] = true;
+            // If locking (ascending row marking 12, or descending row marking 2),
+            // the lock number itself also counts as a mark — already covered above.
+            // The lock icon (last cell) is also marked.
+            if (m.row < 2 && m.number == 12) || (m.row >= 2 && m.number == 2) {
+                // Lock cell: the last index (10) is already set by the formula above.
+            }
+        }
+        Move::Double(m1, m2) => {
+            marks[m1.row][mark_index(m1.row, m1.number)] = true;
+            marks[m2.row][mark_index(m2.row, m2.number)] = true;
+        }
+    }
 }
 
 // Embedded DQN model weights
@@ -129,7 +164,7 @@ fn describe_move(mov: &Move) -> String {
     }
 }
 
-fn build_state_view(state: &State) -> StateView {
+fn build_state_view(state: &State, marks: &[[bool; 11]; 4]) -> StateView {
     let totals = state.row_totals();
     let free_values = state.row_free_values();
     let locked = state.locked();
@@ -150,6 +185,7 @@ fn build_state_view(state: &State) -> StateView {
                 locked: locked[i],
                 ascending,
                 color: colors[i].to_string(),
+                marks: marks[i].to_vec(),
             }
         })
         .collect();
@@ -208,6 +244,7 @@ impl WebGame {
         self.white_sum = self.dice[0] + self.dice[1];
 
         let mov = self.bot_strategy.your_move(&self.bot_state, self.dice);
+        record_marks(&mut self.bot_marks, mov);
         self.bot_state.apply_move(mov);
 
         self.message = format!("Bot played: {}", describe_move(&mov));
@@ -235,6 +272,7 @@ impl WebGame {
             self.bot_strategy
                 .opponents_move(&self.bot_state, self.white_sum, locked);
         if let Some(mov) = bot_mov {
+            record_marks(&mut self.bot_marks, mov);
             self.bot_state.apply_move(mov);
         }
         // Apply any locks from player's active turn to bot
@@ -276,8 +314,8 @@ impl WebGame {
             .collect();
 
         GameView {
-            player: build_state_view(&self.player_state),
-            bot: build_state_view(&self.bot_state),
+            player: build_state_view(&self.player_state, &self.player_marks),
+            bot: build_state_view(&self.bot_state, &self.bot_marks),
             dice: self.dice.to_vec(),
             white_sum: self.white_sum,
             phase: self.phase.as_str().to_string(),
@@ -302,6 +340,8 @@ impl WebGame {
             white_sum: 0,
             message: String::new(),
             available_moves: Vec::new(),
+            player_marks: [[false; 11]; 4],
+            bot_marks: [[false; 11]; 4],
         };
 
         // Process first bot turn automatically
@@ -322,6 +362,7 @@ impl WebGame {
                     return;
                 }
                 let mov = self.available_moves[index];
+                record_marks(&mut self.player_marks, mov);
                 self.player_state.apply_move(mov);
 
                 // Apply locks from bot's turn
@@ -342,6 +383,7 @@ impl WebGame {
                     return;
                 }
                 let mov = self.available_moves[index];
+                record_marks(&mut self.player_marks, mov);
                 self.player_state.apply_move(mov);
 
                 self.message = format!("You played: {}", describe_move(&mov));
@@ -394,6 +436,8 @@ impl WebGame {
         self.white_sum = 0;
         self.message = String::new();
         self.available_moves = Vec::new();
+        self.player_marks = [[false; 11]; 4];
+        self.bot_marks = [[false; 11]; 4];
 
         // Process first bot turn automatically
         self.do_bot_active();

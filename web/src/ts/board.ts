@@ -6,6 +6,9 @@ const SCORE_TABLE: number[] = [0, 1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 66, 78];
 /** Callback type for when a square is clicked */
 export type CellClickHandler = (row: number, number: number) => void;
 
+/** Callback type for when a strike box is clicked */
+export type StrikeClickHandler = () => void;
+
 /**
  * Render a Qwixx scoresheet into the given container.
  *
@@ -15,6 +18,9 @@ export type CellClickHandler = (row: number, number: number) => void;
  * @param clickableCells - set of "row:number" keys for cells that should be clickable
  * @param selectedCells - set of "row:number" keys for cells that are currently selected
  * @param onCellClick - callback when a clickable cell is clicked
+ * @param canStrike - whether the strike boxes should be clickable
+ * @param strikeSelected - whether a strike is currently selected (toggled)
+ * @param onStrikeClick - callback when a strike box is clicked
  */
 export function renderBoard(
     containerId: string,
@@ -23,7 +29,10 @@ export function renderBoard(
     isOpponent: boolean,
     clickableCells?: Set<string>,
     selectedCells?: Set<string>,
-    onCellClick?: CellClickHandler
+    onCellClick?: CellClickHandler,
+    canStrike?: boolean,
+    strikeSelected?: boolean,
+    onStrikeClick?: StrikeClickHandler
 ): void {
     const container = document.getElementById(containerId);
     if (!container) return;
@@ -45,7 +54,7 @@ export function renderBoard(
     }
 
     // Render footer (strikes + totals)
-    const footer = createFooter(state, isOpponent);
+    const footer = createFooter(state, isOpponent, canStrike, strikeSelected, onStrikeClick);
     container.appendChild(footer);
 }
 
@@ -64,6 +73,7 @@ function createRow(
         rowEl.classList.add('locked-row');
     }
 
+    // Determine the free boundary index for "available" highlight
     const freeIndex = row.free !== null
         ? row.numbers.indexOf(row.free)
         : row.numbers.length;
@@ -75,25 +85,35 @@ function createRow(
 
         const isLastNumber = i === row.numbers.length - 1;
         const cellKey = `${rowIndex}:${num}`;
+        const isMarked = row.marks[i];
 
         // Cell content: number
         const numberSpan = document.createElement('span');
+        numberSpan.className = 'cell-number';
         numberSpan.textContent = String(num);
         cell.appendChild(numberSpan);
 
-        // State classes
-        if (row.locked) {
-            if (i < freeIndex) {
-                cell.classList.add('marked');
-            }
+        // State classes based on marks tracking
+        if (isMarked) {
+            // This specific number was marked
+            cell.classList.add('marked');
+            // Add X overlay
+            const xSpan = document.createElement('span');
+            xSpan.className = 'cell-x';
+            xSpan.textContent = 'X';
+            cell.appendChild(xSpan);
+        } else if (row.locked) {
+            // Row is locked but this cell wasn't marked - show as skipped
+            cell.classList.add('skipped');
         } else if (row.free === null) {
-            cell.classList.add('past');
+            // Row is somehow past without lock
+            cell.classList.add('skipped');
+        } else if (i < freeIndex) {
+            // Before the free pointer but NOT marked = skipped/blank
+            cell.classList.add('skipped');
         } else {
-            if (i < freeIndex) {
-                cell.classList.add('marked');
-            } else if (i >= freeIndex) {
-                cell.classList.add('available');
-            }
+            // At or after free pointer = available
+            cell.classList.add('available');
         }
 
         // Lock cell treatment (last number: 12 for ascending, 2 for descending)
@@ -104,7 +124,7 @@ function createRow(
             lockIcon.textContent = '\u{1F512}';
             cell.appendChild(lockIcon);
 
-            if (!row.locked && row.total < 5) {
+            if (!row.locked && row.total < 5 && !isMarked) {
                 cell.classList.add('lock-unavailable');
             }
         }
@@ -146,7 +166,13 @@ function createRow(
     return rowEl;
 }
 
-function createFooter(state: StateView, isOpponent: boolean): HTMLElement {
+function createFooter(
+    state: StateView,
+    isOpponent: boolean,
+    canStrike?: boolean,
+    strikeSelected?: boolean,
+    onStrikeClick?: StrikeClickHandler
+): HTMLElement {
     const footer = document.createElement('div');
     footer.className = 'sheet-footer';
 
@@ -165,6 +191,16 @@ function createFooter(state: StateView, isOpponent: boolean): HTMLElement {
         if (i < state.strikes) {
             box.classList.add('struck');
             box.textContent = 'X';
+        } else if (!isOpponent && canStrike && i === state.strikes) {
+            // The next empty strike box is clickable
+            box.classList.add('strike-clickable');
+            if (strikeSelected) {
+                box.classList.add('strike-selected');
+                box.textContent = 'X';
+            }
+            box.addEventListener('click', () => {
+                if (onStrikeClick) onStrikeClick();
+            });
         }
         strikesArea.appendChild(box);
     }

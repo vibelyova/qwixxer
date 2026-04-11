@@ -1,5 +1,5 @@
 import init, { WebGame } from '../../pkg/qwixxer_web.js';
-import { GameView, SelectionState } from './types';
+import { GameView, MoveView, SelectionState } from './types';
 import { renderBoard, renderScoringReference, targetKey } from './board';
 import { renderDice } from './dice';
 import {
@@ -17,10 +17,15 @@ let selection: SelectionState = {
     compatibleMoves: [],
     phase: '',
 };
+let strikeSelected = false;
 
 function getSelectedBot(): string {
     const select = document.getElementById('bot-select') as HTMLSelectElement;
     return select.value;
+}
+
+function findStrikeMove(moves: MoveView[]): MoveView | undefined {
+    return moves.find(m => m.is_strike);
 }
 
 function render(): void {
@@ -38,14 +43,20 @@ function render(): void {
     // Reset selection if phase changed
     if (selection.phase !== view.phase) {
         selection = emptySelection(view.phase, parsedMoves);
+        strikeSelected = false;
     }
 
     // Get clickable and selected cell sets
-    const clickableCells = isPlayerTurn && !view.game_over
+    const clickableCells = isPlayerTurn && !view.game_over && !strikeSelected
         ? getClickableCellsForSelection(parsedMoves, selection)
         : new Set<string>();
 
     const selectedCells = new Set(selection.selected.map(t => targetKey(t)));
+
+    // Can strike? Only on active turn and a strike move exists
+    const canStrike = isPlayerTurn && !view.game_over &&
+        view.phase === 'player_active' &&
+        !!findStrikeMove(view.available_moves);
 
     // Render player board (interactive)
     renderBoard(
@@ -55,7 +66,10 @@ function render(): void {
         false,
         clickableCells,
         selectedCells,
-        (row, num) => onCellClick(row, num, view)
+        (row, num) => onCellClick(row, num, view),
+        canStrike,
+        strikeSelected,
+        () => onStrikeToggle(view)
     );
 
     // Render bot board (non-interactive)
@@ -83,12 +97,19 @@ function render(): void {
         handleSkip,
         () => {
             selection = emptySelection(view.phase, parsedMoves);
+            strikeSelected = false;
             render();
-        }
+        },
+        strikeSelected
     );
 }
 
 function onCellClick(row: number, num: number, view: GameView): void {
+    // If strike is selected, deselect it when clicking a cell
+    if (strikeSelected) {
+        strikeSelected = false;
+    }
+
     const parsedMoves = view.available_moves.map(m => parseMove(m));
 
     const result = handleCellClick(row, num, parsedMoves, selection);
@@ -103,10 +124,34 @@ function onCellClick(row: number, num: number, view: GameView): void {
     render();
 }
 
+function onStrikeToggle(view: GameView): void {
+    if (strikeSelected) {
+        // Deselect strike
+        strikeSelected = false;
+    } else {
+        // Select strike, clear cell selections
+        strikeSelected = true;
+        const parsedMoves = view.available_moves.map(m => parseMove(m));
+        selection = emptySelection(view.phase, parsedMoves);
+
+        // Auto-confirm the strike after a brief visual flash
+        const strikeMove = findStrikeMove(view.available_moves);
+        if (strikeMove) {
+            render(); // show the selected state briefly
+            setTimeout(() => {
+                handleStrike(strikeMove.index);
+            }, 300);
+            return;
+        }
+    }
+    render();
+}
+
 function handleConfirm(moveIndex: number): void {
     if (!game) return;
     game.make_move(moveIndex);
     selection = { selected: [], compatibleMoves: [], phase: '' };
+    strikeSelected = false;
     render();
 }
 
@@ -114,6 +159,7 @@ function handleStrike(moveIndex: number): void {
     if (!game) return;
     game.make_move(moveIndex);
     selection = { selected: [], compatibleMoves: [], phase: '' };
+    strikeSelected = false;
     render();
 }
 
@@ -121,6 +167,7 @@ function handleSkip(): void {
     if (!game) return;
     game.skip();
     selection = { selected: [], compatibleMoves: [], phase: '' };
+    strikeSelected = false;
     render();
 }
 
@@ -129,6 +176,7 @@ function startNewGame(): void {
         game.new_game(getSelectedBot());
     }
     selection = { selected: [], compatibleMoves: [], phase: '' };
+    strikeSelected = false;
     render();
 }
 
