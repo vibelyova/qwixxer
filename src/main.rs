@@ -8,7 +8,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, ValueEnum)]
 enum BotType {
     Ga,
-    #[cfg(feature = "dqn")]
+    #[cfg(feature = "burn")]
     Dqn,
     Mcts,
     Opportunist,
@@ -23,7 +23,7 @@ impl std::fmt::Display for BotType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             BotType::Ga => write!(f, "GA"),
-            #[cfg(feature = "dqn")]
+            #[cfg(feature = "burn")]
             BotType::Dqn => write!(f, "DQN"),
             BotType::Mcts => write!(f, "MCTS"),
             BotType::Opportunist => write!(f, "Opportunist"),
@@ -44,7 +44,7 @@ fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
                 .expect("No champion.txt found. Run `train ga` first.");
             Box::new(champion)
         }
-        #[cfg(feature = "dqn")]
+        #[cfg(feature = "burn")]
         BotType::Dqn => Box::new(dqn::DqnStrategy::load("dqn_model")),
         BotType::Mcts => {
             let champion = bot::DNA::load_weights("champion.txt", genes)
@@ -208,7 +208,7 @@ fn run_solo(num_games: usize) {
         (BotType::BlankRtl, true),
     ];
 
-    #[cfg(feature = "dqn")]
+    #[cfg(feature = "burn")]
     let all_bots = {
         let mut v = all_bots;
         v.push((BotType::Dqn, std::path::Path::new("dqn_model/model.mpk").exists()));

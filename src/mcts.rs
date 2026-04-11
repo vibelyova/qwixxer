@@ -2,10 +2,11 @@ use crate::game::{Game, Player};
 use crate::state::{Move, State};
 use crate::strategy::Strategy;
 use rand::{rngs::SmallRng, SeedableRng};
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use std::sync::Arc;
 
-/// A factory that creates rollout strategies. Must be Send+Sync for rayon.
+/// A factory that creates rollout strategies. Must be Send+Sync for parallelism.
 pub type RolloutFactory = Arc<dyn Fn() -> Box<dyn Strategy> + Send + Sync>;
 
 #[derive(Clone)]
@@ -43,8 +44,12 @@ impl MonteCarlo {
         let mut our_state = *state;
         our_state.apply_move(mov);
 
-        let total: f64 = (0..self.simulations)
-            .into_par_iter()
+        #[cfg(feature = "parallel")]
+        let iter = (0..self.simulations).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = 0..self.simulations;
+
+        let total: f64 = iter
             .map(|_| {
                 let mut rng = SmallRng::from_entropy();
                 let us = Player::new_with_state(

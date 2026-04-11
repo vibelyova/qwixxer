@@ -1,6 +1,6 @@
 pub mod blank;
 pub mod bot;
-#[cfg(feature = "dqn")]
+#[cfg(feature = "burn")]
 pub mod dqn;
 pub mod game;
 pub mod mcts;

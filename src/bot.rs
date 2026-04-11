@@ -4,6 +4,7 @@ use crate::state::State;
 use crate::strategy::Strategy;
 
 use rand::distributions::WeightedIndex;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -293,8 +294,10 @@ impl Population {
             .map(|_| self.rng.gen())
             .collect();
 
-        // Run simulations in parallel
+        // Run simulations (parallel when available)
         let dna = &self.dna;
+
+        #[cfg(feature = "parallel")]
         let global_rank = seeds
             .par_iter()
             .map(|&seed| Self::rank_generation(dna, seed))
@@ -305,6 +308,15 @@ impl Population {
                     acc
                 },
             );
+
+        #[cfg(not(feature = "parallel"))]
+        let global_rank = seeds
+            .iter()
+            .map(|&seed| Self::rank_generation(dna, seed))
+            .fold(vec![0.0f32; dna.len()], |mut acc, rank| {
+                acc.iter_mut().zip(rank.iter()).for_each(|(a, b)| *a += b);
+                acc
+            });
 
         let dist = WeightedIndex::new(&global_rank).expect("All weights are zero");
 

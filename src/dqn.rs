@@ -1,26 +1,41 @@
-use crate::bot::{self, DNA};
-use crate::mcts::MonteCarlo;
+// ---- Imports for inference (always available with `burn` feature) ----
 use crate::state::{Move, State};
 use crate::strategy::Strategy;
 use burn::{
-    backend::{ndarray::NdArray, Autodiff},
+    backend::ndarray::NdArray,
+    nn::{Linear, LinearConfig, Relu},
+    prelude::*,
+    record::{NamedMpkBytesRecorder, HalfPrecisionSettings, Recorder},
+};
+
+// ---- Imports for training (only with `dqn` feature) ----
+#[cfg(feature = "dqn")]
+use crate::bot::{self, DNA};
+#[cfg(feature = "dqn")]
+use crate::mcts::MonteCarlo;
+#[cfg(feature = "dqn")]
+use burn::{
+    backend::Autodiff,
     data::{
         dataloader::{DataLoaderBuilder, batcher::Batcher},
         dataset::{Dataset, InMemDataset},
     },
-    nn::{Linear, LinearConfig, Relu, loss::{MseLoss, Reduction::Mean}},
+    nn::loss::{MseLoss, Reduction::Mean},
     optim::AdamConfig,
-    prelude::*,
     record::CompactRecorder,
     tensor::backend::AutodiffBackend,
     train::{Learner, RegressionOutput, SupervisedTraining, TrainOutput, TrainStep, InferenceStep, metric::LossMetric},
 };
-use rand::{rngs::SmallRng, Rng, SeedableRng};
+#[cfg(feature = "dqn")]
 use rayon::prelude::*;
+#[cfg(feature = "dqn")]
+use rand::{rngs::SmallRng, Rng, SeedableRng};
+#[cfg(feature = "dqn")]
 use std::sync::Arc;
 
 // Backend type aliases
 type MyBackend = NdArray;
+#[cfg(feature = "dqn")]
 type MyAutodiffBackend = Autodiff<MyBackend>;
 
 /// Number of input features for the state representation.
@@ -75,6 +90,7 @@ pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURE
 }
 
 /// Build opponent context from a 2-player game state.
+#[cfg(feature = "dqn")]
 fn make_context(our_state: &State, opponent_state: &State) -> OpponentContext {
     OpponentContext {
         num_opponents: 1,
@@ -83,40 +99,7 @@ fn make_context(our_state: &State, opponent_state: &State) -> OpponentContext {
     }
 }
 
-// ---- Training data ----
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct TrainingSample {
-    pub features: Vec<f32>,
-    pub value: f32,
-}
-
-#[derive(Clone)]
-pub struct QwixxBatcher<B: Backend> {
-    _phantom: std::marker::PhantomData<B>,
-}
-
-#[derive(Clone, Debug)]
-pub struct QwixxBatch<B: Backend> {
-    pub inputs: Tensor<B, 2>,
-    pub targets: Tensor<B, 1>,
-}
-
-impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
-    fn batch(&self, items: Vec<TrainingSample>, device: &B::Device) -> QwixxBatch<B> {
-        let batch_size = items.len();
-        let inputs: Vec<f32> = items.iter().flat_map(|s| s.features.iter().copied()).collect();
-        let targets: Vec<f32> = items.iter().map(|s| s.value).collect();
-
-        let inputs = Tensor::<B, 1>::from_floats(inputs.as_slice(), device)
-            .reshape([batch_size, NUM_FEATURES]);
-        let targets = Tensor::<B, 1>::from_floats(targets.as_slice(), device);
-
-        QwixxBatch { inputs, targets }
-    }
-}
-
-// ---- Model ----
+// ---- Model (inference, always available) ----
 
 #[derive(Module, Debug)]
 pub struct QwixxModel<B: Backend> {
@@ -152,13 +135,6 @@ impl<B: Backend> QwixxModel<B> {
         self.output.forward(x)
     }
 
-    pub fn forward_step(&self, batch: QwixxBatch<B>) -> RegressionOutput<B> {
-        let targets = batch.targets.clone().unsqueeze_dim(1);
-        let output = self.forward(batch.inputs);
-        let loss = MseLoss::new().forward(output.clone(), targets.clone(), Mean);
-        RegressionOutput { loss, output, targets }
-    }
-
     /// Evaluate a single state, returning the predicted value.
     pub fn evaluate_state(&self, features: &[f32; NUM_FEATURES], device: &B::Device) -> f32 {
         let input = Tensor::<B, 1>::from_floats(features.as_slice(), device)
@@ -168,6 +144,19 @@ impl<B: Backend> QwixxModel<B> {
     }
 }
 
+// ---- Training step impls (dqn feature only) ----
+
+#[cfg(feature = "dqn")]
+impl<B: Backend> QwixxModel<B> {
+    pub fn forward_step(&self, batch: QwixxBatch<B>) -> RegressionOutput<B> {
+        let targets = batch.targets.clone().unsqueeze_dim(1);
+        let output = self.forward(batch.inputs);
+        let loss = MseLoss::new().forward(output.clone(), targets.clone(), Mean);
+        RegressionOutput { loss, output, targets }
+    }
+}
+
+#[cfg(feature = "dqn")]
 impl<B: AutodiffBackend> TrainStep for QwixxModel<B> {
     type Input = QwixxBatch<B>;
     type Output = RegressionOutput<B>;
@@ -178,6 +167,7 @@ impl<B: AutodiffBackend> TrainStep for QwixxModel<B> {
     }
 }
 
+#[cfg(feature = "dqn")]
 impl<B: Backend> InferenceStep for QwixxModel<B> {
     type Input = QwixxBatch<B>;
     type Output = RegressionOutput<B>;
@@ -187,148 +177,7 @@ impl<B: Backend> InferenceStep for QwixxModel<B> {
     }
 }
 
-// ---- Data generation ----
-
-/// Generate training data by playing games and evaluating states with MC.
-pub fn generate_training_data(num_games: usize, mc_sims: usize) -> Vec<TrainingSample> {
-    let genes = Arc::new(bot::default_genes());
-    let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt found");
-    let mc = MonteCarlo::with_ga(mc_sims, champion.clone());
-
-    println!("Generating training data: {num_games} games, {mc_sims} MC sims per state...");
-
-    let samples: Vec<TrainingSample> = (0..num_games)
-        .into_par_iter()
-        .flat_map(|game_idx| {
-            let mut ga = champion.clone();
-            let mut rng = SmallRng::from_entropy();
-            let mut state = State::default();
-            let mut opponent_state = State::default();
-            let mut local_samples = Vec::new();
-
-            let mut turn = 0u32;
-            loop {
-                if state.strikes >= 4 || opponent_state.strikes >= 4 { break; }
-                if state.count_locked() >= 2 || opponent_state.count_locked() >= 2 { break; }
-
-                let dice: [u8; 6] = core::array::from_fn(|_| rng.gen_range(1..=6));
-                let on_white = dice[0] + dice[1];
-
-                if turn % 2 == 0 {
-                    // Our active turn — evaluate each candidate with MC
-                    let moves = state.generate_moves(dice);
-                    let mut all_moves = moves;
-                    all_moves.push(Move::Strike);
-
-                    // Evaluate all moves once, cache results
-                    let evaluated: Vec<(Move, f64)> = all_moves
-                        .iter()
-                        .map(|&mov| {
-                            let mc_value = mc.evaluate_move_public(&state, mov, &opponent_state);
-                            (mov, mc_value)
-                        })
-                        .collect();
-
-                    for &(mov, mc_value) in &evaluated {
-                        let mut new_state = state;
-                        new_state.apply_move(mov);
-                        let ctx = make_context(&new_state, &opponent_state);
-                        let features = state_features(&new_state, &ctx);
-                        local_samples.push(TrainingSample {
-                            features: features.to_vec(),
-                            value: mc_value as f32,
-                        });
-                    }
-
-                    // Play the MC-best move
-                    let best_move = evaluated
-                        .iter()
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                        .unwrap()
-                        .0;
-                    state.apply_move(best_move);
-                    let locked = state.locked();
-                    let opp_mov = ga.opponents_move(&opponent_state, on_white, locked);
-                    if let Some(mov) = opp_mov { opponent_state.apply_move(mov); }
-                    opponent_state.lock(locked);
-                    state.lock(opponent_state.locked());
-                } else {
-                    // Opponent's active turn
-                    let opp_move = ga.your_move(&opponent_state, dice);
-                    opponent_state.apply_move(opp_move);
-                    let locked = opponent_state.locked();
-                    let our_mov = ga.opponents_move(&state, on_white, locked);
-                    if let Some(mov) = our_mov { state.apply_move(mov); }
-                    state.lock(locked);
-                    opponent_state.lock(state.locked());
-                }
-
-                turn += 1;
-                if turn > 200 { break; }
-            }
-
-            if game_idx % 100 == 0 && game_idx > 0 {
-                eprintln!("  {game_idx}/{num_games} games...");
-            }
-
-            local_samples
-        })
-        .collect();
-
-    println!("Generated {} training samples from {num_games} games", samples.len());
-    samples
-}
-
-// ---- Training ----
-
-pub fn train(samples: Vec<TrainingSample>, artifact_dir: &str) {
-    let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-
-    // Split 90/10
-    let split = (samples.len() * 9) / 10;
-    let train_data = InMemDataset::new(samples[..split].to_vec());
-    let valid_data = InMemDataset::new(samples[split..].to_vec());
-
-    println!("Training: {} samples, validation: {} samples", train_data.len(), valid_data.len());
-
-    let model = QwixxModelConfig::new().init::<MyAutodiffBackend>(&device);
-
-    let batcher_train = QwixxBatcher::<MyAutodiffBackend> { _phantom: std::marker::PhantomData };
-    let batcher_valid = QwixxBatcher::<MyBackend> { _phantom: std::marker::PhantomData };
-
-    let dataloader_train = DataLoaderBuilder::new(batcher_train)
-        .batch_size(256)
-        .shuffle(42)
-        .num_workers(2)
-        .build(train_data);
-
-    let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
-        .batch_size(256)
-        .shuffle(42)
-        .num_workers(2)
-        .build(valid_data);
-
-    std::fs::remove_dir_all(artifact_dir).ok();
-    std::fs::create_dir_all(artifact_dir).ok();
-
-    let training = SupervisedTraining::new(artifact_dir, dataloader_train, dataloader_valid)
-        .metric_train_numeric(LossMetric::new())
-        .metric_valid_numeric(LossMetric::new())
-        .with_file_checkpointer(CompactRecorder::new())
-        .num_epochs(50)
-        .summary();
-
-    let result = training.launch(Learner::new(model, AdamConfig::new().init(), 1e-3));
-
-    result
-        .model
-        .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
-        .expect("Failed to save model");
-
-    println!("Model saved to {artifact_dir}/model");
-}
-
-// ---- Strategy using trained model ----
+// ---- Strategy using trained model (inference, always available) ----
 
 pub struct DqnStrategy {
     model: QwixxModel<MyBackend>,
@@ -343,12 +192,29 @@ impl std::fmt::Debug for DqnStrategy {
 }
 
 impl DqnStrategy {
+    /// Load model from a file path (native only).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load(artifact_dir: &str) -> Self {
+        use burn::record::CompactRecorder;
         let device = burn::backend::ndarray::NdArrayDevice::Cpu;
         let model = QwixxModelConfig::new()
             .init::<MyBackend>(&device)
             .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
             .expect("Failed to load model");
+        DqnStrategy { model, device, context: OpponentContext::default() }
+    }
+
+    /// Load model from embedded bytes (works in WASM and native).
+    pub fn load_from_bytes(model_bytes: &[u8]) -> Self {
+        use burn::module::Module;
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let recorder = NamedMpkBytesRecorder::<HalfPrecisionSettings>::new();
+        let record: <QwixxModel<MyBackend> as Module<MyBackend>>::Record = recorder
+            .load(model_bytes.to_vec(), &device)
+            .expect("Failed to load model from bytes");
+        let model = QwixxModelConfig::new()
+            .init::<MyBackend>(&device)
+            .load_record(record);
         DqnStrategy { model, device, context: OpponentContext::default() }
     }
 
@@ -441,8 +307,191 @@ impl Strategy for DqnStrategy {
     }
 }
 
+// ===========================================================================
+// Training code (native only, requires `dqn` feature)
+// ===========================================================================
+
+#[cfg(feature = "dqn")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TrainingSample {
+    pub features: Vec<f32>,
+    pub value: f32,
+}
+
+#[cfg(feature = "dqn")]
+#[derive(Clone)]
+pub struct QwixxBatcher<B: Backend> {
+    _phantom: std::marker::PhantomData<B>,
+}
+
+#[cfg(feature = "dqn")]
+#[derive(Clone, Debug)]
+pub struct QwixxBatch<B: Backend> {
+    pub inputs: Tensor<B, 2>,
+    pub targets: Tensor<B, 1>,
+}
+
+#[cfg(feature = "dqn")]
+impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
+    fn batch(&self, items: Vec<TrainingSample>, device: &B::Device) -> QwixxBatch<B> {
+        let batch_size = items.len();
+        let inputs: Vec<f32> = items.iter().flat_map(|s| s.features.iter().copied()).collect();
+        let targets: Vec<f32> = items.iter().map(|s| s.value).collect();
+
+        let inputs = Tensor::<B, 1>::from_floats(inputs.as_slice(), device)
+            .reshape([batch_size, NUM_FEATURES]);
+        let targets = Tensor::<B, 1>::from_floats(targets.as_slice(), device);
+
+        QwixxBatch { inputs, targets }
+    }
+}
+
+// ---- Data generation ----
+
+#[cfg(feature = "dqn")]
+/// Generate training data by playing games and evaluating states with MC.
+pub fn generate_training_data(num_games: usize, mc_sims: usize) -> Vec<TrainingSample> {
+    let genes = Arc::new(bot::default_genes());
+    let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt found");
+    let mc = MonteCarlo::with_ga(mc_sims, champion.clone());
+
+    println!("Generating training data: {num_games} games, {mc_sims} MC sims per state...");
+
+    let samples: Vec<TrainingSample> = (0..num_games)
+        .into_par_iter()
+        .flat_map(|game_idx| {
+            let mut ga = champion.clone();
+            let mut rng = SmallRng::from_entropy();
+            let mut state = State::default();
+            let mut opponent_state = State::default();
+            let mut local_samples = Vec::new();
+
+            let mut turn = 0u32;
+            loop {
+                if state.strikes >= 4 || opponent_state.strikes >= 4 { break; }
+                if state.count_locked() >= 2 || opponent_state.count_locked() >= 2 { break; }
+
+                let dice: [u8; 6] = core::array::from_fn(|_| rng.gen_range(1..=6));
+                let on_white = dice[0] + dice[1];
+
+                if turn % 2 == 0 {
+                    // Our active turn — evaluate each candidate with MC
+                    let moves = state.generate_moves(dice);
+                    let mut all_moves = moves;
+                    all_moves.push(Move::Strike);
+
+                    // Evaluate all moves once, cache results
+                    let evaluated: Vec<(Move, f64)> = all_moves
+                        .iter()
+                        .map(|&mov| {
+                            let mc_value = mc.evaluate_move_public(&state, mov, &opponent_state);
+                            (mov, mc_value)
+                        })
+                        .collect();
+
+                    for &(mov, mc_value) in &evaluated {
+                        let mut new_state = state;
+                        new_state.apply_move(mov);
+                        let ctx = make_context(&new_state, &opponent_state);
+                        let features = state_features(&new_state, &ctx);
+                        local_samples.push(TrainingSample {
+                            features: features.to_vec(),
+                            value: mc_value as f32,
+                        });
+                    }
+
+                    // Play the MC-best move
+                    let best_move = evaluated
+                        .iter()
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                        .unwrap()
+                        .0;
+                    state.apply_move(best_move);
+                    let locked = state.locked();
+                    let opp_mov = ga.opponents_move(&opponent_state, on_white, locked);
+                    if let Some(mov) = opp_mov { opponent_state.apply_move(mov); }
+                    opponent_state.lock(locked);
+                    state.lock(opponent_state.locked());
+                } else {
+                    // Opponent's active turn
+                    let opp_move = ga.your_move(&opponent_state, dice);
+                    opponent_state.apply_move(opp_move);
+                    let locked = opponent_state.locked();
+                    let our_mov = ga.opponents_move(&state, on_white, locked);
+                    if let Some(mov) = our_mov { state.apply_move(mov); }
+                    state.lock(locked);
+                    opponent_state.lock(state.locked());
+                }
+
+                turn += 1;
+                if turn > 200 { break; }
+            }
+
+            if game_idx % 100 == 0 && game_idx > 0 {
+                eprintln!("  {game_idx}/{num_games} games...");
+            }
+
+            local_samples
+        })
+        .collect();
+
+    println!("Generated {} training samples from {num_games} games", samples.len());
+    samples
+}
+
+// ---- Training ----
+
+#[cfg(feature = "dqn")]
+pub fn train(samples: Vec<TrainingSample>, artifact_dir: &str) {
+    let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+
+    // Split 90/10
+    let split = (samples.len() * 9) / 10;
+    let train_data = InMemDataset::new(samples[..split].to_vec());
+    let valid_data = InMemDataset::new(samples[split..].to_vec());
+
+    println!("Training: {} samples, validation: {} samples", train_data.len(), valid_data.len());
+
+    let model = QwixxModelConfig::new().init::<MyAutodiffBackend>(&device);
+
+    let batcher_train = QwixxBatcher::<MyAutodiffBackend> { _phantom: std::marker::PhantomData };
+    let batcher_valid = QwixxBatcher::<MyBackend> { _phantom: std::marker::PhantomData };
+
+    let dataloader_train = DataLoaderBuilder::new(batcher_train)
+        .batch_size(256)
+        .shuffle(42)
+        .num_workers(2)
+        .build(train_data);
+
+    let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
+        .batch_size(256)
+        .shuffle(42)
+        .num_workers(2)
+        .build(valid_data);
+
+    std::fs::remove_dir_all(artifact_dir).ok();
+    std::fs::create_dir_all(artifact_dir).ok();
+
+    let training = SupervisedTraining::new(artifact_dir, dataloader_train, dataloader_valid)
+        .metric_train_numeric(LossMetric::new())
+        .metric_valid_numeric(LossMetric::new())
+        .with_file_checkpointer(CompactRecorder::new())
+        .num_epochs(50)
+        .summary();
+
+    let result = training.launch(Learner::new(model, AdamConfig::new().init(), 1e-3));
+
+    result
+        .model
+        .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
+        .expect("Failed to save model");
+
+    println!("Model saved to {artifact_dir}/model");
+}
+
 // ---- Self-play RL training ----
 
+#[cfg(feature = "dqn")]
 /// Pick a move using the model, with epsilon-greedy exploration.
 fn pick_move_with_model(
     model: &QwixxModel<MyBackend>,
@@ -486,6 +535,7 @@ fn pick_move_with_model(
         .unwrap()
 }
 
+#[cfg(feature = "dqn")]
 /// Pick an opponent-turn move using the model.
 fn pick_passive_move_with_model(
     model: &QwixxModel<MyBackend>,
@@ -542,6 +592,7 @@ fn pick_passive_move_with_model(
     }
 }
 
+#[cfg(feature = "dqn")]
 /// A simple wrapper to use the DQN model as an opponent (no epsilon, no recording).
 struct DqnSelfPlayOpponent {
     model: QwixxModel<MyBackend>,
@@ -549,12 +600,14 @@ struct DqnSelfPlayOpponent {
     rng: SmallRng,
 }
 
+#[cfg(feature = "dqn")]
 impl std::fmt::Debug for DqnSelfPlayOpponent {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "DqnSelfPlayOpponent")
     }
 }
 
+#[cfg(feature = "dqn")]
 impl Strategy for DqnSelfPlayOpponent {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
         let ctx = OpponentContext::default(); // opponent doesn't need perfect context
@@ -569,6 +622,7 @@ impl Strategy for DqnSelfPlayOpponent {
     }
 }
 
+#[cfg(feature = "dqn")]
 /// Build opponent context for player 0 given all player states.
 fn make_context_multi(our_state: &State, all_states: &[State]) -> OpponentContext {
     let our_score = our_state.count_points();
@@ -587,6 +641,7 @@ fn make_context_multi(our_state: &State, all_states: &[State]) -> OpponentContex
     }
 }
 
+#[cfg(feature = "dqn")]
 /// Play a training game: DQN is player 0, opponents are arbitrary strategies.
 /// Records (state_features, final_score) for player 0.
 fn play_training_game(
@@ -704,6 +759,7 @@ fn play_training_game(
     (samples, final_score)
 }
 
+#[cfg(feature = "dqn")]
 /// Self-play RL training loop with replay buffer and mixed opponents.
 /// Keeps samples from the last `buffer_iterations` rounds to prevent forgetting.
 pub fn self_play_train(
@@ -811,6 +867,7 @@ pub fn self_play_train(
     println!("\nSelf-play training complete. Model saved to {artifact_dir}/model");
 }
 
+#[cfg(feature = "dqn")]
 /// Train with a specific number of epochs, loading from existing model if present.
 fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epochs: usize) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;

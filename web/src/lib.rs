@@ -95,6 +95,9 @@ fn roll_dice(rng: &mut SmallRng) -> [u8; 6] {
     core::array::from_fn(|_| rng.gen_range(1..=6))
 }
 
+// Embedded DQN model weights
+const DQN_MODEL_BYTES: &[u8] = include_bytes!("../../dqn_model/model.mpk");
+
 fn make_strategy(bot_type: &str) -> Box<dyn Strategy> {
     match bot_type {
         "ga" => {
@@ -102,6 +105,7 @@ fn make_strategy(bot_type: &str) -> Box<dyn Strategy> {
             let champion = DNA::load_weights_from_bytes(CHAMPION_BYTES, genes);
             Box::new(champion)
         }
+        "dqn" => Box::new(qwixxer::dqn::DqnStrategy::load_from_bytes(DQN_MODEL_BYTES)),
         "opportunist" => Box::<strategy::Opportunist>::default(),
         "conservative" => Box::<strategy::Conservative>::default(),
         "rusher" => Box::new(strategy::Rusher),
