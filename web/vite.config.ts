@@ -2,7 +2,11 @@ import { defineConfig } from 'vite';
 
 export default defineConfig({
     root: '.',
-    build: { outDir: 'dist' },
+    base: '/qwixxer/',
+    build: {
+        outDir: 'dist',
+        assetsInlineLimit: 0,
+    },
     server: {
         fs: {
             allow: ['.']

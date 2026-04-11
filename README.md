@@ -1,6 +1,8 @@
 # qwixxer
 
-A bot framework for the board game [Qwixx](https://en.wikipedia.org/wiki/Qwixx), featuring hand-crafted strategies, a genetic algorithm for evolving optimal play, and a colorful terminal UI.
+A bot framework for the board game [Qwixx](https://en.wikipedia.org/wiki/Qwixx), featuring hand-crafted strategies, a genetic algorithm for evolving optimal play, a DQN neural network, and both terminal and web UIs.
+
+**[Play in your browser](https://vibelyova.github.io/qwixxer/)** — no installation needed!
 
 ## Usage
 
