@@ -1,13 +1,5 @@
-mod blank;
-mod bot;
-mod dqn;
-mod game;
-mod mcts;
-mod race_to_lock;
-mod state;
-mod strategy;
-
 use clap::{Parser, Subcommand, ValueEnum};
+use qwixxer::*;
 use game::Player;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;

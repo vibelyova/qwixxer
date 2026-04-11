@@ -3,6 +3,14 @@ name = "qwixxer"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "qwixxer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qwixxer"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 burn = { version = "0.20.1", features = ["train", "ndarray"] }
