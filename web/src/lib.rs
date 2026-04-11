@@ -252,16 +252,17 @@ impl WebGame {
         // Propagate any locks the bot just created
         self.propagate_locks();
 
-        if self.check_game_over() {
-            return;
-        }
-
-        // Advance to player_passive: player can mark the white sum
+        // Always let the player make their passive move on the white sum,
+        // even if the game would end (the roll still happened, everyone gets to act on it)
         self.phase = Phase::PlayerPassive;
         self.available_moves = self.player_state.generate_opponent_moves(self.white_sum);
         if self.available_moves.is_empty() {
             self.message
                 .push_str(" | No moves for you on white sum.");
+            // If no passive moves and game is over, end now
+            if self.is_game_over() {
+                self.phase = Phase::GameOver;
+            }
         }
     }
 
