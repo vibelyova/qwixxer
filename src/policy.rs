@@ -6,16 +6,10 @@ use crate::state::{Mark, Move, State};
 use crate::strategy::Strategy;
 use burn::{
     backend::{ndarray::NdArray, Autodiff},
-    data::{
-        dataloader::{DataLoaderBuilder, batcher::Batcher},
-        dataset::InMemDataset,
-    },
-    nn::{Linear, LinearConfig, Relu, loss::{MseLoss, Reduction::Mean}},
+    nn::{Linear, LinearConfig, Relu},
     optim::AdamConfig,
     prelude::*,
     record::CompactRecorder,
-    tensor::backend::AutodiffBackend,
-    train::{Learner, RegressionOutput, SupervisedTraining, TrainOutput, TrainStep, InferenceStep, metric::LossMetric},
 };
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -419,17 +413,24 @@ fn pick_passive_with_policy(
     if best_score > pass_score { Some(best) } else { None }
 }
 
-/// Play a training game, record (move_features, final_score) for player 0.
+/// A decision point: all candidate move features + which was chosen.
+#[derive(Clone)]
+struct DecisionPoint {
+    candidate_features: Vec<[f32; NUM_FEATURES]>, // features for each candidate
+    chosen_index: usize,
+}
+
+/// Play a training game, record decision points for REINFORCE.
 fn play_training_game(
     model: &PolicyModel<MyBackend>,
     device: &burn::backend::ndarray::NdArrayDevice,
     opponents: &mut [Box<dyn Strategy>],
     epsilon: f32,
     rng: &mut SmallRng,
-) -> (Vec<TrainingSample>, f32) {
+) -> (Vec<DecisionPoint>, f32) {
     let num_players = 1 + opponents.len();
     let mut states: Vec<State> = (0..num_players).map(|_| State::default()).collect();
-    let mut recorded: Vec<[f32; NUM_FEATURES]> = Vec::new();
+    let mut decisions: Vec<DecisionPoint> = Vec::new();
     let mut turn = 0u32;
 
     loop {
@@ -444,10 +445,31 @@ fn play_training_game(
             let ctx = make_opponent_context(&states);
             let mut moves = states[0].generate_moves(dice);
             moves.push(Move::Strike);
-            let mov = pick_move_with_policy(model, device, &states[0], &moves, &ctx, epsilon, rng);
-            // Record the features for the chosen move
-            recorded.push(move_features(&states[0], mov, &ctx));
-            states[0].apply_move(mov);
+
+            // Compute features for ALL candidates
+            let candidate_features: Vec<[f32; NUM_FEATURES]> = moves
+                .iter()
+                .map(|&m| move_features(&states[0], m, &ctx))
+                .collect();
+
+            // Pick move (epsilon-greedy)
+            let chosen_index = if rng.gen::<f32>() < epsilon {
+                rng.gen_range(0..moves.len())
+            } else {
+                candidate_features
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| {
+                        model.evaluate(a, device)
+                            .partial_cmp(&model.evaluate(b, device))
+                            .unwrap()
+                    })
+                    .unwrap()
+                    .0
+            };
+
+            decisions.push(DecisionPoint { candidate_features, chosen_index });
+            states[0].apply_move(moves[chosen_index]);
         } else {
             let opp_idx = active - 1;
             let opp_mov = opponents[opp_idx].your_move(&states[active], dice);
@@ -460,12 +482,33 @@ fn play_training_game(
             let passive = (active + idx) % num_players;
             if passive == 0 {
                 let ctx = make_opponent_context(&states);
-                let mov = pick_passive_with_policy(model, device, &states[0], on_white, &ctx);
-                if let Some(m) = mov {
-                    recorded.push(move_features(&states[0], m, &ctx));
-                    states[0].apply_move(m);
+                let moves = states[0].generate_opponent_moves(on_white);
+                if !moves.is_empty() {
+                    // Candidates: each mark + pass
+                    let mut candidate_features: Vec<[f32; NUM_FEATURES]> = moves
+                        .iter()
+                        .map(|&m| move_features(&states[0], m, &ctx))
+                        .collect();
+                    candidate_features.push(pass_features(&states[0], &ctx));
+
+                    let chosen_index = candidate_features
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| {
+                            model.evaluate(a, device)
+                                .partial_cmp(&model.evaluate(b, device))
+                                .unwrap()
+                        })
+                        .unwrap()
+                        .0;
+
+                    decisions.push(DecisionPoint { candidate_features, chosen_index });
+
+                    // Apply if not pass (last index)
+                    if chosen_index < moves.len() {
+                        states[0].apply_move(moves[chosen_index]);
+                    }
                 }
-                // Note: if we pass, we don't record (pass is "no action")
             } else {
                 let opp_idx = passive - 1;
                 let opp_mov = opponents[opp_idx].opponents_move(&states[passive], on_white, new_locked);
@@ -482,52 +525,78 @@ fn play_training_game(
     }
 
     let final_score = states[0].count_points() as f32;
-
-    // TD(lambda) targets
-    let lambda = 0.8f32;
-    let n = recorded.len();
-    if n == 0 {
-        return (Vec::new(), final_score);
-    }
-
-    let values: Vec<f32> = recorded.iter().map(|f| model.evaluate(f, device)).collect();
-    let mut targets = vec![0.0f32; n];
-    targets[n - 1] = final_score;
-    for t in (0..n - 1).rev() {
-        targets[t] = (1.0 - lambda) * values[t + 1] + lambda * targets[t + 1];
-    }
-
-    let samples = recorded
-        .into_iter()
-        .zip(targets)
-        .map(|(features, target)| TrainingSample {
-            features: features.to_vec(),
-            value: target,
-        })
-        .collect();
-
-    (samples, final_score)
+    (decisions, final_score)
 }
 
-/// Self-play training for the policy net.
+/// REINFORCE training: update policy based on advantage-weighted log-probabilities.
+fn reinforce_update<O: burn::optim::Optimizer<PolicyModel<MyAutodiffBackend>, MyAutodiffBackend>>(
+    model: &mut PolicyModel<MyAutodiffBackend>,
+    optimizer: &mut O,
+    device: &burn::backend::ndarray::NdArrayDevice,
+    decisions: &[DecisionPoint],
+    advantage: f32,
+    lr: f64,
+) {
+    if decisions.is_empty() || advantage.abs() < 0.01 {
+        return;
+    }
+
+    // Process decisions in mini-batches to avoid huge graphs
+    for decision in decisions {
+        let n = decision.candidate_features.len();
+        if n <= 1 {
+            continue; // no choice to make
+        }
+
+        // Build input tensor: [n_candidates, NUM_FEATURES]
+        let flat: Vec<f32> = decision.candidate_features
+            .iter()
+            .flat_map(|f| f.iter().copied())
+            .collect();
+        let input = Tensor::<MyAutodiffBackend, 1>::from_floats(flat.as_slice(), device)
+            .reshape([n, NUM_FEATURES]);
+
+        // Forward pass: [n_candidates, 1]
+        let scores = model.forward(input).reshape([n]);
+
+        // Log-softmax
+        let log_probs = burn::tensor::activation::log_softmax(scores, 0);
+
+        // REINFORCE loss: -advantage * log_prob(chosen)
+        let chosen_log_prob = log_probs
+            .slice([decision.chosen_index..decision.chosen_index + 1]);
+        let adv_tensor = Tensor::<MyAutodiffBackend, 1>::from_floats([-advantage].as_slice(), device);
+        let loss = chosen_log_prob.mul(adv_tensor).sum();
+
+        // Backward + step
+        let grads = loss.backward();
+        let grads = burn::optim::GradientsParams::from_grads(grads, &*model);
+        *model = optimizer.step(lr, model.clone(), grads);
+    }
+}
+
+/// Self-play REINFORCE training for the policy net.
 pub fn self_play_train(
     artifact_dir: &str,
     num_iterations: usize,
     games_per_iteration: usize,
-    epochs_per_iteration: usize,
+    _epochs_per_iteration: usize,
 ) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-    let buffer_iterations = 5;
-    let mut replay_buffer: Vec<Vec<TrainingSample>> = Vec::new();
+    let mut baseline = 50.0f32; // moving average baseline
+    let baseline_decay = 0.99f32;
+
+    std::fs::create_dir_all(artifact_dir).ok();
 
     for iteration in 0..num_iterations {
-        let epsilon = (0.2 * (0.95f32).powi(iteration as i32)).max(0.05);
+        let epsilon = (0.3 * (0.97f32).powi(iteration as i32)).max(0.05);
         println!(
-            "\n=== Iteration {}/{num_iterations} (epsilon={epsilon:.3}) ===",
+            "\n=== Iteration {}/{num_iterations} (epsilon={epsilon:.3}, baseline={baseline:.1}) ===",
             iteration + 1
         );
 
-        let model: PolicyModel<MyBackend> = if iteration == 0 {
+        // Load current model for inference
+        let inference_model: PolicyModel<MyBackend> = if iteration == 0 {
             PolicyModelConfig::new()
                 .init::<MyBackend>(&device)
                 .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
@@ -542,6 +611,7 @@ pub fn self_play_train(
                 .expect("Failed to load model")
         };
 
+        // Play games and collect decision points
         let genes = Arc::new(bot::default_genes());
         let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
         let games_each = games_per_iteration / 4;
@@ -551,11 +621,11 @@ pub fn self_play_train(
             .collect();
 
         let tmp_model_path = format!("{artifact_dir}/tmp_thread_model");
-        model
+        inference_model
             .save_file(&tmp_model_path, &CompactRecorder::new())
             .expect("Failed to save temp model");
 
-        let game_results: Vec<(Vec<TrainingSample>, f32)> = game_configs
+        let game_results: Vec<(Vec<DecisionPoint>, f32)> = game_configs
             .par_iter()
             .map(|&config| {
                 let thread_model = PolicyModelConfig::new()
@@ -573,65 +643,48 @@ pub fn self_play_train(
             })
             .collect();
 
-        let new_samples: Vec<TrainingSample> = game_results.iter().flat_map(|(s, _)| s.iter().cloned()).collect();
         let game_scores: Vec<f32> = game_results.iter().map(|(_, score)| *score).collect();
         let avg_score = if game_scores.is_empty() { 0.0 } else {
             game_scores.iter().sum::<f32>() / game_scores.len() as f32
         };
+        let total_decisions: usize = game_results.iter().map(|(d, _)| d.len()).sum();
 
-        replay_buffer.push(new_samples);
-        if replay_buffer.len() > buffer_iterations {
-            replay_buffer.remove(0);
-        }
-
-        let all_samples: Vec<TrainingSample> = replay_buffer.iter().flatten().cloned().collect();
         println!(
-            "  Generated {} new samples (avg score: {avg_score:.1}), replay buffer: {} total",
-            replay_buffer.last().unwrap().len(),
-            all_samples.len()
+            "  {} games, {} decisions, avg score: {avg_score:.1}",
+            game_scores.len(),
+            total_decisions
         );
 
-        // Train
-        let split = (all_samples.len() * 9) / 10;
-        let train_data = InMemDataset::new(all_samples[..split].to_vec());
-        let valid_data = InMemDataset::new(all_samples[split..].to_vec());
-
-        let model: PolicyModel<MyAutodiffBackend> = PolicyModelConfig::new()
+        // REINFORCE updates
+        let mut model: PolicyModel<MyAutodiffBackend> = PolicyModelConfig::new()
             .init::<MyAutodiffBackend>(&device)
             .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
             .unwrap_or_else(|_| PolicyModelConfig::new().init::<MyAutodiffBackend>(&device));
 
-        let batcher_train = PolicyBatcher::<MyAutodiffBackend> { _phantom: std::marker::PhantomData };
-        let batcher_valid = PolicyBatcher::<MyBackend> { _phantom: std::marker::PhantomData };
+        let mut optimizer = AdamConfig::new().init();
+        let lr = 1e-4;
 
-        let dataloader_train = DataLoaderBuilder::new(batcher_train)
-            .batch_size(256)
-            .shuffle(iteration as u64)
-            .build(train_data);
-        let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
-            .batch_size(256)
-            .shuffle(iteration as u64)
-            .build(valid_data);
+        let mut update_count = 0u32;
+        for (decisions, score) in &game_results {
+            let advantage = score - baseline;
+            if advantage.abs() > 0.5 {
+                reinforce_update(&mut model, &mut optimizer, &device, decisions, advantage, lr);
+                update_count += 1;
+            }
+        }
+        println!("  Updated on {update_count}/{} games", game_scores.len());
 
-        let ckpt_dir = format!("{artifact_dir}/ckpt");
-        std::fs::remove_dir_all(&ckpt_dir).ok();
-        std::fs::create_dir_all(&ckpt_dir).ok();
+        // Update baseline
+        baseline = baseline_decay * baseline + (1.0 - baseline_decay) * avg_score;
 
-        let training = SupervisedTraining::new(&ckpt_dir, dataloader_train, dataloader_valid)
-            .metric_train_numeric(LossMetric::new())
-            .metric_valid_numeric(LossMetric::new())
-            .num_epochs(epochs_per_iteration)
-            .summary();
-
-        let result = training.launch(Learner::new(model, AdamConfig::new().init(), 1e-3));
-
-        result
-            .model
-            .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
-            .expect("Failed to save model");
-
-        std::fs::remove_dir_all(&ckpt_dir).ok();
+        // Save
+        {
+            use burn::module::AutodiffModule;
+            model.valid()
+                .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
+                .expect("Failed to save model");
+        }
     }
 
-    println!("\nPolicy net training complete. Model saved to {artifact_dir}/model");
+    println!("\nREINFORCE training complete. Model saved to {artifact_dir}/model");
 }
