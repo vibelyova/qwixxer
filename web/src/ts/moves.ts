@@ -149,29 +149,7 @@ export function handleCellClick(
         return { newSelection: currentSelection, autoConfirmMove: null };
     }
 
-    // Check if exactly one move is fully matched (all targets selected)
-    const exactMatch = compatible.find(moveIdx => {
-        const pm = parsedMoves.find(p => p.moveIndex === moveIdx);
-        if (!pm) return false;
-        return pm.targets.length === newSelected.length;
-    });
-
-    // If there is exactly one compatible move and all its targets are selected, auto-confirm
-    if (exactMatch !== undefined) {
-        const pm = parsedMoves.find(p => p.moveIndex === exactMatch);
-        if (pm && compatible.length === 1) {
-            // Only one possible move and it's fully specified
-            return {
-                newSelection: {
-                    selected: newSelected,
-                    compatibleMoves: compatible,
-                    phase: currentSelection.phase,
-                },
-                autoConfirmMove: exactMatch,
-            };
-        }
-    }
-
+    // Never auto-confirm — always require explicit confirm button
     return {
         newSelection: {
             selected: newSelected,
@@ -271,12 +249,18 @@ export function renderActionButtons(
     const exactMove = findExactMove(selection, parsedMoves);
     const hasSelection = selection.selected.length > 0;
 
-    // Confirm button (for cell selections)
-    if (hasSelection && !strikeSelected) {
+    // Confirm button (for cell selections or strike)
+    if (hasSelection || strikeSelected) {
         const confirmBtn = document.createElement('button');
         confirmBtn.className = 'action-btn confirm';
         confirmBtn.textContent = 'Confirm';
-        if (exactMove !== null) {
+
+        if (strikeSelected) {
+            const strikeMove = _moves.find(m => m.is_strike);
+            if (strikeMove) {
+                confirmBtn.addEventListener('click', () => _onStrike(strikeMove.index));
+            }
+        } else if (exactMove !== null) {
             confirmBtn.addEventListener('click', () => onConfirm(exactMove));
         } else {
             confirmBtn.disabled = true;

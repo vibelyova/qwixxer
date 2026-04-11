@@ -114,35 +114,16 @@ function onCellClick(row: number, num: number, view: GameView): void {
 
     const result = handleCellClick(row, num, parsedMoves, selection);
     selection = result.newSelection;
-
-    if (result.autoConfirmMove !== null) {
-        // Auto-confirm: single move that matches exactly
-        handleConfirm(result.autoConfirmMove);
-        return;
-    }
-
     render();
 }
 
 function onStrikeToggle(view: GameView): void {
     if (strikeSelected) {
-        // Deselect strike
         strikeSelected = false;
     } else {
-        // Select strike, clear cell selections
         strikeSelected = true;
         const parsedMoves = view.available_moves.map(m => parseMove(m));
         selection = emptySelection(view.phase, parsedMoves);
-
-        // Auto-confirm the strike after a brief visual flash
-        const strikeMove = findStrikeMove(view.available_moves);
-        if (strikeMove) {
-            render(); // show the selected state briefly
-            setTimeout(() => {
-                handleStrike(strikeMove.index);
-            }, 300);
-            return;
-        }
     }
     render();
 }
