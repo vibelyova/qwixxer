@@ -142,35 +142,54 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
         bots.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" vs ")
     );
 
+    use rayon::prelude::*;
+
+    // Run games in parallel, collect per-game results
+    let results: Vec<(Vec<(usize, isize)>, bool)> = (0..num_games)
+        .into_par_iter()
+        .map(|i| {
+            let rotation = i % num_players;
+            let players: Vec<Player> = (0..num_players)
+                .map(|j| {
+                    let bot_idx = (j + num_players - rotation) % num_players;
+                    Player::new(make_strategy(&bots[bot_idx]), Box::new(SmallRng::from_entropy()))
+                })
+                .collect();
+
+            let mut game = game::Game::new(players);
+            game.play();
+
+            let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+            let max = *scores.iter().max().unwrap();
+            let num_winners = scores.iter().filter(|&&s| s == max).count();
+
+            let per_bot: Vec<(usize, isize)> = (0..num_players)
+                .map(|j| {
+                    let bot_idx = (j + num_players - rotation) % num_players;
+                    (bot_idx, scores[j])
+                })
+                .collect();
+
+            let is_tie = num_winners > 1;
+            (per_bot, is_tie)
+        })
+        .collect();
+
+    // Aggregate
     let mut wins = vec![0u32; num_players];
     let mut total_pts = vec![0i64; num_players];
     let mut ties = 0u32;
 
-    for i in 0..num_games {
-        // Rotate starting positions
-        let rotation = i % num_players;
-        let players: Vec<Player> = (0..num_players)
-            .map(|j| {
-                let bot_idx = (j + num_players - rotation) % num_players;
-                Player::new(make_strategy(&bots[bot_idx]), Box::new(SmallRng::from_entropy()))
-            })
-            .collect();
-
-        let mut game = game::Game::new(players);
-        game.play();
-
-        let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
-        let max = *scores.iter().max().unwrap();
-        let num_winners = scores.iter().filter(|&&s| s == max).count();
-
-        for j in 0..num_players {
-            let bot_idx = (j + num_players - rotation) % num_players;
-            total_pts[bot_idx] += scores[j] as i64;
-            if scores[j] == max && num_winners == 1 {
+    for (per_bot, is_tie) in &results {
+        let max = per_bot.iter().map(|(_, s)| *s).max().unwrap();
+        let num_winners = per_bot.iter().filter(|(_, s)| *s == max).count();
+        for &(bot_idx, score) in per_bot {
+            total_pts[bot_idx] += score as i64;
+            if score == max && num_winners == 1 {
                 wins[bot_idx] += 1;
             }
         }
-        if num_winners > 1 {
+        if *is_tie {
             ties += 1;
         }
     }
