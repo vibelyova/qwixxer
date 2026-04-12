@@ -745,13 +745,21 @@ fn play_training_game(
         if turn > 200 { break; }
     }
 
-    let final_score = states[0].count_points() as f32;
+    let our_score = states[0].count_points();
+    let max_opp_score = states[1..].iter().map(|s| s.count_points()).max().unwrap_or(0);
+    let did_win = if our_score > max_opp_score { 1.0f32 } else { 0.0f32 };
+    let normalized_score = (our_score as f32).max(0.0) / 100.0; // roughly 0-1 range
+
+    // Blend: 50% win signal + 50% normalized score
+    let game_outcome = 0.5 * did_win + 0.5 * normalized_score;
+    // Scale to a range the net can work with (~0 to ~1)
+    let final_target = game_outcome * 100.0;
 
     // Compute TD(lambda) targets backwards through the trajectory
     let lambda = 0.8f32;
     let n = recorded_features.len();
     if n == 0 {
-        return (Vec::new(), final_score);
+        return (Vec::new(), final_target);
     }
 
     // Get model's value estimates for each recorded state
@@ -761,9 +769,9 @@ fn play_training_game(
         .collect();
 
     // Compute targets: G_t = (1-lambda)*V(s_{t+1}) + lambda*G_{t+1}
-    // G_{n-1} = final_score
+    // G_{n-1} = final_target (blended win + score)
     let mut targets = vec![0.0f32; n];
-    targets[n - 1] = final_score;
+    targets[n - 1] = final_target;
     for t in (0..n - 1).rev() {
         targets[t] = (1.0 - lambda) * values[t + 1] + lambda * targets[t + 1];
     }
@@ -776,7 +784,7 @@ fn play_training_game(
             value: target,
         })
         .collect();
-    (samples, final_score)
+    (samples, our_score as f32)
 }
 
 /// Self-play RL training loop with replay buffer and mixed opponents.
