@@ -747,13 +747,8 @@ fn play_training_game(
 
     let our_score = states[0].count_points();
     let max_opp_score = states[1..].iter().map(|s| s.count_points()).max().unwrap_or(0);
-    let did_win = if our_score > max_opp_score { 1.0f32 } else { 0.0f32 };
-    let normalized_score = (our_score as f32).max(0.0) / 100.0; // roughly 0-1 range
-
-    // Blend: 50% win signal + 50% normalized score
-    let game_outcome = 0.5 * did_win + 0.5 * normalized_score;
-    // Scale to a range the net can work with (~0 to ~1)
-    let final_target = game_outcome * 100.0;
+    let did_win = if our_score > max_opp_score { 100.0f32 } else { 0.0f32 };
+    let final_target = did_win;
 
     // Compute TD(lambda) targets backwards through the trajectory
     let lambda = 0.8f32;
