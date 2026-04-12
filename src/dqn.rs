@@ -334,6 +334,7 @@ pub struct DqnStrategy {
     model: QwixxModel<MyBackend>,
     device: burn::backend::ndarray::NdArrayDevice,
     context: OpponentContext,
+    cache: std::collections::HashMap<[u32; NUM_FEATURES], f32>,
 }
 
 impl std::fmt::Debug for DqnStrategy {
@@ -349,12 +350,67 @@ impl DqnStrategy {
             .init::<MyBackend>(&device)
             .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
             .expect("Failed to load model");
-        DqnStrategy { model, device, context: OpponentContext::default() }
+        DqnStrategy { model, device, context: OpponentContext::default(), cache: std::collections::HashMap::new() }
     }
 
-    fn evaluate(&self, state: &State) -> f32 {
+    fn features_key(features: &[f32; NUM_FEATURES]) -> [u32; NUM_FEATURES] {
+        let mut key = [0u32; NUM_FEATURES];
+        for i in 0..NUM_FEATURES {
+            key[i] = features[i].to_bits();
+        }
+        key
+    }
+
+    fn evaluate(&mut self, state: &State) -> f32 {
         let features = state_features(state, &self.context);
-        self.model.evaluate_state(&features, &self.device)
+        let key = Self::features_key(&features);
+        if let Some(&cached) = self.cache.get(&key) {
+            return cached;
+        }
+        let value = self.model.evaluate_state(&features, &self.device);
+        self.cache.insert(key, value);
+        value
+    }
+
+    /// Batch evaluate multiple states at once — single forward pass.
+    fn evaluate_batch(&mut self, states: &[State]) -> Vec<f32> {
+        if states.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results = vec![0.0f32; states.len()];
+        let mut uncached_indices = Vec::new();
+        let mut uncached_features = Vec::new();
+
+        // Check cache first
+        for (i, state) in states.iter().enumerate() {
+            let features = state_features(state, &self.context);
+            let key = Self::features_key(&features);
+            if let Some(&cached) = self.cache.get(&key) {
+                results[i] = cached;
+            } else {
+                uncached_indices.push(i);
+                uncached_features.push(features);
+            }
+        }
+
+        // Batch forward pass for uncached states
+        if !uncached_features.is_empty() {
+            let n = uncached_features.len();
+            let flat: Vec<f32> = uncached_features.iter().flat_map(|f| f.iter().copied()).collect();
+            let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), &self.device)
+                .reshape([n, NUM_FEATURES]);
+            let output = self.model.forward(input).reshape([n]);
+            let values = output.into_data().to_vec::<f32>().unwrap();
+
+            for (j, &idx) in uncached_indices.iter().enumerate() {
+                results[idx] = values[j];
+                let key = Self::features_key(&uncached_features[j]);
+                self.cache.insert(key, values[j]);
+            }
+        }
+
+        results
     }
 
     fn find_locking_move(state: &State, moves: &[Move]) -> Option<Move> {
@@ -382,16 +438,23 @@ impl Strategy for DqnStrategy {
         let mut moves = moves;
         moves.push(Move::Strike);
 
+        // Batch: compute all resulting states, evaluate in one pass
+        let result_states: Vec<State> = moves
+            .iter()
+            .map(|&mov| {
+                let mut s = *state;
+                s.apply_move(mov);
+                s
+            })
+            .collect();
+        let values = self.evaluate_batch(&result_states);
+
         moves
             .into_iter()
-            .max_by(|&a, &b| {
-                let mut sa = *state;
-                sa.apply_move(a);
-                let mut sb = *state;
-                sb.apply_move(b);
-                self.evaluate(&sa).partial_cmp(&self.evaluate(&sb)).unwrap()
-            })
+            .enumerate()
+            .max_by(|(i, _), (j, _)| values[*i].partial_cmp(&values[*j]).unwrap())
             .unwrap()
+            .1
     }
 
     fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
@@ -405,19 +468,31 @@ impl Strategy for DqnStrategy {
             return None;
         }
 
-        // Evaluate mark vs skip
-        let best = moves
-            .into_iter()
-            .max_by(|&a, &b| {
-                let mut sa = *state;
-                sa.apply_move(a);
-                sa.lock(locked);
-                let mut sb = *state;
-                sb.apply_move(b);
-                sb.lock(locked);
-                self.evaluate(&sa).partial_cmp(&self.evaluate(&sb)).unwrap()
+        // Batch: compute all resulting states + skip state, evaluate in one pass
+        let mut eval_states: Vec<State> = moves
+            .iter()
+            .map(|&mov| {
+                let mut s = *state;
+                s.apply_move(mov);
+                s.lock(locked);
+                s
             })
+            .collect();
+        // Add skip state (no mark, just lock)
+        let mut skip_state = *state;
+        skip_state.lock(locked);
+        eval_states.push(skip_state);
+
+        let values = self.evaluate_batch(&eval_states);
+        let skip_value = *values.last().unwrap();
+
+        let (best_idx, best_value) = values[..moves.len()]
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap();
+
+        let best = moves[best_idx];
 
         let mut new_state = *state;
         new_state.apply_move(best);
