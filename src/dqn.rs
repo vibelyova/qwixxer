@@ -378,6 +378,7 @@ impl std::fmt::Debug for DqnStrategy {
 
 impl DqnStrategy {
     pub fn load(artifact_dir: &str) -> Self {
+        use burn::record::CompactRecorder;
         let device = burn::backend::ndarray::NdArrayDevice::Cpu;
         let model = QwixxModelConfig::new()
             .init::<MyBackend>(&device)
@@ -414,6 +415,7 @@ impl DqnStrategy {
         key
     }
 
+    #[allow(dead_code)]
     fn evaluate(&mut self, state: &State) -> f32 {
         let features = state_features(state, &self.context);
         let key = Self::features_key(&features);
@@ -545,17 +547,8 @@ impl Strategy for DqnStrategy {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap();
 
-        let best = moves[best_idx];
-
-        let mut new_state = *state;
-        new_state.apply_move(best);
-        new_state.lock(locked);
-
-        let mut skip_state = *state;
-        skip_state.lock(locked);
-
-        if self.evaluate(&new_state) > self.evaluate(&skip_state) {
-            Some(best)
+        if *best_value > skip_value {
+            Some(moves[best_idx])
         } else {
             None
         }

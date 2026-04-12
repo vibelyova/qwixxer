@@ -142,11 +142,16 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
         bots.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" vs ")
     );
 
+    #[cfg(feature = "parallel")]
     use rayon::prelude::*;
 
-    // Run games in parallel, collect per-game results
-    let results: Vec<(Vec<(usize, isize)>, bool)> = (0..num_games)
-        .into_par_iter()
+    // Run games in parallel when available
+    #[cfg(feature = "parallel")]
+    let iter = (0..num_games).into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let iter = 0..num_games;
+
+    let results: Vec<(Vec<(usize, isize)>, bool)> = iter
         .map(|i| {
             let rotation = i % num_players;
             let players: Vec<Player> = (0..num_players)
