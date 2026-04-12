@@ -177,142 +177,7 @@ impl<B: Backend> InferenceStep for QwixxModel<B> {
     }
 }
 
-// ---- Strategy using trained model (inference, always available) ----
-
-pub struct DqnStrategy {
-    model: QwixxModel<MyBackend>,
-    device: burn::backend::ndarray::NdArrayDevice,
-    context: OpponentContext,
-}
-
-impl std::fmt::Debug for DqnStrategy {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DqnStrategy")
-    }
-}
-
-impl DqnStrategy {
-    /// Load model from a file path (native only).
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn load(artifact_dir: &str) -> Self {
-        use burn::record::CompactRecorder;
-        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-        let model = QwixxModelConfig::new()
-            .init::<MyBackend>(&device)
-            .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
-            .expect("Failed to load model");
-        DqnStrategy { model, device, context: OpponentContext::default() }
-    }
-
-    /// Load model from embedded bytes (works in WASM and native).
-    pub fn load_from_bytes(model_bytes: &[u8]) -> Self {
-        use burn::module::Module;
-        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-        let recorder = NamedMpkBytesRecorder::<HalfPrecisionSettings>::new();
-        let record: <QwixxModel<MyBackend> as Module<MyBackend>>::Record = recorder
-            .load(model_bytes.to_vec(), &device)
-            .expect("Failed to load model from bytes");
-        let model = QwixxModelConfig::new()
-            .init::<MyBackend>(&device)
-            .load_record(record);
-        DqnStrategy { model, device, context: OpponentContext::default() }
-    }
-
-    /// Evaluate a state using the DQN model with the current context.
-    pub fn evaluate(&self, state: &State) -> f32 {
-        let features = state_features(state, &self.context);
-        self.model.evaluate_state(&features, &self.device)
-    }
-
-    /// Evaluate a state with a custom opponent context.
-    pub fn evaluate_with_context(&self, state: &State, ctx: &OpponentContext) -> f32 {
-        let features = state_features(state, ctx);
-        self.model.evaluate_state(&features, &self.device)
-    }
-
-    fn find_locking_move(state: &State, moves: &[Move]) -> Option<Move> {
-        let current_locked = state.count_locked();
-        moves.iter().copied().find(|&mov| {
-            let mut new_state = *state;
-            new_state.apply_move(mov);
-            new_state.count_locked() > current_locked
-        })
-    }
-}
-
-impl Strategy for DqnStrategy {
-    fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
-        let moves = state.generate_moves(dice);
-
-        if let Some(mov) = Self::find_locking_move(state, &moves) {
-            return mov;
-        }
-
-        if moves.is_empty() {
-            return Move::Strike;
-        }
-
-        let mut moves = moves;
-        moves.push(Move::Strike);
-
-        moves
-            .into_iter()
-            .max_by(|&a, &b| {
-                let mut sa = *state;
-                sa.apply_move(a);
-                let mut sb = *state;
-                sb.apply_move(b);
-                self.evaluate(&sa).partial_cmp(&self.evaluate(&sb)).unwrap()
-            })
-            .unwrap()
-    }
-
-    fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
-        let moves = state.generate_opponent_moves(number);
-
-        if let Some(mov) = Self::find_locking_move(state, &moves) {
-            return Some(mov);
-        }
-
-        if moves.is_empty() {
-            return None;
-        }
-
-        // Evaluate mark vs skip
-        let best = moves
-            .into_iter()
-            .max_by(|&a, &b| {
-                let mut sa = *state;
-                sa.apply_move(a);
-                sa.lock(locked);
-                let mut sb = *state;
-                sb.apply_move(b);
-                sb.lock(locked);
-                self.evaluate(&sa).partial_cmp(&self.evaluate(&sb)).unwrap()
-            })
-            .unwrap();
-
-        let mut new_state = *state;
-        new_state.apply_move(best);
-        new_state.lock(locked);
-
-        let mut skip_state = *state;
-        skip_state.lock(locked);
-
-        if self.evaluate(&new_state) > self.evaluate(&skip_state) {
-            Some(best)
-        } else {
-            None
-        }
-    }
-
-    fn observe_opponents(&mut self, our_score: isize, opponents: &[State]) {
-        self.context.num_opponents = opponents.len() as u8;
-        self.context.max_opponent_strikes = opponents.iter().map(|s| s.strikes).max().unwrap_or(0);
-        let max_opp_score = opponents.iter().map(|s| s.count_points()).max().unwrap_or(0);
-        self.context.score_gap_to_leader = our_score - max_opp_score;
-    }
-}
+// (DqnStrategy defined below after training code, with cache + batch)
 
 // ===========================================================================
 // Training code (native only, requires `dqn` feature)
@@ -494,6 +359,214 @@ pub fn train(samples: Vec<TrainingSample>, artifact_dir: &str) {
         .expect("Failed to save model");
 
     println!("Model saved to {artifact_dir}/model");
+}
+
+// ---- Strategy using trained model ----
+
+pub struct DqnStrategy {
+    model: QwixxModel<MyBackend>,
+    device: burn::backend::ndarray::NdArrayDevice,
+    context: OpponentContext,
+    cache: std::collections::HashMap<[u32; NUM_FEATURES], f32>,
+}
+
+impl std::fmt::Debug for DqnStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "DqnStrategy")
+    }
+}
+
+impl DqnStrategy {
+    pub fn load(artifact_dir: &str) -> Self {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = QwixxModelConfig::new()
+            .init::<MyBackend>(&device)
+            .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+            .expect("Failed to load model");
+        DqnStrategy { model, device, context: OpponentContext::default(), cache: std::collections::HashMap::new() }
+    }
+
+    /// Load model from embedded bytes (works in WASM and native).
+    pub fn load_from_bytes(model_bytes: &[u8]) -> Self {
+        use burn::module::Module;
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let recorder = NamedMpkBytesRecorder::<HalfPrecisionSettings>::new();
+        let record: <QwixxModel<MyBackend> as Module<MyBackend>>::Record = recorder
+            .load(model_bytes.to_vec(), &device)
+            .expect("Failed to load model from bytes");
+        let model = QwixxModelConfig::new()
+            .init::<MyBackend>(&device)
+            .load_record(record);
+        DqnStrategy { model, device, context: OpponentContext::default(), cache: std::collections::HashMap::new() }
+    }
+
+    /// Evaluate a state with a custom opponent context (for state explorer).
+    pub fn evaluate_with_context(&self, state: &State, ctx: &OpponentContext) -> f32 {
+        let features = state_features(state, ctx);
+        self.model.evaluate_state(&features, &self.device)
+    }
+
+    fn features_key(features: &[f32; NUM_FEATURES]) -> [u32; NUM_FEATURES] {
+        let mut key = [0u32; NUM_FEATURES];
+        for i in 0..NUM_FEATURES {
+            key[i] = features[i].to_bits();
+        }
+        key
+    }
+
+    fn evaluate(&mut self, state: &State) -> f32 {
+        let features = state_features(state, &self.context);
+        let key = Self::features_key(&features);
+        if let Some(&cached) = self.cache.get(&key) {
+            return cached;
+        }
+        let value = self.model.evaluate_state(&features, &self.device);
+        self.cache.insert(key, value);
+        value
+    }
+
+    /// Batch evaluate multiple states at once — single forward pass.
+    fn evaluate_batch(&mut self, states: &[State]) -> Vec<f32> {
+        if states.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results = vec![0.0f32; states.len()];
+        let mut uncached_indices = Vec::new();
+        let mut uncached_features = Vec::new();
+
+        // Check cache first
+        for (i, state) in states.iter().enumerate() {
+            let features = state_features(state, &self.context);
+            let key = Self::features_key(&features);
+            if let Some(&cached) = self.cache.get(&key) {
+                results[i] = cached;
+            } else {
+                uncached_indices.push(i);
+                uncached_features.push(features);
+            }
+        }
+
+        // Batch forward pass for uncached states
+        if !uncached_features.is_empty() {
+            let n = uncached_features.len();
+            let flat: Vec<f32> = uncached_features.iter().flat_map(|f| f.iter().copied()).collect();
+            let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), &self.device)
+                .reshape([n, NUM_FEATURES]);
+            let output = self.model.forward(input).reshape([n]);
+            let values = output.into_data().to_vec::<f32>().unwrap();
+
+            for (j, &idx) in uncached_indices.iter().enumerate() {
+                results[idx] = values[j];
+                let key = Self::features_key(&uncached_features[j]);
+                self.cache.insert(key, values[j]);
+            }
+        }
+
+        results
+    }
+
+    fn find_locking_move(state: &State, moves: &[Move]) -> Option<Move> {
+        let current_locked = state.count_locked();
+        moves.iter().copied().find(|&mov| {
+            let mut new_state = *state;
+            new_state.apply_move(mov);
+            new_state.count_locked() > current_locked
+        })
+    }
+}
+
+impl Strategy for DqnStrategy {
+    fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
+        let moves = state.generate_moves(dice);
+
+        if let Some(mov) = Self::find_locking_move(state, &moves) {
+            return mov;
+        }
+
+        if moves.is_empty() {
+            return Move::Strike;
+        }
+
+        let mut moves = moves;
+        moves.push(Move::Strike);
+
+        // Batch: compute all resulting states, evaluate in one pass
+        let result_states: Vec<State> = moves
+            .iter()
+            .map(|&mov| {
+                let mut s = *state;
+                s.apply_move(mov);
+                s
+            })
+            .collect();
+        let values = self.evaluate_batch(&result_states);
+
+        moves
+            .into_iter()
+            .enumerate()
+            .max_by(|(i, _), (j, _)| values[*i].partial_cmp(&values[*j]).unwrap())
+            .unwrap()
+            .1
+    }
+
+    fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
+        let moves = state.generate_opponent_moves(number);
+
+        if let Some(mov) = Self::find_locking_move(state, &moves) {
+            return Some(mov);
+        }
+
+        if moves.is_empty() {
+            return None;
+        }
+
+        // Batch: compute all resulting states + skip state, evaluate in one pass
+        let mut eval_states: Vec<State> = moves
+            .iter()
+            .map(|&mov| {
+                let mut s = *state;
+                s.apply_move(mov);
+                s.lock(locked);
+                s
+            })
+            .collect();
+        // Add skip state (no mark, just lock)
+        let mut skip_state = *state;
+        skip_state.lock(locked);
+        eval_states.push(skip_state);
+
+        let values = self.evaluate_batch(&eval_states);
+        let skip_value = *values.last().unwrap();
+
+        let (best_idx, best_value) = values[..moves.len()]
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap();
+
+        let best = moves[best_idx];
+
+        let mut new_state = *state;
+        new_state.apply_move(best);
+        new_state.lock(locked);
+
+        let mut skip_state = *state;
+        skip_state.lock(locked);
+
+        if self.evaluate(&new_state) > self.evaluate(&skip_state) {
+            Some(best)
+        } else {
+            None
+        }
+    }
+
+    fn observe_opponents(&mut self, our_score: isize, opponents: &[State]) {
+        self.context.num_opponents = opponents.len() as u8;
+        self.context.max_opponent_strikes = opponents.iter().map(|s| s.strikes).max().unwrap_or(0);
+        let max_opp_score = opponents.iter().map(|s| s.count_points()).max().unwrap_or(0);
+        self.context.score_gap_to_leader = our_score - max_opp_score;
+    }
 }
 
 // ---- Self-play RL training ----
