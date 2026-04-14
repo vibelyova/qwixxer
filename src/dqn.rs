@@ -111,9 +111,9 @@ pub struct QwixxModel<B: Backend> {
 
 #[derive(Config, Debug)]
 pub struct QwixxModelConfig {
-    #[config(default = 64)]
+    #[config(default = 128)]
     pub hidden1: usize,
-    #[config(default = 32)]
+    #[config(default = 64)]
     pub hidden2: usize,
 }
 
@@ -209,21 +209,29 @@ impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
         let batch_size = items.len();
         let mut rng = SmallRng::from_entropy();
 
-        // Data augmentation: randomly swap symmetric row features.
-        // Red(0)↔Yellow(1) are both ascending, Green(2)↔Blue(3) are both descending.
+        // Data augmentation: 3 independent swaps (8 permutations).
         // Per-row feature indices: progress [0-3], marks [4-7], locked [8-11], weighted_prob [12-15].
         let inputs: Vec<f32> = items
             .iter()
             .flat_map(|s| {
                 let mut f = s.features.clone();
+                // Swap red(0)↔yellow(1) within ascending pair
                 if rng.gen::<bool>() {
                     for &base in &[0, 4, 8, 12] {
                         f.swap(base, base + 1);
                     }
                 }
+                // Swap green(2)↔blue(3) within descending pair
                 if rng.gen::<bool>() {
                     for &base in &[2, 6, 10, 14] {
                         f.swap(base, base + 1);
+                    }
+                }
+                // Swap ascending(0,1)↔descending(2,3) pairs
+                if rng.gen::<bool>() {
+                    for &base in &[0, 4, 8, 12] {
+                        f.swap(base, base + 2);     // 0↔2, 4↔6, 8↔10, 12↔14
+                        f.swap(base + 1, base + 3); // 1↔3, 5↔7, 9↔11, 13↔15
                     }
                 }
                 f
@@ -351,13 +359,13 @@ pub fn train(samples: Vec<TrainingSample>, artifact_dir: &str) {
     let batcher_valid = QwixxBatcher::<MyBackend> { _phantom: std::marker::PhantomData };
 
     let dataloader_train = DataLoaderBuilder::new(batcher_train)
-        .batch_size(256)
+        .batch_size(1024)
         .shuffle(42)
         .num_workers(2)
         .build(train_data);
 
     let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
-        .batch_size(256)
+        .batch_size(1024)
         .shuffle(42)
         .num_workers(2)
         .build(valid_data);
@@ -863,8 +871,8 @@ pub fn self_play_train(
     epochs_per_iteration: usize,
 ) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-    let buffer_iterations = 5; // keep last 5 iterations of data
-    let mut replay_buffer: Vec<Vec<TrainingSample>> = Vec::new();
+    let buffer_iterations = 3;
+    let mut replay_buffer: std::collections::VecDeque<Vec<TrainingSample>> = std::collections::VecDeque::new();
 
     let scores_log_path = format!("{artifact_dir}/training_scores.csv");
     // Write header
@@ -874,7 +882,7 @@ pub fn self_play_train(
     let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
 
     for iteration in 0..num_iterations {
-        let epsilon = (0.2 * (0.95f32).powi(iteration as i32)).max(0.05);
+        let epsilon = (0.2 * (0.95f32).powi(iteration as i32)).max(0.07);
         println!(
             "\n=== Iteration {}/{num_iterations} (epsilon={epsilon:.3}) ===",
             iteration + 1
@@ -950,15 +958,15 @@ pub fn self_play_train(
         };
 
         // Update replay buffer
-        replay_buffer.push(new_samples);
+        replay_buffer.push_back(new_samples);
         if replay_buffer.len() > buffer_iterations {
-            replay_buffer.remove(0);
+            replay_buffer.pop_front();
         }
 
         let all_samples: Vec<TrainingSample> = replay_buffer.iter().flatten().cloned().collect();
         println!(
             "  Generated {} new samples (avg score: {avg_score:.1}), replay buffer: {} total",
-            replay_buffer.last().unwrap().len(),
+            replay_buffer.back().unwrap().len(),
             all_samples.len()
         );
 
@@ -968,9 +976,8 @@ pub fn self_play_train(
             writeln!(f, "{},{avg_score:.2}", iteration + 1).ok();
         }
 
-        // Train on the full replay buffer with decaying LR
-        let lr = 1e-4 * (0.97f64).powi(iteration as i32); // decay from 1e-4 toward ~1e-5
-        train_with_epochs(all_samples, artifact_dir, epochs_per_iteration, lr);
+        // Train on replay buffer
+        train_with_epochs(all_samples, artifact_dir, epochs_per_iteration, 4e-4);
     }
 
     println!("\nSelf-play training complete. Model saved to {artifact_dir}/model");
@@ -995,12 +1002,12 @@ fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epoch
     let batcher_valid = QwixxBatcher::<MyBackend> { _phantom: std::marker::PhantomData };
 
     let dataloader_train = DataLoaderBuilder::new(batcher_train)
-        .batch_size(256)
+        .batch_size(1024)
         .shuffle(42)
         .build(train_data);
 
     let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
-        .batch_size(256)
+        .batch_size(1024)
         .shuffle(42)
         .build(valid_data);
 

@@ -200,7 +200,7 @@ export function findExactMove(
         return pm.targets.every(t => selectedKeys.has(targetKey(t)));
     });
 
-    if (exactMatches.length === 1) {
+    if (exactMatches.length >= 1) {
         return exactMatches[0].moveIndex;
     }
 

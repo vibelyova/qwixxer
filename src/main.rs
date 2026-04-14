@@ -291,13 +291,14 @@ fn run_train() {
 
 #[cfg(feature = "dqn")]
 fn run_dqn_train() {
-    let samples = dqn::generate_training_data(500, 200);
+    let samples = dqn::generate_training_data(1500, 500);
     dqn::train(samples, "dqn_model");
 }
 
 #[cfg(feature = "dqn")]
 fn run_dqn_selfplay() {
-    dqn::self_play_train("dqn_model", 80, 12000, 10);
+    std::env::set_var("OPENBLAS_NUM_THREADS", "1");
+    dqn::self_play_train("dqn_model", 80, 20000, 10);
 }
 
 fn main() {
