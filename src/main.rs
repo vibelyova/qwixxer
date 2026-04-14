@@ -216,6 +216,22 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
             ties as f64 / num_games as f64 * 100.0
         );
     }
+
+    // For 1v1: show 99% confidence interval for the leading bot's win rate
+    if num_players == 2 {
+        let leader = if wins[0] >= wins[1] { 0 } else { 1 };
+        let n = num_games as f64;
+        let p = wins[leader] as f64 / n;
+        let se = (p * (1.0 - p) / n).sqrt();
+        let z = 2.576; // 99% confidence
+        let moe = z * se;
+        println!(
+            "\n  99% CI: {} wins {:.2}% - {:.2}%",
+            bots[leader],
+            (p - moe) * 100.0,
+            (p + moe) * 100.0
+        );
+    }
 }
 
 fn run_solo(num_games: usize) {
@@ -281,7 +297,7 @@ fn run_dqn_train() {
 
 #[cfg(feature = "dqn")]
 fn run_dqn_selfplay() {
-    dqn::self_play_train("dqn_model", 80, 3000, 10);
+    dqn::self_play_train("dqn_model", 80, 12000, 10);
 }
 
 fn main() {

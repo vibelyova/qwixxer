@@ -207,7 +207,28 @@ pub struct QwixxBatch<B: Backend> {
 impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
     fn batch(&self, items: Vec<TrainingSample>, device: &B::Device) -> QwixxBatch<B> {
         let batch_size = items.len();
-        let inputs: Vec<f32> = items.iter().flat_map(|s| s.features.iter().copied()).collect();
+        let mut rng = SmallRng::from_entropy();
+
+        // Data augmentation: randomly swap symmetric row features.
+        // Red(0)↔Yellow(1) are both ascending, Green(2)↔Blue(3) are both descending.
+        // Per-row feature indices: progress [0-3], marks [4-7], locked [8-11], weighted_prob [12-15].
+        let inputs: Vec<f32> = items
+            .iter()
+            .flat_map(|s| {
+                let mut f = s.features.clone();
+                if rng.gen::<bool>() {
+                    for &base in &[0, 4, 8, 12] {
+                        f.swap(base, base + 1);
+                    }
+                }
+                if rng.gen::<bool>() {
+                    for &base in &[2, 6, 10, 14] {
+                        f.swap(base, base + 1);
+                    }
+                }
+                f
+            })
+            .collect();
         let targets: Vec<f32> = items.iter().map(|s| s.value).collect();
 
         let inputs = Tensor::<B, 1>::from_floats(inputs.as_slice(), device)
@@ -845,6 +866,13 @@ pub fn self_play_train(
     let buffer_iterations = 5; // keep last 5 iterations of data
     let mut replay_buffer: Vec<Vec<TrainingSample>> = Vec::new();
 
+    let scores_log_path = format!("{artifact_dir}/training_scores.csv");
+    // Write header
+    std::fs::write(&scores_log_path, "iteration,avg_score\n").ok();
+
+    let genes = Arc::new(bot::default_genes());
+    let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
+
     for iteration in 0..num_iterations {
         let epsilon = (0.2 * (0.95f32).powi(iteration as i32)).max(0.05);
         println!(
@@ -868,30 +896,31 @@ pub fn self_play_train(
                 .expect("Failed to load model")
         };
 
-        // Generate training data: 3-4 player games vs GA champions and self
-        let genes = Arc::new(bot::default_genes());
-        let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
         let games_each = games_per_iteration / 4;
 
         // 4 configs: 3p vs 2 GA, 4p vs 3 GA, 3p vs GA + self, 4p vs 2 GA + self
+        // (1v1 configs commented out for now)
         let game_configs: Vec<u8> = (0..4)
             .flat_map(|config| std::iter::repeat(config).take(games_each))
             .collect();
 
-        let tmp_model_path = format!("{artifact_dir}/tmp_thread_model");
-        model
-            .save_file(&tmp_model_path, &CompactRecorder::new())
-            .expect("Failed to save temp model");
+        // Pre-clone models — one per game. Cloning is cheap (NdArray tensors are Arc-backed).
+        let models: Vec<QwixxModel<MyBackend>> = (0..game_configs.len())
+            .map(|_| model.clone())
+            .collect();
 
         let game_results: Vec<(Vec<TrainingSample>, f32)> = game_configs
-            .par_iter()
-            .map(|&config| {
-                let thread_model = QwixxModelConfig::new()
-                    .init::<MyBackend>(&device)
-                    .load_file(&tmp_model_path, &CompactRecorder::new(), &device)
-                    .expect("Failed to load thread model");
+            .into_par_iter()
+            .zip(models.into_par_iter())
+            .map(|(config, thread_model)| {
                 let mut rng = SmallRng::from_entropy();
                 let mut opps: Vec<Box<dyn Strategy>> = match config {
+                    // // 1v1: vs GA champion
+                    // 0 => vec![Box::new(champion.clone())],
+                    // // 1v1: vs self
+                    // 1 => vec![
+                    //     Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::from_entropy() }),
+                    // ],
                     // 3-player: vs 2 GA champions
                     0 => vec![Box::new(champion.clone()), Box::new(champion.clone())],
                     // 4-player: vs 3 GA champions
@@ -933,8 +962,15 @@ pub fn self_play_train(
             all_samples.len()
         );
 
-        // Train on the full replay buffer
-        train_with_epochs(all_samples, artifact_dir, epochs_per_iteration);
+        // Log avg score
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
+            writeln!(f, "{},{avg_score:.2}", iteration + 1).ok();
+        }
+
+        // Train on the full replay buffer with decaying LR
+        let lr = 1e-4 * (0.97f64).powi(iteration as i32); // decay from 1e-4 toward ~1e-5
+        train_with_epochs(all_samples, artifact_dir, epochs_per_iteration, lr);
     }
 
     println!("\nSelf-play training complete. Model saved to {artifact_dir}/model");
@@ -942,7 +978,7 @@ pub fn self_play_train(
 
 #[cfg(feature = "dqn")]
 /// Train with a specific number of epochs, loading from existing model if present.
-fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epochs: usize) {
+fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epochs: usize, lr: f64) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
 
     let split = (samples.len() * 9) / 10;
@@ -979,7 +1015,7 @@ fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epoch
         .num_epochs(num_epochs)
         .summary();
 
-    let result = training.launch(Learner::new(model, AdamConfig::new().init(), 1e-4));
+    let result = training.launch(Learner::new(model, AdamConfig::new().init(), lr));
 
     result
         .model
