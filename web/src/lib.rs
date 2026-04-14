@@ -243,6 +243,10 @@ impl WebGame {
         self.dice = roll_dice(&mut self.rng);
         self.white_sum = self.dice[0] + self.dice[1];
 
+        self.bot_strategy.observe_opponents(
+            self.bot_state.count_points(),
+            &[self.player_state],
+        );
         let mov = self.bot_strategy.your_move(&self.bot_state, self.dice);
         record_marks(&mut self.bot_marks, mov);
         self.bot_state.apply_move(mov);
@@ -267,6 +271,10 @@ impl WebGame {
     /// Execute the bot's passive turn (during player's active turn).
     fn do_bot_passive(&mut self) {
         let locked = self.player_state.locked();
+        self.bot_strategy.observe_opponents(
+            self.bot_state.count_points(),
+            &[self.player_state],
+        );
         let bot_mov =
             self.bot_strategy
                 .opponents_move(&self.bot_state, self.white_sum, locked);
