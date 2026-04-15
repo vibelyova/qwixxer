@@ -521,6 +521,15 @@ impl DqnStrategy {
 
 impl Strategy for DqnStrategy {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
+        // End the game immediately if we're ahead and can strike out
+        if state.strikes == 3 {
+            let our_score_after_strike = state.count_points() - 5;
+            let opp_score = state.count_points() - self.context.score_gap_to_leader;
+            if our_score_after_strike > opp_score {
+                return Move::Strike;
+            }
+        }
+
         let moves = state.generate_moves(dice);
 
         if let Some(mov) = Self::find_locking_move(state, &moves, self.context.score_gap_to_leader) {
@@ -618,6 +627,15 @@ fn pick_move_with_model(
 ) -> Move {
     if moves.is_empty() {
         return Move::Strike;
+    }
+
+    // End the game immediately if we're ahead and can strike out
+    if state.strikes == 3 {
+        let our_score_after_strike = state.count_points() - 5;
+        let opp_score = state.count_points() - ctx.score_gap_to_leader;
+        if our_score_after_strike > opp_score {
+            return Move::Strike;
+        }
     }
 
     // Lock if possible and beneficial
