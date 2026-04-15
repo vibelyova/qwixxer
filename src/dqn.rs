@@ -497,12 +497,24 @@ impl DqnStrategy {
         results
     }
 
-    fn find_locking_move(state: &State, moves: &[Move]) -> Option<Move> {
+    fn find_locking_move(state: &State, moves: &[Move], score_gap: isize) -> Option<Move> {
         let current_locked = state.count_locked();
         moves.iter().copied().find(|&mov| {
             let mut new_state = *state;
             new_state.apply_move(mov);
-            new_state.count_locked() > current_locked
+            if new_state.count_locked() <= current_locked {
+                return false; // not a locking move
+            }
+            // If locking would end the game (2+ locked rows), only lock if we're winning
+            if new_state.count_locked() >= 2 {
+                let score_after = new_state.count_points();
+                // score_gap is our_score - opponent_score BEFORE this move
+                // Approximate opponent score = our_score_before - score_gap
+                let our_score_before = state.count_points();
+                let opp_score = our_score_before - score_gap;
+                return score_after > opp_score;
+            }
+            true
         })
     }
 }
@@ -511,7 +523,7 @@ impl Strategy for DqnStrategy {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
         let moves = state.generate_moves(dice);
 
-        if let Some(mov) = Self::find_locking_move(state, &moves) {
+        if let Some(mov) = Self::find_locking_move(state, &moves, self.context.score_gap_to_leader) {
             return mov;
         }
 
@@ -544,7 +556,7 @@ impl Strategy for DqnStrategy {
     fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
         let moves = state.generate_opponent_moves(number);
 
-        if let Some(mov) = Self::find_locking_move(state, &moves) {
+        if let Some(mov) = Self::find_locking_move(state, &moves, self.context.score_gap_to_leader) {
             return Some(mov);
         }
 
@@ -608,12 +620,17 @@ fn pick_move_with_model(
         return Move::Strike;
     }
 
-    // Always lock if possible
+    // Lock if possible and beneficial
     let current_locked = state.count_locked();
     if let Some(mov) = moves.iter().copied().find(|&mov| {
         let mut s = *state;
         s.apply_move(mov);
-        s.count_locked() > current_locked
+        if s.count_locked() <= current_locked { return false; }
+        if s.count_locked() >= 2 {
+            let opp_score = state.count_points() - ctx.score_gap_to_leader;
+            return s.count_points() > opp_score;
+        }
+        true
     }) {
         return mov;
     }
@@ -652,12 +669,17 @@ fn pick_passive_move_with_model(
         return None;
     }
 
-    // Always lock
+    // Lock if beneficial
     let current_locked = state.count_locked();
     if let Some(mov) = moves.iter().copied().find(|&mov| {
         let mut s = *state;
         s.apply_move(mov);
-        s.count_locked() > current_locked
+        if s.count_locked() <= current_locked { return false; }
+        if s.count_locked() >= 2 {
+            let opp_score = state.count_points() - ctx.score_gap_to_leader;
+            return s.count_points() > opp_score;
+        }
+        true
     }) {
         return Some(mov);
     }

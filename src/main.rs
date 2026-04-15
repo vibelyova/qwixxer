@@ -298,7 +298,7 @@ fn run_dqn_train() {
 #[cfg(feature = "dqn")]
 fn run_dqn_selfplay() {
     std::env::set_var("OPENBLAS_NUM_THREADS", "1");
-    dqn::self_play_train("dqn_model", 80, 20000, 10);
+    dqn::self_play_train("dqn_model", 40, 20000, 10);
 }
 
 fn main() {
