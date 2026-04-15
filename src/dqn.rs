@@ -530,18 +530,17 @@ impl Strategy for DqnStrategy {
             }
         }
 
-        let moves = state.generate_moves(dice);
+        let mut moves = state.generate_moves(dice);
+        moves.push(Move::Strike);
 
         if let Some(mov) = Self::find_locking_move(state, &moves, self.context.score_gap_to_leader) {
             return mov;
         }
 
+        let moves = state.prune_dominated(&moves);
         if moves.is_empty() {
             return Move::Strike;
         }
-
-        let mut moves = moves;
-        moves.push(Move::Strike);
 
         // Batch: compute all resulting states, evaluate in one pass
         let result_states: Vec<State> = moves

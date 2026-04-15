@@ -84,14 +84,14 @@ impl Strategy for DNA {
             }
         }
 
-        let moves = state.generate_moves(dice);
+        let mut moves = state.generate_moves(dice);
+        moves.push(Move::Strike);
 
         if let Some(mov) = Self::find_locking_move(state, &moves, self.score_gap) {
             return mov;
         }
 
-        let mut moves = moves;
-        moves.push(Move::Strike);
+        let moves = state.prune_dominated(&moves);
 
         moves
             .into_iter()

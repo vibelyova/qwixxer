@@ -206,6 +206,62 @@ impl State {
             .collect()
     }
 
+    /// Prune dominated single moves. Doubles and Strike pass through unchanged.
+    ///
+    /// Dominance rules for singles:
+    /// 1. Same row: keep only the mark closest to free pointer (fewer blanks, more options).
+    /// 2. Cross-row: if two singles create equal blanks and equal resulting progress
+    ///    (direction-adjusted), prefer the row with higher total marks (more marginal score).
+    pub fn prune_dominated(&self, moves: &[Move]) -> Vec<Move> {
+        struct SingleInfo {
+            mov: Move,
+            row: usize,
+            blanks: u8,
+            progress: u8,
+        }
+
+        // Separate singles from non-singles (doubles, strike pass through)
+        let mut singles: Vec<SingleInfo> = Vec::new();
+        let mut result: Vec<Move> = Vec::new();
+
+        for &mov in moves {
+            match mov {
+                Move::Single(m) => {
+                    let free = self.rows[m.row].free.unwrap();
+                    let blanks = if m.row < 2 { m.number - free } else { free - m.number };
+                    let progress = if m.row < 2 { m.number - 1 } else { 13 - m.number };
+                    singles.push(SingleInfo { mov, row: m.row, blanks, progress });
+                }
+                _ => result.push(mov),
+            }
+        }
+
+        // Rule 1: per row, keep only the single with fewest blanks
+        let mut best_per_row: [Option<&SingleInfo>; 4] = [None; 4];
+        for info in &singles {
+            match &best_per_row[info.row] {
+                Some(prev) if prev.blanks <= info.blanks => {}
+                _ => best_per_row[info.row] = Some(info),
+            }
+        }
+        let survivors: Vec<&SingleInfo> = best_per_row.iter().filter_map(|x| *x).collect();
+
+        // Rule 2: among survivors, prune if another has equal blanks + progress but higher total
+        for info in &survivors {
+            let dominated = survivors.iter().any(|other| {
+                other.row != info.row
+                    && other.blanks == info.blanks
+                    && other.progress == info.progress
+                    && self.rows[other.row].total > self.rows[info.row].total
+            });
+            if !dominated {
+                result.push(info.mov);
+            }
+        }
+
+        result
+    }
+
     //////////////////////////////////////
     // Metrics ///////////////////////////
     //////////////////////////////////////
