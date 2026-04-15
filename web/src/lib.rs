@@ -253,9 +253,7 @@ impl WebGame {
 
         self.message = format!("Bot played: {}", describe_move(&mov));
 
-        // Apply bot's locks to player before generating passive moves
-        // (a locked row is immediately unavailable per Qwixx rules).
-        self.player_state.lock(self.bot_state.locked());
+        // DON'T propagate locks yet — player gets their passive move first.
         self.phase = Phase::PlayerPassive;
         self.available_moves = self.player_state.generate_opponent_moves(self.white_sum);
         if self.available_moves.is_empty() {
