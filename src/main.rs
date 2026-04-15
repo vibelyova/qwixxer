@@ -199,10 +199,11 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
         }
     }
 
+    // Per-player stats
     for (i, bot) in bots.iter().enumerate() {
         println!(
             "  {:<16} {:>5} wins ({:>4.1}%)  avg {:.1} pts",
-            bot.to_string(),
+            format!("{} #{}", bot, i + 1),
             wins[i],
             wins[i] as f64 / num_games as f64 * 100.0,
             total_pts[i] as f64 / num_games as f64
@@ -217,20 +218,111 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
         );
     }
 
-    // For 1v1: show 99% confidence interval for the leading bot's win rate
-    if num_players == 2 {
-        let leader = if wins[0] >= wins[1] { 0 } else { 1 };
-        let n = num_games as f64;
-        let p = wins[leader] as f64 / n;
-        let se = (p * (1.0 - p) / n).sqrt();
-        let z = 2.576; // 99% confidence
-        let moe = z * se;
-        println!(
-            "\n  99% CI: {} wins {:.2}% - {:.2}%",
-            bots[leader],
-            (p - moe) * 100.0,
-            (p + moe) * 100.0
-        );
+    // Aggregate stats per strategy (when multiple bots share a strategy)
+    let unique_strategies: Vec<String> = bots.iter().map(|b| b.to_string()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    if unique_strategies.len() < num_players {
+        println!("\n  By strategy:");
+
+        // For each game, determine which STRATEGY won.
+        // A tie between bots of the same strategy counts as a win for that strategy.
+        let mut strat_wins: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut strat_pts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut strat_count: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut strat_ties = 0u32;
+
+        for bot in &bots {
+            let name = bot.to_string();
+            strat_count.entry(name.clone()).or_insert(0);
+            strat_wins.entry(name.clone()).or_insert(0);
+            strat_pts.entry(name.clone()).or_insert(0);
+        }
+        for (i, bot) in bots.iter().enumerate() {
+            let name = bot.to_string();
+            *strat_count.entry(name).or_insert(0) += 1;
+            let _ = i; // count only
+        }
+
+        for (per_bot, _) in &results {
+            let max = per_bot.iter().map(|(_, s)| *s).max().unwrap();
+
+            // Accumulate points per strategy
+            for &(bot_idx, score) in per_bot {
+                let name = bots[bot_idx].to_string();
+                *strat_pts.entry(name).or_insert(0) += score as i64;
+            }
+
+            // Find which strategies have the max score
+            let winning_strategies: std::collections::BTreeSet<String> = per_bot
+                .iter()
+                .filter(|(_, s)| *s == max)
+                .map(|(idx, _)| bots[*idx].to_string())
+                .collect();
+
+            if winning_strategies.len() == 1 {
+                let name = winning_strategies.into_iter().next().unwrap();
+                *strat_wins.entry(name).or_insert(0) += 1;
+            } else {
+                strat_ties += 1;
+            }
+        }
+
+        for strat in &unique_strategies {
+            let count = *strat_count.get(strat).unwrap() as f64;
+            let sw = *strat_wins.get(strat).unwrap_or(&0);
+            let sp = *strat_pts.get(strat).unwrap_or(&0);
+            println!(
+                "  {:<16} {:>5} wins ({:>4.1}%)  avg {:.1} pts",
+                strat,
+                sw,
+                sw as f64 / num_games as f64 * 100.0,
+                sp as f64 / (num_games as f64 * count),
+            );
+        }
+        if strat_ties > 0 {
+            println!(
+                "  {:<16} {:>5}       ({:>4.1}%)",
+                "Ties",
+                strat_ties,
+                strat_ties as f64 / num_games as f64 * 100.0
+            );
+        }
+
+        // CI for 2-strategy matchups
+        if unique_strategies.len() == 2 {
+            let s0 = &unique_strategies[0];
+            let s1 = &unique_strategies[1];
+            let w0 = *strat_wins.get(s0).unwrap_or(&0);
+            let w1 = *strat_wins.get(s1).unwrap_or(&0);
+            let leader = if w0 >= w1 { s0 } else { s1 };
+            let leader_wins = w0.max(w1);
+            let n = num_games as f64;
+            let p = leader_wins as f64 / n;
+            let se = (p * (1.0 - p) / n).sqrt();
+            let z = 2.576;
+            let moe = z * se;
+            println!(
+                "\n  99% CI: {} wins {:.2}% - {:.2}%",
+                leader,
+                (p - moe) * 100.0,
+                (p + moe) * 100.0
+            );
+        }
+    } else {
+        // Simple 1v1 CI (no duplicate strategies)
+        if num_players == 2 {
+            let leader = if wins[0] >= wins[1] { 0 } else { 1 };
+            let n = num_games as f64;
+            let p = wins[leader] as f64 / n;
+            let se = (p * (1.0 - p) / n).sqrt();
+            let z = 2.576;
+            let moe = z * se;
+            println!(
+                "\n  99% CI: {} wins {:.2}% - {:.2}%",
+                bots[leader],
+                (p - moe) * 100.0,
+                (p + moe) * 100.0
+            );
+        }
     }
 }
 
