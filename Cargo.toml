@@ -26,3 +26,6 @@ itertools = "0.12"
 rand = { version = "0.8", features = ["small_rng"] }
 rayon = { version = "1", optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
+
+[profile.release]
+lto = true

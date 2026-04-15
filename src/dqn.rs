@@ -111,9 +111,9 @@ pub struct QwixxModel<B: Backend> {
 
 #[derive(Config, Debug)]
 pub struct QwixxModelConfig {
-    #[config(default = 64)]
+    #[config(default = 128)]
     pub hidden1: usize,
-    #[config(default = 32)]
+    #[config(default = 64)]
     pub hidden2: usize,
 }
 
@@ -207,7 +207,36 @@ pub struct QwixxBatch<B: Backend> {
 impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
     fn batch(&self, items: Vec<TrainingSample>, device: &B::Device) -> QwixxBatch<B> {
         let batch_size = items.len();
-        let inputs: Vec<f32> = items.iter().flat_map(|s| s.features.iter().copied()).collect();
+        let mut rng = SmallRng::from_entropy();
+
+        // Data augmentation: 3 independent swaps (8 permutations).
+        // Per-row feature indices: progress [0-3], marks [4-7], locked [8-11], weighted_prob [12-15].
+        let inputs: Vec<f32> = items
+            .iter()
+            .flat_map(|s| {
+                let mut f = s.features.clone();
+                // Swap red(0)↔yellow(1) within ascending pair
+                if rng.gen::<bool>() {
+                    for &base in &[0, 4, 8, 12] {
+                        f.swap(base, base + 1);
+                    }
+                }
+                // Swap green(2)↔blue(3) within descending pair
+                if rng.gen::<bool>() {
+                    for &base in &[2, 6, 10, 14] {
+                        f.swap(base, base + 1);
+                    }
+                }
+                // Swap ascending(0,1)↔descending(2,3) pairs
+                if rng.gen::<bool>() {
+                    for &base in &[0, 4, 8, 12] {
+                        f.swap(base, base + 2);     // 0↔2, 4↔6, 8↔10, 12↔14
+                        f.swap(base + 1, base + 3); // 1↔3, 5↔7, 9↔11, 13↔15
+                    }
+                }
+                f
+            })
+            .collect();
         let targets: Vec<f32> = items.iter().map(|s| s.value).collect();
 
         let inputs = Tensor::<B, 1>::from_floats(inputs.as_slice(), device)
@@ -330,13 +359,13 @@ pub fn train(samples: Vec<TrainingSample>, artifact_dir: &str) {
     let batcher_valid = QwixxBatcher::<MyBackend> { _phantom: std::marker::PhantomData };
 
     let dataloader_train = DataLoaderBuilder::new(batcher_train)
-        .batch_size(256)
+        .batch_size(1024)
         .shuffle(42)
         .num_workers(2)
         .build(train_data);
 
     let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
-        .batch_size(256)
+        .batch_size(1024)
         .shuffle(42)
         .num_workers(2)
         .build(valid_data);
@@ -468,21 +497,42 @@ impl DqnStrategy {
         results
     }
 
-    fn find_locking_move(state: &State, moves: &[Move]) -> Option<Move> {
+    fn find_locking_move(state: &State, moves: &[Move], score_gap: isize) -> Option<Move> {
         let current_locked = state.count_locked();
         moves.iter().copied().find(|&mov| {
             let mut new_state = *state;
             new_state.apply_move(mov);
-            new_state.count_locked() > current_locked
+            if new_state.count_locked() <= current_locked {
+                return false; // not a locking move
+            }
+            // If locking would end the game (2+ locked rows), only lock if we're winning
+            if new_state.count_locked() >= 2 {
+                let score_after = new_state.count_points();
+                // score_gap is our_score - opponent_score BEFORE this move
+                // Approximate opponent score = our_score_before - score_gap
+                let our_score_before = state.count_points();
+                let opp_score = our_score_before - score_gap;
+                return score_after > opp_score;
+            }
+            true
         })
     }
 }
 
 impl Strategy for DqnStrategy {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
+        // End the game immediately if we're ahead and can strike out
+        if state.strikes == 3 {
+            let our_score_after_strike = state.count_points() - 5;
+            let opp_score = state.count_points() - self.context.score_gap_to_leader;
+            if our_score_after_strike > opp_score {
+                return Move::Strike;
+            }
+        }
+
         let moves = state.generate_moves(dice);
 
-        if let Some(mov) = Self::find_locking_move(state, &moves) {
+        if let Some(mov) = Self::find_locking_move(state, &moves, self.context.score_gap_to_leader) {
             return mov;
         }
 
@@ -515,7 +565,7 @@ impl Strategy for DqnStrategy {
     fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
         let moves = state.generate_opponent_moves(number);
 
-        if let Some(mov) = Self::find_locking_move(state, &moves) {
+        if let Some(mov) = Self::find_locking_move(state, &moves, self.context.score_gap_to_leader) {
             return Some(mov);
         }
 
@@ -579,12 +629,26 @@ fn pick_move_with_model(
         return Move::Strike;
     }
 
-    // Always lock if possible
+    // End the game immediately if we're ahead and can strike out
+    if state.strikes == 3 {
+        let our_score_after_strike = state.count_points() - 5;
+        let opp_score = state.count_points() - ctx.score_gap_to_leader;
+        if our_score_after_strike > opp_score {
+            return Move::Strike;
+        }
+    }
+
+    // Lock if possible and beneficial
     let current_locked = state.count_locked();
     if let Some(mov) = moves.iter().copied().find(|&mov| {
         let mut s = *state;
         s.apply_move(mov);
-        s.count_locked() > current_locked
+        if s.count_locked() <= current_locked { return false; }
+        if s.count_locked() >= 2 {
+            let opp_score = state.count_points() - ctx.score_gap_to_leader;
+            return s.count_points() > opp_score;
+        }
+        true
     }) {
         return mov;
     }
@@ -623,12 +687,17 @@ fn pick_passive_move_with_model(
         return None;
     }
 
-    // Always lock
+    // Lock if beneficial
     let current_locked = state.count_locked();
     if let Some(mov) = moves.iter().copied().find(|&mov| {
         let mut s = *state;
         s.apply_move(mov);
-        s.count_locked() > current_locked
+        if s.count_locked() <= current_locked { return false; }
+        if s.count_locked() >= 2 {
+            let opp_score = state.count_points() - ctx.score_gap_to_leader;
+            return s.count_points() > opp_score;
+        }
+        true
     }) {
         return Some(mov);
     }
@@ -842,11 +911,18 @@ pub fn self_play_train(
     epochs_per_iteration: usize,
 ) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-    let buffer_iterations = 5; // keep last 5 iterations of data
-    let mut replay_buffer: Vec<Vec<TrainingSample>> = Vec::new();
+    let buffer_iterations = 3;
+    let mut replay_buffer: std::collections::VecDeque<Vec<TrainingSample>> = std::collections::VecDeque::new();
+
+    let scores_log_path = format!("{artifact_dir}/training_scores.csv");
+    // Write header
+    std::fs::write(&scores_log_path, "iteration,avg_score\n").ok();
+
+    let genes = Arc::new(bot::default_genes());
+    let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
 
     for iteration in 0..num_iterations {
-        let epsilon = (0.2 * (0.95f32).powi(iteration as i32)).max(0.05);
+        let epsilon = (0.2 * (0.95f32).powi(iteration as i32)).max(0.07);
         println!(
             "\n=== Iteration {}/{num_iterations} (epsilon={epsilon:.3}) ===",
             iteration + 1
@@ -868,30 +944,31 @@ pub fn self_play_train(
                 .expect("Failed to load model")
         };
 
-        // Generate training data: 3-4 player games vs GA champions and self
-        let genes = Arc::new(bot::default_genes());
-        let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
         let games_each = games_per_iteration / 4;
 
         // 4 configs: 3p vs 2 GA, 4p vs 3 GA, 3p vs GA + self, 4p vs 2 GA + self
+        // (1v1 configs commented out for now)
         let game_configs: Vec<u8> = (0..4)
             .flat_map(|config| std::iter::repeat(config).take(games_each))
             .collect();
 
-        let tmp_model_path = format!("{artifact_dir}/tmp_thread_model");
-        model
-            .save_file(&tmp_model_path, &CompactRecorder::new())
-            .expect("Failed to save temp model");
+        // Pre-clone models — one per game. Cloning is cheap (NdArray tensors are Arc-backed).
+        let models: Vec<QwixxModel<MyBackend>> = (0..game_configs.len())
+            .map(|_| model.clone())
+            .collect();
 
         let game_results: Vec<(Vec<TrainingSample>, f32)> = game_configs
-            .par_iter()
-            .map(|&config| {
-                let thread_model = QwixxModelConfig::new()
-                    .init::<MyBackend>(&device)
-                    .load_file(&tmp_model_path, &CompactRecorder::new(), &device)
-                    .expect("Failed to load thread model");
+            .into_par_iter()
+            .zip(models.into_par_iter())
+            .map(|(config, thread_model)| {
                 let mut rng = SmallRng::from_entropy();
                 let mut opps: Vec<Box<dyn Strategy>> = match config {
+                    // // 1v1: vs GA champion
+                    // 0 => vec![Box::new(champion.clone())],
+                    // // 1v1: vs self
+                    // 1 => vec![
+                    //     Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::from_entropy() }),
+                    // ],
                     // 3-player: vs 2 GA champions
                     0 => vec![Box::new(champion.clone()), Box::new(champion.clone())],
                     // 4-player: vs 3 GA champions
@@ -921,20 +998,26 @@ pub fn self_play_train(
         };
 
         // Update replay buffer
-        replay_buffer.push(new_samples);
+        replay_buffer.push_back(new_samples);
         if replay_buffer.len() > buffer_iterations {
-            replay_buffer.remove(0);
+            replay_buffer.pop_front();
         }
 
         let all_samples: Vec<TrainingSample> = replay_buffer.iter().flatten().cloned().collect();
         println!(
             "  Generated {} new samples (avg score: {avg_score:.1}), replay buffer: {} total",
-            replay_buffer.last().unwrap().len(),
+            replay_buffer.back().unwrap().len(),
             all_samples.len()
         );
 
-        // Train on the full replay buffer
-        train_with_epochs(all_samples, artifact_dir, epochs_per_iteration);
+        // Log avg score
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
+            writeln!(f, "{},{avg_score:.2}", iteration + 1).ok();
+        }
+
+        // Train on replay buffer
+        train_with_epochs(all_samples, artifact_dir, epochs_per_iteration, 4e-4);
     }
 
     println!("\nSelf-play training complete. Model saved to {artifact_dir}/model");
@@ -942,7 +1025,7 @@ pub fn self_play_train(
 
 #[cfg(feature = "dqn")]
 /// Train with a specific number of epochs, loading from existing model if present.
-fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epochs: usize) {
+fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epochs: usize, lr: f64) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
 
     let split = (samples.len() * 9) / 10;
@@ -959,12 +1042,12 @@ fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epoch
     let batcher_valid = QwixxBatcher::<MyBackend> { _phantom: std::marker::PhantomData };
 
     let dataloader_train = DataLoaderBuilder::new(batcher_train)
-        .batch_size(256)
+        .batch_size(1024)
         .shuffle(42)
         .build(train_data);
 
     let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
-        .batch_size(256)
+        .batch_size(1024)
         .shuffle(42)
         .build(valid_data);
 
@@ -979,7 +1062,7 @@ fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epoch
         .num_epochs(num_epochs)
         .summary();
 
-    let result = training.launch(Learner::new(model, AdamConfig::new().init(), 1e-4));
+    let result = training.launch(Learner::new(model, AdamConfig::new().init(), lr));
 
     result
         .model
