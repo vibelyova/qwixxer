@@ -364,6 +364,65 @@ pub enum Move {
     Double(Mark, Mark),
 }
 
+/// Result of applying meta-rules to a move list.
+pub enum MetaDecision {
+    /// A forced move (smart lock or smart strike) — use immediately.
+    Forced(Move),
+    /// Filtered move list for the strategy to evaluate.
+    Choices(Vec<Move>),
+}
+
+impl State {
+    /// Apply meta-rules: smart lock, smart strike, don't-strike-into-loss, prune dominated.
+    /// `score_gap` is our_score - max_opponent_score.
+    pub fn apply_meta_rules(&self, dice: [u8; 6], score_gap: isize) -> MetaDecision {
+        let mut moves = self.generate_moves(dice);
+        moves.push(Move::Strike);
+
+        let opp_score = self.count_points() - score_gap;
+
+        // Smart strike: end the game if ahead with 3 strikes
+        if self.strikes == 3 {
+            if self.count_points() - 5 > opp_score {
+                return MetaDecision::Forced(Move::Strike);
+            }
+            // Don't strike into a loss (unless forced)
+            if moves.len() > 1 {
+                moves.retain(|m| !matches!(m, Move::Strike));
+            }
+        }
+
+        // Smart lock: lock if possible, but not into a loss
+        if let Some(mov) = self.find_smart_lock(&moves, score_gap) {
+            return MetaDecision::Forced(mov);
+        }
+
+        // Prune dominated moves
+        let moves = self.prune_dominated(&moves);
+        if moves.is_empty() {
+            return MetaDecision::Forced(Move::Strike);
+        }
+
+        MetaDecision::Choices(moves)
+    }
+
+    /// Check if any move in the list is a smart lock (locks a row beneficially).
+    /// Returns the locking move if found.
+    pub fn find_smart_lock(&self, moves: &[Move], score_gap: isize) -> Option<Move> {
+        let opp_score = self.count_points() - score_gap;
+        let current_locked = self.count_locked();
+        moves.iter().copied().find(|&mov| {
+            let mut s = *self;
+            s.apply_move(mov);
+            if s.count_locked() <= current_locked { return false; }
+            if s.count_locked() >= 2 {
+                return s.count_points() > opp_score;
+            }
+            true
+        })
+    }
+}
+
 impl From<(usize, u8)> for Move {
     fn from((row, number): (usize, u8)) -> Self {
         Move::Single(Mark { row, number })

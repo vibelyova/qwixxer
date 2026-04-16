@@ -497,58 +497,15 @@ impl DqnStrategy {
         results
     }
 
-    fn find_locking_move(state: &State, moves: &[Move], score_gap: isize) -> Option<Move> {
-        let current_locked = state.count_locked();
-        moves.iter().copied().find(|&mov| {
-            let mut new_state = *state;
-            new_state.apply_move(mov);
-            if new_state.count_locked() <= current_locked {
-                return false; // not a locking move
-            }
-            // If locking would end the game (2+ locked rows), only lock if we're winning
-            if new_state.count_locked() >= 2 {
-                let score_after = new_state.count_points();
-                // score_gap is our_score - opponent_score BEFORE this move
-                // Approximate opponent score = our_score_before - score_gap
-                let our_score_before = state.count_points();
-                let opp_score = our_score_before - score_gap;
-                return score_after > opp_score;
-            }
-            true
-        })
-    }
 }
 
 impl Strategy for DqnStrategy {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
-        // End the game immediately if we're ahead and can strike out
-        if state.strikes == 3 {
-            let our_score_after_strike = state.count_points() - 5;
-            let opp_score = state.count_points() - self.context.score_gap_to_leader;
-            if our_score_after_strike > opp_score {
-                return Move::Strike;
-            }
-        }
-
-        let mut moves = state.generate_moves(dice);
-        moves.push(Move::Strike);
-
-        // Don't strike into a loss (unless forced)
-        if state.strikes == 3 && moves.len() > 1 {
-            let opp_score = state.count_points() - self.context.score_gap_to_leader;
-            if state.count_points() - 5 <= opp_score {
-                moves.retain(|m| !matches!(m, Move::Strike));
-            }
-        }
-
-        if let Some(mov) = Self::find_locking_move(state, &moves, self.context.score_gap_to_leader) {
-            return mov;
-        }
-
-        let moves = state.prune_dominated(&moves);
-        if moves.is_empty() {
-            return Move::Strike;
-        }
+        use crate::state::MetaDecision;
+        let moves = match state.apply_meta_rules(dice, self.context.score_gap_to_leader) {
+            MetaDecision::Forced(mov) => return mov,
+            MetaDecision::Choices(moves) => moves,
+        };
 
         // Batch: compute all resulting states, evaluate in one pass
         let result_states: Vec<State> = moves
@@ -572,7 +529,7 @@ impl Strategy for DqnStrategy {
     fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
         let moves = state.generate_opponent_moves(number);
 
-        if let Some(mov) = Self::find_locking_move(state, &moves, self.context.score_gap_to_leader) {
+        if let Some(mov) = state.find_smart_lock(&moves, self.context.score_gap_to_leader) {
             return Some(mov);
         }
 
@@ -622,7 +579,7 @@ impl Strategy for DqnStrategy {
 // ---- Self-play RL training ----
 
 #[cfg(feature = "dqn")]
-/// Pick a move using the model, with epsilon-greedy exploration.
+/// Pick a move from candidates using the model, with epsilon-greedy exploration.
 fn pick_move_with_model(
     model: &QwixxModel<MyBackend>,
     device: &burn::backend::ndarray::NdArrayDevice,
@@ -632,41 +589,6 @@ fn pick_move_with_model(
     rng: &mut SmallRng,
     ctx: &OpponentContext,
 ) -> Move {
-    if moves.is_empty() {
-        return Move::Strike;
-    }
-
-    // Smart strike: end the game if ahead; avoid striking into a loss
-    if state.strikes == 3 {
-        let opp_score = state.count_points() - ctx.score_gap_to_leader;
-        if state.count_points() - 5 > opp_score {
-            return Move::Strike;
-        }
-        // Don't strike into a loss (unless forced)
-        if moves.len() > 1 {
-            let no_strike: Vec<Move> = moves.iter().copied().filter(|m| !matches!(m, Move::Strike)).collect();
-            if !no_strike.is_empty() {
-                return pick_move_with_model(model, device, state, &no_strike, epsilon, rng, ctx);
-            }
-        }
-    }
-
-    // Lock if possible and beneficial
-    let current_locked = state.count_locked();
-    if let Some(mov) = moves.iter().copied().find(|&mov| {
-        let mut s = *state;
-        s.apply_move(mov);
-        if s.count_locked() <= current_locked { return false; }
-        if s.count_locked() >= 2 {
-            let opp_score = state.count_points() - ctx.score_gap_to_leader;
-            return s.count_points() > opp_score;
-        }
-        true
-    }) {
-        return mov;
-    }
-
-    // Epsilon-greedy
     if rng.gen::<f32>() < epsilon {
         return moves[rng.gen_range(0..moves.len())];
     }
@@ -700,18 +622,8 @@ fn pick_passive_move_with_model(
         return None;
     }
 
-    // Lock if beneficial
-    let current_locked = state.count_locked();
-    if let Some(mov) = moves.iter().copied().find(|&mov| {
-        let mut s = *state;
-        s.apply_move(mov);
-        if s.count_locked() <= current_locked { return false; }
-        if s.count_locked() >= 2 {
-            let opp_score = state.count_points() - ctx.score_gap_to_leader;
-            return s.count_points() > opp_score;
-        }
-        true
-    }) {
+    // Smart lock
+    if let Some(mov) = state.find_smart_lock(&moves, ctx.score_gap_to_leader) {
         return Some(mov);
     }
 
@@ -765,10 +677,14 @@ impl std::fmt::Debug for DqnSelfPlayOpponent {
 #[cfg(feature = "dqn")]
 impl Strategy for DqnSelfPlayOpponent {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
-        let ctx = OpponentContext::default(); // opponent doesn't need perfect context
-        let mut moves = state.generate_moves(dice);
-        moves.push(Move::Strike);
-        pick_move_with_model(&self.model, &self.device, state, &moves, 0.0, &mut self.rng, &ctx)
+        use crate::state::MetaDecision;
+        let ctx = OpponentContext::default();
+        match state.apply_meta_rules(dice, ctx.score_gap_to_leader) {
+            MetaDecision::Forced(mov) => mov,
+            MetaDecision::Choices(moves) => {
+                pick_move_with_model(&self.model, &self.device, state, &moves, 0.0, &mut self.rng, &ctx)
+            }
+        }
     }
 
     fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
@@ -823,9 +739,12 @@ fn play_training_game(
         if active == 0 {
             // DQN's active turn
             let ctx = make_context_multi(&states[0], &states);
-            let mut moves = states[0].generate_moves(dice);
-            moves.push(Move::Strike);
-            let mov = pick_move_with_model(model, device, &states[0], &moves, epsilon, rng, &ctx);
+            let mov = match states[0].apply_meta_rules(dice, ctx.score_gap_to_leader) {
+                crate::state::MetaDecision::Forced(mov) => mov,
+                crate::state::MetaDecision::Choices(moves) => {
+                    pick_move_with_model(model, device, &states[0], &moves, epsilon, rng, &ctx)
+                }
+            };
             let mut s = states[0];
             s.apply_move(mov);
             let ctx_after = make_context_multi(&s, &states);

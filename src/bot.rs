@@ -56,50 +56,13 @@ pub struct DNA {
     score_gap: isize,
 }
 
-impl DNA {
-    /// If any move locks a row, return it immediately.
-    fn find_locking_move(state: &State, moves: &[Move], score_gap: isize) -> Option<Move> {
-        let current_locked = state.count_locked();
-        moves.iter().copied().find(|&mov| {
-            let mut new_state = *state;
-            new_state.apply_move(mov);
-            if new_state.count_locked() <= current_locked { return false; }
-            if new_state.count_locked() >= 2 {
-                let opp_score = state.count_points() - score_gap;
-                return new_state.count_points() > opp_score;
-            }
-            true
-        })
-    }
-}
-
 impl Strategy for DNA {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
-        // End the game immediately if we're ahead and can strike out
-        if state.strikes == 3 {
-            let our_score_after_strike = state.count_points() - 5;
-            let opp_score = state.count_points() - self.score_gap;
-            if our_score_after_strike > opp_score {
-                return Move::Strike;
-            }
-        }
-
-        let mut moves = state.generate_moves(dice);
-        moves.push(Move::Strike);
-
-        // Don't strike into a loss (unless forced)
-        if state.strikes == 3 && moves.len() > 1 {
-            let opp_score = state.count_points() - self.score_gap;
-            if state.count_points() - 5 <= opp_score {
-                moves.retain(|m| !matches!(m, Move::Strike));
-            }
-        }
-
-        if let Some(mov) = Self::find_locking_move(state, &moves, self.score_gap) {
-            return mov;
-        }
-
-        let moves = state.prune_dominated(&moves);
+        use crate::state::MetaDecision;
+        let moves = match state.apply_meta_rules(dice, self.score_gap) {
+            MetaDecision::Forced(mov) => return mov,
+            MetaDecision::Choices(moves) => moves,
+        };
 
         moves
             .into_iter()
@@ -116,7 +79,7 @@ impl Strategy for DNA {
     fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
         let moves = state.generate_opponent_moves(number);
 
-        if let Some(mov) = Self::find_locking_move(state, &moves, self.score_gap) {
+        if let Some(mov) = state.find_smart_lock(&moves, self.score_gap) {
             return Some(mov);
         }
 
