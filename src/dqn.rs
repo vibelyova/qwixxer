@@ -533,6 +533,14 @@ impl Strategy for DqnStrategy {
         let mut moves = state.generate_moves(dice);
         moves.push(Move::Strike);
 
+        // Don't strike into a loss (unless forced)
+        if state.strikes == 3 && moves.len() > 1 {
+            let opp_score = state.count_points() - self.context.score_gap_to_leader;
+            if state.count_points() - 5 <= opp_score {
+                moves.retain(|m| !matches!(m, Move::Strike));
+            }
+        }
+
         if let Some(mov) = Self::find_locking_move(state, &moves, self.context.score_gap_to_leader) {
             return mov;
         }
@@ -628,12 +636,18 @@ fn pick_move_with_model(
         return Move::Strike;
     }
 
-    // End the game immediately if we're ahead and can strike out
+    // Smart strike: end the game if ahead; avoid striking into a loss
     if state.strikes == 3 {
-        let our_score_after_strike = state.count_points() - 5;
         let opp_score = state.count_points() - ctx.score_gap_to_leader;
-        if our_score_after_strike > opp_score {
+        if state.count_points() - 5 > opp_score {
             return Move::Strike;
+        }
+        // Don't strike into a loss (unless forced)
+        if moves.len() > 1 {
+            let no_strike: Vec<Move> = moves.iter().copied().filter(|m| !matches!(m, Move::Strike)).collect();
+            if !no_strike.is_empty() {
+                return pick_move_with_model(model, device, state, &no_strike, epsilon, rng, ctx);
+            }
         }
     }
 

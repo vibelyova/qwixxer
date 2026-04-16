@@ -87,6 +87,14 @@ impl Strategy for DNA {
         let mut moves = state.generate_moves(dice);
         moves.push(Move::Strike);
 
+        // Don't strike into a loss (unless forced)
+        if state.strikes == 3 && moves.len() > 1 {
+            let opp_score = state.count_points() - self.score_gap;
+            if state.count_points() - 5 <= opp_score {
+                moves.retain(|m| !matches!(m, Move::Strike));
+            }
+        }
+
         if let Some(mov) = Self::find_locking_move(state, &moves, self.score_gap) {
             return mov;
         }
