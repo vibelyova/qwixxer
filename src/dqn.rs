@@ -41,6 +41,9 @@ type MyAutodiffBackend = Autodiff<MyBackend>;
 /// Number of input features for the state representation.
 pub const NUM_FEATURES: usize = 21;
 
+/// Global seed for reproducible training. Change to get a different run.
+pub const TRAIN_SEED: u64 = 42;
+
 /// Context about opponents, updated via observe_opponents.
 #[derive(Clone, Debug, Default)]
 pub struct OpponentContext {
@@ -207,7 +210,11 @@ pub struct QwixxBatch<B: Backend> {
 impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
     fn batch(&self, items: Vec<TrainingSample>, device: &B::Device) -> QwixxBatch<B> {
         let batch_size = items.len();
-        let mut rng = SmallRng::from_entropy();
+        // Seed from batch contents for deterministic augmentation
+        let batch_seed = TRAIN_SEED
+            .wrapping_add(items[0].value.to_bits() as u64)
+            .wrapping_add(batch_size as u64);
+        let mut rng = SmallRng::seed_from_u64(batch_seed);
 
         // Data augmentation: 3 independent swaps (8 permutations).
         // Per-row feature indices: progress [0-3], marks [4-7], locked [8-11], weighted_prob [12-15].
@@ -262,7 +269,7 @@ pub fn generate_training_data(num_games: usize, mc_sims: usize) -> Vec<TrainingS
         .into_par_iter()
         .flat_map(|game_idx| {
             let mut ga = champion.clone();
-            let mut rng = SmallRng::from_entropy();
+            let mut rng = SmallRng::seed_from_u64(TRAIN_SEED.wrapping_add(game_idx as u64));
             let mut state = State::default();
             let mut opponent_state = State::default();
             let mut local_samples = Vec::new();
@@ -360,13 +367,13 @@ pub fn train(samples: Vec<TrainingSample>, artifact_dir: &str) {
 
     let dataloader_train = DataLoaderBuilder::new(batcher_train)
         .batch_size(1024)
-        .shuffle(42)
+        .shuffle(TRAIN_SEED)
         .num_workers(2)
         .build(train_data);
 
     let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
         .batch_size(1024)
-        .shuffle(42)
+        .shuffle(TRAIN_SEED)
         .num_workers(2)
         .build(valid_data);
 
@@ -843,6 +850,7 @@ pub fn self_play_train(
     epochs_per_iteration: usize,
 ) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+    MyBackend::seed(&device, TRAIN_SEED);
     let buffer_iterations = 3;
     let mut replay_buffer: std::collections::VecDeque<Vec<TrainingSample>> = std::collections::VecDeque::new();
 
@@ -892,14 +900,16 @@ pub fn self_play_train(
         let game_results: Vec<(Vec<TrainingSample>, f32)> = game_configs
             .into_par_iter()
             .zip(models.into_par_iter())
-            .map(|(config, thread_model)| {
-                let mut rng = SmallRng::from_entropy();
+            .enumerate()
+            .map(|(game_idx, (config, thread_model))| {
+                let seed = TRAIN_SEED.wrapping_add((iteration * games_per_iteration + game_idx) as u64);
+                let mut rng = SmallRng::seed_from_u64(seed);
                 let mut opps: Vec<Box<dyn Strategy>> = match config {
                     // // 1v1: vs GA champion
                     // 0 => vec![Box::new(champion.clone())],
                     // // 1v1: vs self
                     // 1 => vec![
-                    //     Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::from_entropy() }),
+                    //     Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000) }),
                     // ],
                     // 3-player: vs 2 GA champions
                     0 => vec![Box::new(champion.clone()), Box::new(champion.clone())],
@@ -908,13 +918,13 @@ pub fn self_play_train(
                     // 3-player: vs GA + self
                     2 => vec![
                         Box::new(champion.clone()),
-                        Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::from_entropy() }),
+                        Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000) }),
                     ],
                     // 4-player: vs 2 GA + self
                     _ => vec![
                         Box::new(champion.clone()),
                         Box::new(champion.clone()),
-                        Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::from_entropy() }),
+                        Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000) }),
                     ],
                 };
                 play_training_game(&thread_model, &device, &mut opps, epsilon, &mut rng)
@@ -975,12 +985,12 @@ fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epoch
 
     let dataloader_train = DataLoaderBuilder::new(batcher_train)
         .batch_size(1024)
-        .shuffle(42)
+        .shuffle(TRAIN_SEED)
         .build(train_data);
 
     let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
         .batch_size(1024)
-        .shuffle(42)
+        .shuffle(TRAIN_SEED)
         .build(valid_data);
 
     // Use a temp dir for checkpoints to avoid clobbering the main model dir

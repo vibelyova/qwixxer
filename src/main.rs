@@ -108,7 +108,11 @@ enum Commands {
     DqnTrain,
     /// DQN self-play reinforcement learning
     #[cfg(feature = "dqn")]
-    DqnSelfplay,
+    DqnSelfplay {
+        /// Number of iterations
+        #[arg(short, long, default_value = "40")]
+        iterations: usize,
+    },
 }
 
 fn run_play(bots: Vec<BotType>, verbose: bool) {
@@ -388,9 +392,9 @@ fn run_dqn_train() {
 }
 
 #[cfg(feature = "dqn")]
-fn run_dqn_selfplay() {
+fn run_dqn_selfplay(iterations: usize) {
     std::env::set_var("OPENBLAS_NUM_THREADS", "1");
-    dqn::self_play_train("dqn_model", 40, 20000, 10);
+    dqn::self_play_train("dqn_model", iterations, 20000, 10);
 }
 
 fn main() {
@@ -404,7 +408,7 @@ fn main() {
         #[cfg(feature = "dqn")]
         Some(Commands::DqnTrain) => run_dqn_train(),
         #[cfg(feature = "dqn")]
-        Some(Commands::DqnSelfplay) => run_dqn_selfplay(),
+        Some(Commands::DqnSelfplay { iterations }) => run_dqn_selfplay(iterations),
         None => {
             // Default: play against MCTS
             run_play(vec![BotType::Mcts], false);
