@@ -112,6 +112,9 @@ enum Commands {
         /// Number of iterations
         #[arg(short, long, default_value = "40")]
         iterations: usize,
+        /// Benchmark games per iteration (0 to disable)
+        #[arg(short, long, default_value = "0")]
+        bench: usize,
     },
 }
 
@@ -392,9 +395,9 @@ fn run_dqn_train() {
 }
 
 #[cfg(feature = "dqn")]
-fn run_dqn_selfplay(iterations: usize) {
+fn run_dqn_selfplay(iterations: usize, bench_games: usize) {
     std::env::set_var("OPENBLAS_NUM_THREADS", "1");
-    dqn::self_play_train("dqn_model", iterations, 20000, 10);
+    dqn::self_play_train("dqn_model", iterations, 20000, 10, bench_games);
 }
 
 fn main() {
@@ -408,7 +411,7 @@ fn main() {
         #[cfg(feature = "dqn")]
         Some(Commands::DqnTrain) => run_dqn_train(),
         #[cfg(feature = "dqn")]
-        Some(Commands::DqnSelfplay { iterations }) => run_dqn_selfplay(iterations),
+        Some(Commands::DqnSelfplay { iterations, bench }) => run_dqn_selfplay(iterations, bench),
         None => {
             // Default: play against MCTS
             run_play(vec![BotType::Mcts], false);

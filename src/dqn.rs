@@ -843,11 +843,58 @@ fn play_training_game(
 #[cfg(feature = "dqn")]
 /// Self-play RL training loop with replay buffer and mixed opponents.
 /// Keeps samples from the last `buffer_iterations` rounds to prevent forgetting.
+#[cfg(feature = "dqn")]
+fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 {
+    use crate::game::{Game, Player};
+
+    let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+    let model = QwixxModelConfig::new()
+        .init::<MyBackend>(&device)
+        .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+        .expect("Failed to load model for benchmark");
+
+    // Pre-clone models for parallel benchmark (model is !Sync due to OnceCell)
+    let models: Vec<QwixxModel<MyBackend>> = (0..num_games).map(|_| model.clone()).collect();
+
+    let wins: u32 = models
+        .into_par_iter()
+        .enumerate()
+        .map(|(i, model)| {
+            let dqn = DqnStrategy {
+                model,
+                device: device.clone(),
+                context: OpponentContext::default(),
+                cache: std::collections::HashMap::new(),
+            };
+            let rotation = i % 2;
+            let players: Vec<Player> = if rotation == 0 {
+                vec![
+                    Player::new(Box::new(dqn), Box::new(SmallRng::from_entropy())),
+                    Player::new(Box::new(champion.clone()), Box::new(SmallRng::from_entropy())),
+                ]
+            } else {
+                vec![
+                    Player::new(Box::new(champion.clone()), Box::new(SmallRng::from_entropy())),
+                    Player::new(Box::new(dqn), Box::new(SmallRng::from_entropy())),
+                ]
+            };
+            let mut game = Game::new(players);
+            game.play();
+            let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+            let dqn_idx = rotation;
+            if scores[dqn_idx] > scores[1 - dqn_idx] { 1u32 } else { 0u32 }
+        })
+        .sum();
+    wins as f64 / num_games as f64
+}
+
+#[cfg(feature = "dqn")]
 pub fn self_play_train(
     artifact_dir: &str,
     num_iterations: usize,
     games_per_iteration: usize,
     epochs_per_iteration: usize,
+    bench_games: usize,
 ) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
     MyBackend::seed(&device, TRAIN_SEED);
@@ -856,10 +903,11 @@ pub fn self_play_train(
 
     let scores_log_path = format!("{artifact_dir}/training_scores.csv");
     // Write header
-    std::fs::write(&scores_log_path, "iteration,avg_score\n").ok();
+    std::fs::write(&scores_log_path, "iteration,avg_score,winrate\n").ok();
 
     let genes = Arc::new(bot::default_genes());
     let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
+    let start_time = std::time::Instant::now();
 
     for iteration in 0..num_iterations {
         let epsilon = (0.2 * (0.95f32).powi(iteration as i32)).max(0.07);
@@ -952,14 +1000,32 @@ pub fn self_play_train(
             all_samples.len()
         );
 
-        // Log avg score
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
-            writeln!(f, "{},{avg_score:.2}", iteration + 1).ok();
-        }
-
         // Train on replay buffer
         train_with_epochs(all_samples, artifact_dir, epochs_per_iteration, 4e-4);
+
+        let elapsed = start_time.elapsed().as_secs();
+        let mins = elapsed / 60;
+        let secs = elapsed % 60;
+
+        use std::io::Write;
+        if bench_games > 0 {
+            let winrate = benchmark_vs_ga(artifact_dir, &champion, bench_games);
+            println!(
+                "  Iteration {:>3}/{}: avg score {:.1}, winrate {:.1}%, elapsed {}m{}s",
+                iteration + 1, num_iterations, avg_score, winrate * 100.0, mins, secs,
+            );
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
+                writeln!(f, "{},{avg_score:.2},{:.2}", iteration + 1, winrate * 100.0).ok();
+            }
+        } else {
+            println!(
+                "  Iteration {:>3}/{}: avg score {:.1}, elapsed {}m{}s",
+                iteration + 1, num_iterations, avg_score, mins, secs,
+            );
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
+                writeln!(f, "{},{avg_score:.2}", iteration + 1).ok();
+            }
+        }
     }
 
     println!("\nSelf-play training complete. Model saved to {artifact_dir}/model");
