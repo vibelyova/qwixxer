@@ -411,15 +411,23 @@ impl State {
     pub fn find_smart_lock(&self, moves: &[Move], score_gap: isize) -> Option<Move> {
         let opp_score = self.count_points() - score_gap;
         let current_locked = self.count_locked();
-        moves.iter().copied().find(|&mov| {
-            let mut s = *self;
-            s.apply_move(mov);
-            if s.count_locked() <= current_locked { return false; }
-            if s.count_locked() >= 2 {
-                return s.count_points() > opp_score;
-            }
-            true
-        })
+        moves
+            .iter()
+            .copied()
+            .filter(|&mov| {
+                let mut s = *self;
+                s.apply_move(mov);
+                if s.count_locked() <= current_locked { return false; }
+                if s.count_locked() >= 2 {
+                    return s.count_points() > opp_score;
+                }
+                true
+            })
+            .max_by_key(|&mov| {
+                let mut s = *self;
+                s.apply_move(mov);
+                s.count_points()
+            })
     }
 }
 
