@@ -418,20 +418,111 @@ Bmhowe34's dynamic programming solution achieves ~115.5 points in optimal single
 | 2-player GA training | Less robust than 4-player |
 | Extended DQN training (200 iters) | Fully converged at 80 iterations |
 
+---
+
+## Phase 5: Meta-Rules and Strategic Improvements
+
+### Smart lock rule (+3.5% win rate)
+
+The biggest single improvement. Instead of always locking when possible, the bot now checks:
+- **Lock to win**: If locking ends the game (2+ locked rows) and we're ahead, force it.
+- **Don't lock into a loss**: If locking ends the game and we're behind, don't do it.
+- **First lock**: Always lock the first row (doesn't end the game, pure upside).
+
+Result: DQN jumped from ~53.5% to ~57% vs GA. The GA bot also benefits from the same rule.
+
+Experiments isolating the effect (200k games each):
+| DQN lock | GA lock | DQN win % |
+|----------|---------|-----------|
+| forced | forced | 57.8% |
+| forced | relaxed | 57.1% |
+| relaxed | forced | 56.0% |
+| relaxed | relaxed | 55.2% |
+
+Forced first-lock helps DQN (+1.8%). Relaxing GA barely matters. The rule is kept as forced for both bots.
+
+### Smart strike rule
+
+With 3 strikes: intentionally strike to end the game if ahead. Never strike into a loss (unless forced). Marginal impact (~0.1%) since the scenario is rare.
+
+### Move pruning
+
+Prune dominated singles before model evaluation:
+1. **Same row**: Keep only the mark closest to free pointer (fewer blanks, more future options).
+2. **Cross-row**: Equal blanks + equal resulting progress → prefer the row with higher total marks (more marginal score from triangular scoring).
+
+Theoretically correct (strict dominance), marginal benchmark impact (~0.1%).
+
+### Extracted meta-rules (`State::apply_meta_rules`)
+
+All strategic rules consolidated into `State::apply_meta_rules()` and `State::find_smart_lock()`. Returns `MetaDecision::Forced(move)` for smart lock/strike, or `MetaDecision::Choices(moves)` with pruned list. Shared by DQN, GA, and training code — eliminated ~60 lines of duplication.
+
+### Network architecture experiments
+
+| Architecture | Win % vs GA | Notes |
+|-------------|------------|-------|
+| 64→32 (3.5k params) | ~53.5% | Original, pre-meta-rules |
+| 128→64 (11k params) | ~56% | Current, with meta-rules |
+| 96→48 (7k params) | ~56% | No improvement over 128→64 |
+
+Network size doesn't matter much — the bottleneck is the training objective (score vs winrate).
+
+### Hyperparameter sweep
+
+Many hyperparameters tested with no significant impact beyond meta-rules:
+
+| Change | Result |
+|--------|--------|
+| Data augmentation (8 color permutations) | Neutral (53.5% with or without) |
+| Batch size 256→1024→2048 | Neutral when LR scaled proportionally |
+| LR decay (0.97 per iter) | Slightly worse |
+| Epsilon floor 0.01 vs 0.05 vs 0.07 | Neutral |
+| Replay buffer 3 vs 5 iterations | Neutral |
+| No replay buffer (30k fresh games) | Worse (51.9%) |
+| MC pretrain (1500×500 sims) | Same ceiling as from scratch |
+| OpenBLAS | Slower for small matrices |
+| 1v1 training configs | Worse (diluted multi-player training) |
+
+### Score vs win rate divergence
+
+**Key discovery**: Win rate peaks around iteration 9-10 (~58.8%) then declines to ~56% while avg score keeps climbing from 62 to 65+. The model optimizes for score (TD target = final game score), which diverges from winning after ~10 iterations.
+
+| Iteration | Avg Score | Win Rate |
+|-----------|-----------|----------|
+| 5 | 55.7 | 54.8% |
+| 9 | 62.2 | **58.8%** |
+| 15 | 64.3 | 57.6% |
+| 25 | 65.2 | 56.4% |
+
+This explains why our "lucky" 57.2% model (from early experiments) couldn't be reproduced — it was trained for 40 iterations but with a seed that happened to plateau well. Systematic benchmarking per iteration reveals the true optimum is at ~10 iterations.
+
+### Reproducible training
+
+All RNG seeded from a global `TRAIN_SEED` constant. Verified: two runs produce byte-identical training scores. Model weights differ slightly (floating-point non-determinism in burn's optimizer) but benchmark identically.
+
+### Techniques that failed (Phase 5)
+
+| Technique | Why it failed |
+|-----------|--------------|
+| Relaxed lock rule for DQN | Model delays locking to chase score, hurting winrate |
+| Score gap as training target | More noise than absolute score, model learns near-identity |
+| Tabular TD (20M states) | Only 12.7% state coverage after 100M games, 31% vs GA |
+
 ### Overall rankings (multiplayer)
 
-At 500,000 games with seat rotation, the approximate hierarchy is:
+At 500,000 games with seat rotation and meta-rules enabled:
 
 ```
-DQN (~54% vs GA head-to-head)
- > GA Champion (~70% vs Opportunist)
-   > MCTS (~73% vs Opportunist, ~tied with GA)
-     > Opportunist
-       > Conservative
-         > Blank's Race-to-Lock
-           > Blank's Score-Based (in multiplayer)
-             > Rusher
-               > Random
+DQN at iteration 9 (~58.8% vs GA, 99% CI: 58.5-59.1%)
+  > DQN at iteration 40 (~56% vs GA)
+    > GA Champion (~70% vs Opportunist)
+      > MCTS (~73% vs Opportunist, ~tied with GA)
+        > Opportunist
+          > Conservative
+            > Blank's Race-to-Lock
+              > Blank's Score-Based (in multiplayer)
+                > Rusher
+                  > Random
 ```
 
-The DQN and GA are close enough that variance matters at smaller sample sizes. MCTS is approximately GA-level but much slower. All learned strategies dominate the hand-crafted ones.
+The DQN's advantage over GA comes primarily from meta-rules (smart lock/strike) rather than neural net evaluation.

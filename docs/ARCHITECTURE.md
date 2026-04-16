@@ -43,7 +43,7 @@ qwixxer/
 | `burn` | Burn inference only (model definition + forward pass, no training) |
 | `parallel` | Rayon parallelism for benchmarks and GA training |
 
-Default features are `dqn` + `parallel` for the native binary. The web crate uses only `burn` (no rayon, no training code) to keep the WASM binary small (1.6 MB).
+Default features are `dqn` + `parallel` for the native binary. The web crate uses only `burn` (no rayon, no training code) to keep the WASM binary small (~1 MB with wasm-opt).
 
 ---
 
@@ -167,7 +167,7 @@ pub trait Strategy: std::fmt::Debug {
 
 The `instinct(&self, state: &State) -> f64` method computes the weighted sum. Weights are L2-normalized.
 
-**Always-lock rule**: If any legal move locks a row, it is taken immediately without consulting the weight vector. This is hardcoded, not learned -- evolution consistently rediscovered it, so it was baked in.
+**Meta-rules**: Before evaluating moves, `State::apply_meta_rules()` applies smart lock, smart strike, and move pruning (shared with DQN). The GA also tracks `score_gap` via `observe_opponents`.
 
 **Move selection**: For active turns, evaluates `instinct()` on each resulting state (including Strike) and picks the maximum. For passive turns, also compares against the skip state (with locks applied) to decide whether marking is worthwhile.
 
@@ -198,14 +198,19 @@ The strategy only makes marks that appear in the allowed table. Falls back to sm
 **Architecture**: 21-input MLP with ReLU activations.
 
 ```
-Input (21) -> Linear(64) -> ReLU -> Linear(32) -> ReLU -> Linear(1)
+Input (21) -> Linear(128) -> ReLU -> Linear(64) -> ReLU -> Linear(1)
 ```
 
-Total parameters: `21*64 + 64 + 64*32 + 32 + 32*1 + 1 = 3,489`.
+Total parameters: `21*128 + 128 + 128*64 + 64 + 64*1 + 1 = 11,073`.
 
-The model outputs a scalar state value. Move selection: apply each candidate move to the state, evaluate the resulting state, pick the highest value. Uses batch evaluation (single forward pass for all candidates) with a HashMap cache for repeated states.
+The model outputs a scalar state value (TD value learner, not a true DQN — closer to TD-Gammon). Move selection: apply each candidate move to the state, evaluate the resulting state, pick the highest value. Uses batch evaluation (single forward pass for all candidates) with a HashMap cache for repeated states.
 
-**Always-lock rule**: Same as GA -- locks are taken immediately.
+**Meta-rules** (`State::apply_meta_rules`): Before the model evaluates moves, shared strategic rules are applied:
+- **Smart lock**: Always lock to win the game (2+ locked rows and ahead). Always lock the first row. Never lock into a game-ending loss.
+- **Smart strike**: With 3 strikes, strike to end the game if ahead. Never strike into a loss (unless forced).
+- **Move pruning**: Remove dominated singles (same row: keep closest to free pointer; cross-row: equal blanks + progress, prefer higher total marks).
+
+These meta-rules are shared by DQN, GA, and training code via `State::apply_meta_rules()` and `State::find_smart_lock()`.
 
 **Opponent awareness**: `observe_opponents()` updates an `OpponentContext` with `num_opponents`, `max_opponent_strikes`, and `score_gap_to_leader`, which feed into the last 3 input features.
 
@@ -260,22 +265,30 @@ The rollout policy is pluggable via `RolloutFactory = Arc<dyn Fn() -> Box<dyn St
 ### DQN Training
 
 **Phase 1: MC-supervised pretraining** (`generate_training_data` + `train`):
-1. Play 500 games using the GA champion
-2. At each active-turn decision point, evaluate all candidate moves with 200 MC rollouts
+1. Play 1,500 games using the GA champion
+2. At each active-turn decision point, evaluate all candidate moves with 500 MC rollouts
 3. Record `(features_after_move, mc_average_score)` tuples
-4. Train the MLP for 50 epochs with MSE loss, Adam optimizer (lr=1e-3), batch size 256
+4. Train the MLP for 50 epochs with MSE loss, Adam optimizer (lr=1e-3), batch size 1024
 
 **Phase 2: Self-play RL** (`self_play_train`):
-1. Load the pretrained model
-2. For each iteration (80 total, 3,000 games per iteration):
-   a. Play games with epsilon-greedy exploration (epsilon decays from 0.2 to 0.05)
-   b. 4 training configurations (750 games each): 3p vs 2 GA, 4p vs 3 GA, 3p vs GA + self-play copy, 4p vs 2 GA + self-play copy
+1. Can start from pretrained model or from scratch (random weights)
+2. For each iteration (default 40, 20,000 games per iteration):
+   a. Play games with epsilon-greedy exploration (epsilon decays from 0.2 to 0.07)
+   b. 4 training configurations (5,000 games each): 3p vs 2 GA, 4p vs 3 GA, 3p vs GA + self-play copy, 4p vs 2 GA + self-play copy
    c. Record state features at each decision point for player 0 (the DQN agent)
    d. Compute TD(lambda=0.8) targets: `G_t = (1-0.8) * V(s_{t+1}) + 0.8 * G_{t+1}`, with `G_{n-1} = final_score`
-   e. Add new samples to a replay buffer (last 5 iterations retained)
-   f. Retrain for 10 epochs on the full replay buffer (Adam lr=1e-4, batch 256)
+   e. Add new samples to a replay buffer (last 3 iterations retained, VecDeque)
+   f. Retrain for 10 epochs on the full replay buffer (Adam lr=4e-4, batch 1024)
+   g. Optionally benchmark against GA each iteration (`--bench N`)
+   h. Save per-iteration checkpoint (iter-N.mpk)
 
-**Training infrastructure**: Self-play games are parallelized with rayon. Each thread loads its own copy of the model for inference. Thread models are saved/loaded via `CompactRecorder`.
+**Data augmentation**: The batcher randomly swaps symmetric row features (3 independent swaps, 8 permutations): red↔yellow, green↔blue, ascending↔descending pairs.
+
+**Reproducibility**: All RNG is seeded from a global `TRAIN_SEED` constant. Per-game seeds are deterministic (`TRAIN_SEED + iteration * games + game_idx`). Burn's weight initialization is seeded. Training is reproducible across runs (identical training scores, model weights may differ slightly due to floating-point non-determinism in burn's optimizer).
+
+**Training infrastructure**: Self-play games are parallelized with rayon. Models are pre-cloned (Arc-backed NdArray tensors make cloning cheap) instead of saving/loading from disk. LTO and `target-cpu=native` enabled for release builds.
+
+**Key finding**: Win rate peaks around iteration 9-10 (~58.8%) then declines while avg score keeps climbing (~65). The model optimizes for score (TD target = final game score), not win rate. Early stopping at the win-rate peak produces the best competitive model.
 
 ---
 
@@ -327,8 +340,18 @@ The `bench` subcommand runs N games between 2+ bot types with seat rotation to c
 
 **Parallelism**: When the `parallel` feature is enabled, games run on a rayon thread pool. Each game constructs its own strategies and RNG (no shared mutable state). Results are collected into a `Vec` and aggregated serially.
 
-**Aggregation**: Tracks wins (outright, no ties), total points, and tie count per bot. Reports win rate percentage and average points.
+**Aggregation**: Tracks wins (outright, no ties), total points, and tie count per bot. Reports win rate percentage and average points. When multiple bots share a strategy, prints aggregate stats where ties between same-strategy bots count as wins for that strategy. For 1v1 and 2-strategy matchups, shows 99% confidence interval (SE = sqrt(p*(1-p)/N), z=2.576).
 
 **Solo mode**: Runs single-player games for each strategy, reporting average/min/max scores. Used for comparing against Blank's thesis solo benchmarks.
 
 **Scale**: 500,000 games between DQN and GA complete in ~32 seconds with rayon parallelization and DQN batch+cache optimizations.
+
+---
+
+## PWA Support
+
+The web app is installable as a Progressive Web App with offline caching:
+- `web/public/manifest.json` — app name, theme color, icons
+- `web/public/sw.js` — service worker with stale-while-revalidate caching
+- WASM binary optimized with `opt-level='z'`, `strip`, `panic='abort'`, and `wasm-opt -Oz` (~1 MB)
+- Build script: `web/build.sh` runs wasm-pack + wasm-opt in one step
