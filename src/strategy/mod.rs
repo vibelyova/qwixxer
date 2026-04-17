@@ -164,7 +164,7 @@ pub struct Conservative {
 
 impl Default for Conservative {
     fn default() -> Self {
-        Self { max_new_blanks: 2 }
+        Self { max_new_blanks: 3 }
     }
 }
 
@@ -178,13 +178,14 @@ impl Conservative {
                 new_state.apply_move(mov);
                 let new_blanks = new_state.blanks().saturating_sub(current_blanks);
                 if new_blanks <= max_new_blanks {
-                    Some((mov, new_blanks))
+                    Some((mov, new_blanks, new_state.count_points()))
                 } else {
                     None
                 }
             })
-            .min_by_key(|(_, blanks)| *blanks)
-            .map(|(mov, _)| mov)
+            // Minimize blanks first, then maximize resulting score
+            .min_by_key(|(_, blanks, score)| (*blanks, -*score))
+            .map(|(mov, _, _)| mov)
     }
 }
 
@@ -196,7 +197,7 @@ impl Strategy for Conservative {
 
     fn opponents_move(&mut self, state: &State, number: u8, _locked: [bool; 4]) -> Option<Move> {
         let moves = state.generate_opponent_moves(number);
-        Self::best_move(state, &moves, self.max_new_blanks)
+        Self::best_move(state, &moves, 0)
     }
 }
 
