@@ -213,53 +213,74 @@ impl State {
     /// 2. Cross-row: if two singles create equal blanks and equal resulting progress
     ///    (direction-adjusted), prefer the row with higher total marks (more marginal score).
     pub fn prune_dominated(&self, moves: &[Move]) -> Vec<Move> {
-        struct SingleInfo {
-            mov: Move,
-            row: usize,
-            blanks: u8,
-            progress: u8,
-        }
+        // Strike always passes through; prune the rest by post-state dominance.
+        let (strikes, markers): (Vec<_>, Vec<_>) = moves
+            .iter()
+            .copied()
+            .partition(|m| matches!(m, Move::Strike));
 
-        // Separate singles from non-singles (doubles, strike pass through)
-        let mut singles: Vec<SingleInfo> = Vec::new();
-        let mut result: Vec<Move> = Vec::new();
+        let post_states: Vec<State> = markers
+            .iter()
+            .map(|&m| {
+                let mut s = *self;
+                s.apply_move(m);
+                s
+            })
+            .collect();
 
-        for &mov in moves {
-            match mov {
-                Move::Single(m) => {
-                    let free = self.rows[m.row].free.unwrap();
-                    let blanks = if m.row < 2 { m.number - free } else { free - m.number };
-                    let progress = if m.row < 2 { m.number - 1 } else { 13 - m.number };
-                    singles.push(SingleInfo { mov, row: m.row, blanks, progress });
-                }
-                _ => result.push(mov),
-            }
-        }
+        // Rule 1: strict post-state dominance (applies to singles and doubles uniformly)
+        let mut surviving: Vec<Move> = markers
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                !(0..markers.len())
+                    .any(|j| j != *i && post_state_dominates(&post_states[j], &post_states[*i]))
+            })
+            .map(|(_, m)| *m)
+            .collect();
 
-        // Rule 1: per row, keep only the single with fewest blanks
-        let mut best_per_row: [Option<&SingleInfo>; 4] = [None; 4];
-        for info in &singles {
-            match &best_per_row[info.row] {
-                Some(prev) if prev.blanks <= info.blanks => {}
-                _ => best_per_row[info.row] = Some(info),
-            }
-        }
-        let survivors: Vec<&SingleInfo> = best_per_row.iter().filter_map(|x| *x).collect();
+        // Rule 2: cross-row single heuristic — prefer higher pre-move total when blanks+progress match
+        surviving = self.apply_single_marginal_dominance(&surviving);
 
-        // Rule 2: among survivors, prune if another has equal blanks + progress but higher total
-        for info in &survivors {
-            let dominated = survivors.iter().any(|other| {
-                other.row != info.row
-                    && other.blanks == info.blanks
-                    && other.progress == info.progress
-                    && self.rows[other.row].total > self.rows[info.row].total
-            });
-            if !dominated {
-                result.push(info.mov);
-            }
-        }
-
+        let mut result = surviving;
+        result.extend(strikes);
         result
+    }
+
+    /// Rule 2 — among singles, prune if another single with same blanks and progress
+    /// is on a row with higher current total (higher marginal value from triangular scoring).
+    fn apply_single_marginal_dominance(&self, moves: &[Move]) -> Vec<Move> {
+        let info: Vec<(Move, Option<(usize, u8, u8)>)> = moves
+            .iter()
+            .map(|&m| {
+                let tag = match m {
+                    Move::Single(mark) => {
+                        let free = self.rows[mark.row].free.unwrap();
+                        let blanks = if mark.row < 2 { mark.number - free } else { free - mark.number };
+                        let progress = if mark.row < 2 { mark.number - 1 } else { 13 - mark.number };
+                        Some((mark.row, blanks, progress))
+                    }
+                    _ => None,
+                };
+                (m, tag)
+            })
+            .collect();
+
+        info.iter()
+            .filter(|(_, tag)| match tag {
+                None => true, // non-singles pass through
+                Some((row, blanks, progress)) => !info.iter().any(|(_, other)| match other {
+                    Some((other_row, b, p)) => {
+                        other_row != row
+                            && b == blanks
+                            && p == progress
+                            && self.rows[*other_row].total > self.rows[*row].total
+                    }
+                    None => false,
+                }),
+            })
+            .map(|(m, _)| *m)
+            .collect()
     }
 
     //////////////////////////////////////
@@ -370,6 +391,35 @@ pub enum MetaDecision {
     Forced(Move),
     /// Filtered move list for the strategy to evaluate.
     Choices(Vec<Move>),
+}
+
+/// True if state `better` strictly dominates `worse`: no worse on any row and strictly better on one.
+/// Per row: higher total is better; among unlocked rows, free closer to start (asc) / end (desc) is better.
+/// Locked vs unlocked is incomparable (locked gains mark bonus but loses all future options).
+fn post_state_dominates(better: &State, worse: &State) -> bool {
+    let mut any_strict = false;
+    for row in 0..4 {
+        let t1 = better.rows[row].total;
+        let t2 = worse.rows[row].total;
+        if t1 < t2 { return false; }
+
+        let f1 = better.rows[row].free;
+        let f2 = worse.rows[row].free;
+        let ascending = row < 2;
+
+        let free_cmp = match (f1, f2) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) | (Some(_), None) => return false,
+            (Some(a), Some(b)) => {
+                if ascending { b.cmp(&a) } else { a.cmp(&b) }
+            }
+        };
+        if free_cmp == std::cmp::Ordering::Less { return false; }
+        if free_cmp == std::cmp::Ordering::Greater || t1 > t2 {
+            any_strict = true;
+        }
+    }
+    any_strict
 }
 
 impl State {
