@@ -447,6 +447,17 @@ impl State {
             return MetaDecision::Forced(mov);
         }
 
+        // Filter out moves that lock into a game-ending loss (the model mustn't pick them).
+        // Ties are allowed — neither player wins in a tie, so it's not a loss.
+        let current_locked = self.count_locked();
+        moves.retain(|&mov| {
+            let mut s = *self;
+            s.apply_move(mov);
+            !(s.count_locked() > current_locked
+                && s.count_locked() >= 2
+                && s.count_points() < opp_score)
+        });
+
         // Prune dominated moves
         let moves = self.prune_dominated(&moves);
         if moves.is_empty() {
