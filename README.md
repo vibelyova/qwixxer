@@ -41,7 +41,6 @@ Model artifacts:
 | **MCTS** | Monte Carlo tree search with GA rollouts | ~GA-level |
 | **Opportunist** | Max weighted probability, blank caps, always-lock | ~30% |
 | **Conservative** | Skip at most 2 numbers per mark | ~25% |
-| **Rusher** | Concentrate marks, race to lock | ~20% |
 | **Random** | Uniform random legal move | ~0% |
 
 All strategies share the **meta-rules** (`State::apply_meta_rules`):

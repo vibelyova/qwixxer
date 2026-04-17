@@ -143,7 +143,6 @@ fn make_strategy(bot_type: &str) -> Box<dyn Strategy> {
         "dqn" => Box::new(qwixxer::dqn::DqnStrategy::load_from_bytes(DQN_MODEL_BYTES)),
         "opportunist" => Box::<strategy::Opportunist>::default(),
         "conservative" => Box::<strategy::Conservative>::default(),
-        "rusher" => Box::new(strategy::Rusher),
         "random" => Box::new(strategy::Random),
         _ => Box::<strategy::Opportunist>::default(),
     }

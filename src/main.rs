@@ -13,7 +13,6 @@ enum BotType {
     Mcts,
     Opportunist,
     Conservative,
-    Rusher,
     Random,
 }
 
@@ -26,7 +25,6 @@ impl std::fmt::Display for BotType {
             BotType::Mcts => write!(f, "MCTS"),
             BotType::Opportunist => write!(f, "Opportunist"),
             BotType::Conservative => write!(f, "Conservative"),
-            BotType::Rusher => write!(f, "Rusher"),
             BotType::Random => write!(f, "Random"),
         }
     }
@@ -49,7 +47,6 @@ fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
         }
         BotType::Opportunist => Box::<strategy::Opportunist>::default(),
         BotType::Conservative => Box::<strategy::Conservative>::default(),
-        BotType::Rusher => Box::new(strategy::Rusher),
         BotType::Random => Box::new(strategy::Random),
     }
 }
@@ -334,7 +331,6 @@ fn run_solo(num_games: usize) {
     let all_bots: Vec<(BotType, bool)> = vec![
         (BotType::Random, true),
         (BotType::Conservative, true),
-        (BotType::Rusher, true),
         (BotType::Opportunist, true),
         (BotType::Ga, champion.is_some()),
     ];

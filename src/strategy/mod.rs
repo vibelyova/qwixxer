@@ -155,16 +155,17 @@ impl Strategy for Interactive {
 
 /// Conservative strategy: only marks numbers that don't skip too many.
 /// Picks the move creating the fewest new blanks, rejecting any that
-/// would add more than `max_new_blanks`. Prefers singles over doubles
-/// at equal blank cost.
+/// would add more than `max_new_blanks`. Among moves with equal blanks,
+/// picks the one with the highest resulting score.
 #[derive(Debug, Clone)]
 pub struct Conservative {
     max_new_blanks: u8,
+    score_gap: isize,
 }
 
 impl Default for Conservative {
     fn default() -> Self {
-        Self { max_new_blanks: 3 }
+        Self { max_new_blanks: 3, score_gap: 0 }
     }
 }
 
@@ -191,93 +192,38 @@ impl Conservative {
 
 impl Strategy for Conservative {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
-        let moves = state.generate_moves(dice);
-        Self::best_move(state, &moves, self.max_new_blanks).unwrap_or(Move::Strike)
+        use crate::state::MetaDecision;
+        let moves = match state.apply_meta_rules(dice, self.score_gap) {
+            MetaDecision::Forced(mov) => return mov,
+            MetaDecision::Choices(moves) => moves,
+        };
+        // Evaluate only marking moves; Strike is the fallback
+        let marks: Vec<Move> = moves.into_iter().filter(|m| !matches!(m, Move::Strike)).collect();
+        Self::best_move(state, &marks, self.max_new_blanks).unwrap_or(Move::Strike)
     }
 
     fn opponents_move(&mut self, state: &State, number: u8, _locked: [bool; 4]) -> Option<Move> {
         let moves = state.generate_opponent_moves(number);
+        if let Some(mov) = state.find_smart_lock(&moves, self.score_gap) {
+            return Some(mov);
+        }
         Self::best_move(state, &moves, 0)
     }
-}
 
-/// Rush-to-lock strategy: concentrates marks in few rows, racing to 5
-/// marks then locking. Willing to skip numbers for speed. Scores moves
-/// by rewarding locks and concentrated mark counts.
-#[derive(Debug, Default, Clone)]
-pub struct Rusher;
-
-impl Rusher {
-    fn score_state(state: &State) -> i32 {
-        let totals = state.row_totals();
-        let locked = state.count_locked() as i32;
-
-        // Huge bonus per lock — this is the goal
-        let lock_bonus = locked * 1000;
-
-        // Reward concentration: square each row's total so 5+0 beats 3+2
-        let concentration: i32 = totals.iter().map(|&t| (t as i32) * (t as i32)).sum();
-
-        // Mild blank penalty to break ties
-        let blank_penalty = state.blanks() as i32;
-
-        // Strike penalty
-        let strike_penalty = state.strikes as i32 * 30;
-
-        lock_bonus + concentration - blank_penalty - strike_penalty
-    }
-
-    fn best_move(state: &State, moves: &[Move]) -> Option<Move> {
-        moves
-            .iter()
-            .map(|&mov| {
-                let mut new_state = *state;
-                new_state.apply_move(mov);
-                (mov, Self::score_state(&new_state))
-            })
-            .max_by_key(|(_, score)| *score)
-            .map(|(mov, _)| mov)
-    }
-}
-
-impl Strategy for Rusher {
-    fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
-        let mut moves = state.generate_moves(dice);
-        moves.push(Move::Strike);
-        Self::best_move(state, &moves).unwrap()
-    }
-
-    fn opponents_move(&mut self, state: &State, number: u8, _locked: [bool; 4]) -> Option<Move> {
-        let moves = state.generate_opponent_moves(number);
-        if moves.is_empty() {
-            return None;
-        }
-        // Only take it if it improves our score
-        let current_score = Self::score_state(state);
-        Self::best_move(state, &moves).filter(|&mov| {
-            let mut new_state = *state;
-            new_state.apply_move(mov);
-            Self::score_state(&new_state) > current_score
-        })
+    fn observe_opponents(&mut self, our_score: isize, opponents: &[State]) {
+        let max_opp = opponents.iter().map(|s| s.count_points()).max().unwrap_or(0);
+        self.score_gap = our_score - max_opp;
     }
 }
 
 /// Opportunist strategy: optimizes for probability (keeping free pointers
 /// on common 2d6 sums like 6/7/8) to maximize marks on opponent turns.
-/// Always locks when possible, never strikes unless forced.
 #[derive(Debug, Default, Clone)]
-pub struct Opportunist;
+pub struct Opportunist {
+    score_gap: isize,
+}
 
 impl Opportunist {
-    fn find_locking_move(state: &State, moves: &[Move]) -> Option<Move> {
-        let current_locked = state.count_locked();
-        moves.iter().copied().find(|&mov| {
-            let mut new_state = *state;
-            new_state.apply_move(mov);
-            new_state.count_locked() > current_locked
-        })
-    }
-
     /// Filter moves to those within a blank budget, then pick by best probability.
     fn best_move(state: &State, moves: &[Move], max_new_blanks: u8) -> Option<Move> {
         let current_blanks = state.blanks();
@@ -301,25 +247,29 @@ impl Opportunist {
 
 impl Strategy for Opportunist {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
-        let moves = state.generate_moves(dice);
-
-        if let Some(mov) = Self::find_locking_move(state, &moves) {
-            return mov;
-        }
-
+        use crate::state::MetaDecision;
+        let moves = match state.apply_meta_rules(dice, self.score_gap) {
+            MetaDecision::Forced(mov) => return mov,
+            MetaDecision::Choices(moves) => moves,
+        };
+        // Evaluate only marking moves; Strike is the fallback
+        let marks: Vec<Move> = moves.into_iter().filter(|m| !matches!(m, Move::Strike)).collect();
         // Allow up to 2 blanks on active turn, pick by probability
-        Self::best_move(state, &moves, 2).unwrap_or(Move::Strike)
+        Self::best_move(state, &marks, 2).unwrap_or(Move::Strike)
     }
 
     fn opponents_move(&mut self, state: &State, number: u8, _locked: [bool; 4]) -> Option<Move> {
         let moves = state.generate_opponent_moves(number);
-
-        if let Some(mov) = Self::find_locking_move(state, &moves) {
+        if let Some(mov) = state.find_smart_lock(&moves, self.score_gap) {
             return Some(mov);
         }
-
         // Allow up to 1 blank on opponent turn, pick by probability
         Self::best_move(state, &moves, 1)
+    }
+
+    fn observe_opponents(&mut self, our_score: isize, opponents: &[State]) {
+        let max_opp = opponents.iter().map(|s| s.count_points()).max().unwrap_or(0);
+        self.score_gap = our_score - max_opp;
     }
 }
 

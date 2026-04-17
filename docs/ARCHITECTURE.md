@@ -12,7 +12,7 @@ qwixxer/
     main.rs            -- CLI entry point (clap subcommands: play, bench, solo, evolve, dqn-train, dqn-selfplay)
     state.rs           -- Game state, rows, marks, moves, scoring, display
     game.rs            -- Game loop, players, DiceSource trait
-    strategy/mod.rs    -- Strategy trait + Interactive, Conservative, Rusher, Opportunist, Random
+    strategy/mod.rs    -- Strategy trait + Interactive, Conservative, Opportunist, Random
     bot.rs             -- Genetic algorithm: DNA, genes, Population, evolution
     dqn.rs             -- DQN neural net: model, features, training, self-play RL
     mcts.rs            -- Monte Carlo tree search with pluggable rollout policy
@@ -145,8 +145,6 @@ pub trait Strategy: std::fmt::Debug {
 **Random** -- Picks a uniformly random legal move. Baseline for benchmarking.
 
 **Conservative** -- Minimizes new blanks. Only accepts moves that skip at most `max_new_blanks` (default 2) numbers. Among qualifying moves, picks the one creating the fewest blanks. Strikes if nothing qualifies.
-
-**Rusher** -- Concentrates marks in few rows, racing to lock. Scores states by: `locked * 1000 + sum(total^2) - blanks - strikes * 30`. On passive turns, only marks if it improves the score. Designed to end games quickly via locks.
 
 **Opportunist** -- Probability-maximizing with blank discipline. Always locks when possible. Caps blanks (2 on active, 1 on passive), then picks the move maximizing `State::probability()` (the chance of getting a useful white sum on future opponent turns). The strongest hand-crafted strategy.
 
