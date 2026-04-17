@@ -16,8 +16,6 @@ qwixxer/
     bot.rs             -- Genetic algorithm: DNA, genes, Population, evolution
     dqn.rs             -- DQN neural net: model, features, training, self-play RL
     mcts.rs            -- Monte Carlo tree search with pluggable rollout policy
-    blank.rs           -- Blank's score-based strategy (Cal Poly thesis)
-    race_to_lock.rs    -- Blank's race-to-lock strategy (absorbing Markov chains)
   web/
     Cargo.toml         -- WASM crate (qwixxer-web), depends on qwixxer with burn feature only
     src/
@@ -171,28 +169,6 @@ The `instinct(&self, state: &State) -> f64` method computes the weighted sum. We
 
 **Move selection**: For active turns, evaluates `instinct()` on each resulting state (including Strike) and picks the maximum. For passive turns, also compares against the skip state (with locks applied) to decide whether marking is worthwhile.
 
-### Blank's Score-Based Strategy (`blank.rs`)
-
-Reimplements the scoring formula from Joshua Blank's thesis "Qwixx Strategies Using Simulation and MCMC Methods" (Cal Poly, 2024).
-
-Each move is scored as the sum of two sub-move scores (white + color, or white + skip). Each sub-move evaluates four weighted components:
-- **Gap score** (0-10): Penalizes skipping numbers. `(9 - gap) * 10/9`
-- **Position score** (0-10): Leftmost positions score highest
-- **Count score** (0-10): More marks in the row = higher score
-- **Likelihood score**: Rarer rolls score higher, weighted by `1/300`
-
-Special rules: skip sub-moves get a score of 5 across gap/position/count. Never takes a 4th strike.
-
-Designed for solo play optimization. Achieves 87.7 avg solo score but collapses in multiplayer.
-
-### Blank's Race-to-Lock Strategy (`race_to_lock.rs`)
-
-Models each row as an absorbing Markov chain with states `(free_pointer, mark_count)`. Uses value iteration to precompute an **allowed-transitions table**: for each state, which marks decrease the expected number of rolls to reach lockable status (count >= 5).
-
-Uses the "2 sums from 3 dice" criterion: each roll of one white die and one color die produces 3 possible sums from which the best allowed mark is chosen.
-
-The strategy only makes marks that appear in the allowed table. Falls back to smallest-gap marks when no allowed transition exists to avoid excessive strikes.
-
 ### DQN Neural Net (`dqn.rs`)
 
 **Architecture**: 21-input MLP with ReLU activations.
@@ -342,7 +318,7 @@ The `bench` subcommand runs N games between 2+ bot types with seat rotation to c
 
 **Aggregation**: Tracks wins (outright, no ties), total points, and tie count per bot. Reports win rate percentage and average points. When multiple bots share a strategy, prints aggregate stats where ties between same-strategy bots count as wins for that strategy. For 1v1 and 2-strategy matchups, shows 99% confidence interval (SE = sqrt(p*(1-p)/N), z=2.576).
 
-**Solo mode**: Runs single-player games for each strategy, reporting average/min/max scores. Used for comparing against Blank's thesis solo benchmarks.
+**Solo mode**: Runs single-player games for each strategy, reporting average/min/max scores.
 
 **Scale**: 500,000 games between DQN and GA complete in ~32 seconds with rayon parallelization and DQN batch+cache optimizations.
 

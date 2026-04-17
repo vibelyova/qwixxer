@@ -42,8 +42,6 @@ Model artifacts:
 | **Opportunist** | Max weighted probability, blank caps, always-lock | ~30% |
 | **Conservative** | Skip at most 2 numbers per mark | ~25% |
 | **Rusher** | Concentrate marks, race to lock | ~20% |
-| **Blank-SB** | Blank's score-based heuristic (Cal Poly thesis) | ~15% |
-| **Blank-RTL** | Blank's race-to-lock (absorbing Markov chains) | ~18% |
 | **Random** | Uniform random legal move | ~0% |
 
 All strategies share the **meta-rules** (`State::apply_meta_rules`):
@@ -90,8 +88,6 @@ src/
   bot.rs           GA: DNA, genes, Population, evolution
   dqn.rs           DQN model, features, training, self-play RL, benchmark
   mcts.rs          Monte Carlo tree search with pluggable rollout policy
-  blank.rs         Blank's score-based strategy (Cal Poly thesis)
-  race_to_lock.rs  Blank's race-to-lock (absorbing Markov chains)
   main.rs          CLI entry point (clap subcommands)
 web/
   src/lib.rs       WASM crate: WebGame state machine + StateExplorer

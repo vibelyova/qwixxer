@@ -15,8 +15,6 @@ enum BotType {
     Conservative,
     Rusher,
     Random,
-    BlankSb,
-    BlankRtl,
 }
 
 impl std::fmt::Display for BotType {
@@ -30,8 +28,6 @@ impl std::fmt::Display for BotType {
             BotType::Conservative => write!(f, "Conservative"),
             BotType::Rusher => write!(f, "Rusher"),
             BotType::Random => write!(f, "Random"),
-            BotType::BlankSb => write!(f, "Blank S.B."),
-            BotType::BlankRtl => write!(f, "Blank R.T.L."),
         }
     }
 }
@@ -55,8 +51,6 @@ fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
         BotType::Conservative => Box::<strategy::Conservative>::default(),
         BotType::Rusher => Box::new(strategy::Rusher),
         BotType::Random => Box::new(strategy::Random),
-        BotType::BlankSb => Box::new(blank::BlankScoreBased),
-        BotType::BlankRtl => Box::new(race_to_lock::BlankRaceToLock::new()),
     }
 }
 
@@ -343,8 +337,6 @@ fn run_solo(num_games: usize) {
         (BotType::Rusher, true),
         (BotType::Opportunist, true),
         (BotType::Ga, champion.is_some()),
-        (BotType::BlankSb, true),
-        (BotType::BlankRtl, true),
     ];
 
     #[cfg(feature = "burn")]
