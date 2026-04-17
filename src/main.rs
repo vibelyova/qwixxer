@@ -385,7 +385,7 @@ fn run_train() {
 
     let _champion = pop.current_champion().clone();
     println!("\nBenchmarking champion vs Opportunist...\n");
-    run_bench(vec![BotType::Ga, BotType::Opportunist], 10_000);
+    run_bench(vec![BotType::Ga, BotType::Opportunist], 100_000);
 }
 
 #[cfg(feature = "dqn")]

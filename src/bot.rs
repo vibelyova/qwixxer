@@ -290,7 +290,7 @@ impl Population {
     }
 
     pub fn next_generation(&mut self) {
-        const NUMBER_OF_SIMULATIONS: usize = 1000;
+        const NUMBER_OF_SIMULATIONS: usize = 20_000;
 
         // Pre-generate seeds
         let seeds: Vec<u64> = (0..NUMBER_OF_SIMULATIONS)
