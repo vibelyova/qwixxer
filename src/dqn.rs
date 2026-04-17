@@ -847,43 +847,37 @@ fn play_training_game(
 fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 {
     use crate::game::{Game, Player};
 
-    let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-    let model = QwixxModelConfig::new()
-        .init::<MyBackend>(&device)
-        .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
-        .expect("Failed to load model for benchmark");
-
-    // Pre-clone models for parallel benchmark (model is !Sync due to OnceCell)
-    let models: Vec<QwixxModel<MyBackend>> = (0..num_games).map(|_| model.clone()).collect();
-
-    let wins: u32 = models
+    // Load model once per rayon thread via map_init — shared parse, one clone per game
+    let wins: u32 = (0..num_games)
         .into_par_iter()
-        .enumerate()
-        .map(|(i, model)| {
-            let dqn = DqnStrategy {
-                model,
-                device: device.clone(),
-                context: OpponentContext::default(),
-                cache: std::collections::HashMap::new(),
-            };
-            let rotation = i % 2;
-            let players: Vec<Player> = if rotation == 0 {
-                vec![
-                    Player::new(Box::new(dqn), Box::new(SmallRng::from_entropy())),
-                    Player::new(Box::new(champion.clone()), Box::new(SmallRng::from_entropy())),
-                ]
-            } else {
-                vec![
-                    Player::new(Box::new(champion.clone()), Box::new(SmallRng::from_entropy())),
-                    Player::new(Box::new(dqn), Box::new(SmallRng::from_entropy())),
-                ]
-            };
-            let mut game = Game::new(players);
-            game.play();
-            let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
-            let dqn_idx = rotation;
-            if scores[dqn_idx] > scores[1 - dqn_idx] { 1u32 } else { 0u32 }
-        })
+        .map_init(
+            || DqnStrategy::load(artifact_dir),
+            |template, i| {
+                let dqn = DqnStrategy {
+                    model: template.model.clone(),
+                    device: template.device.clone(),
+                    context: OpponentContext::default(),
+                    cache: std::collections::HashMap::new(),
+                };
+                let rotation = i % 2;
+                let players: Vec<Player> = if rotation == 0 {
+                    vec![
+                        Player::new(Box::new(dqn), Box::new(SmallRng::from_entropy())),
+                        Player::new(Box::new(champion.clone()), Box::new(SmallRng::from_entropy())),
+                    ]
+                } else {
+                    vec![
+                        Player::new(Box::new(champion.clone()), Box::new(SmallRng::from_entropy())),
+                        Player::new(Box::new(dqn), Box::new(SmallRng::from_entropy())),
+                    ]
+                };
+                let mut game = Game::new(players);
+                game.play();
+                let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+                let dqn_idx = rotation;
+                if scores[dqn_idx] > scores[1 - dqn_idx] { 1u32 } else { 0u32 }
+            },
+        )
         .sum();
     wins as f64 / num_games as f64
 }
@@ -932,11 +926,10 @@ pub fn self_play_train(
                 .expect("Failed to load model")
         };
 
-        let games_each = games_per_iteration / 4;
+        let games_each = games_per_iteration / 6;
 
-        // 4 configs: 3p vs 2 GA, 4p vs 3 GA, 3p vs GA + self, 4p vs 2 GA + self
-        // (1v1 configs commented out for now)
-        let game_configs: Vec<u8> = (0..4)
+        // 6 configs: 1v1 GA, 1v1 self, 3p vs 2 GA, 4p vs 3 GA, 3p vs GA + self, 4p vs 2 GA + self
+        let game_configs: Vec<u8> = (0..6)
             .flat_map(|config| std::iter::repeat(config).take(games_each))
             .collect();
 
@@ -953,18 +946,18 @@ pub fn self_play_train(
                 let seed = TRAIN_SEED.wrapping_add((iteration * games_per_iteration + game_idx) as u64);
                 let mut rng = SmallRng::seed_from_u64(seed);
                 let mut opps: Vec<Box<dyn Strategy>> = match config {
-                    // // 1v1: vs GA champion
-                    // 0 => vec![Box::new(champion.clone())],
-                    // // 1v1: vs self
-                    // 1 => vec![
-                    //     Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000) }),
-                    // ],
+                    // 1v1: vs GA champion
+                    0 => vec![Box::new(champion.clone())],
+                    // 1v1: vs self
+                    1 => vec![
+                        Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000) }),
+                    ],
                     // 3-player: vs 2 GA champions
-                    0 => vec![Box::new(champion.clone()), Box::new(champion.clone())],
+                    2 => vec![Box::new(champion.clone()), Box::new(champion.clone())],
                     // 4-player: vs 3 GA champions
-                    1 => vec![Box::new(champion.clone()), Box::new(champion.clone()), Box::new(champion.clone())],
+                    3 => vec![Box::new(champion.clone()), Box::new(champion.clone()), Box::new(champion.clone())],
                     // 3-player: vs GA + self
-                    2 => vec![
+                    4 => vec![
                         Box::new(champion.clone()),
                         Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000) }),
                     ],
