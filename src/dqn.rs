@@ -672,6 +672,7 @@ struct DqnSelfPlayOpponent {
     model: QwixxModel<MyBackend>,
     device: burn::backend::ndarray::NdArrayDevice,
     rng: SmallRng,
+    context: OpponentContext,
 }
 
 #[cfg(feature = "dqn")]
@@ -685,37 +686,47 @@ impl std::fmt::Debug for DqnSelfPlayOpponent {
 impl Strategy for DqnSelfPlayOpponent {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
         use crate::state::MetaDecision;
-        let ctx = OpponentContext::default();
-        match state.apply_meta_rules(dice, ctx.score_gap_to_leader) {
+        match state.apply_meta_rules(dice, self.context.score_gap_to_leader) {
             MetaDecision::Forced(mov) => mov,
             MetaDecision::Choices(moves) => {
-                pick_move_with_model(&self.model, &self.device, state, &moves, 0.0, &mut self.rng, &ctx)
+                pick_move_with_model(&self.model, &self.device, state, &moves, 0.0, &mut self.rng, &self.context)
             }
         }
     }
 
     fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
-        let ctx = OpponentContext::default();
-        pick_passive_move_with_model(&self.model, &self.device, state, number, locked, &ctx)
+        pick_passive_move_with_model(&self.model, &self.device, state, number, locked, &self.context)
+    }
+
+    fn observe_opponents(&mut self, our_score: isize, opponents: &[State]) {
+        self.context.num_opponents = opponents.len() as u8;
+        self.context.max_opponent_strikes = opponents.iter().map(|s| s.strikes).max().unwrap_or(0);
+        let max_opp_score = opponents.iter().map(|s| s.count_points()).max().unwrap_or(0);
+        self.context.score_gap_to_leader = our_score - max_opp_score;
     }
 }
 
 #[cfg(feature = "dqn")]
 /// Build opponent context for player 0 given all player states.
+///
+/// `score_gap_to_leader = our_score - max(opponent scores)` — positive when we
+/// are ahead, negative when behind. Matches `DqnStrategy::observe_opponents`
+/// so training and inference see the same feature distribution.
 fn make_context_multi(our_state: &State, all_states: &[State]) -> OpponentContext {
     let our_score = our_state.count_points();
     let mut max_strikes = 0u8;
-    let mut max_score = our_score;
+    let mut max_opp_score: Option<isize> = None;
     let mut num_opponents = 0u8;
     for s in all_states.iter().skip(1) {
         num_opponents += 1;
         max_strikes = max_strikes.max(s.strikes);
-        max_score = max_score.max(s.count_points());
+        let score = s.count_points();
+        max_opp_score = Some(max_opp_score.map_or(score, |m| m.max(score)));
     }
     OpponentContext {
         num_opponents,
         max_opponent_strikes: max_strikes,
-        score_gap_to_leader: our_score - max_score,
+        score_gap_to_leader: our_score - max_opp_score.unwrap_or(0),
     }
 }
 
@@ -758,8 +769,13 @@ fn play_training_game(
             recorded_features.push(state_features(&s, &ctx_after));
             states[0].apply_move(mov);
         } else {
-            // Opponent's active turn
+            // Opponent's active turn — deliver observe_opponents first, mirroring Game::play.
             let opp_idx = active - 1;
+            let opp_view: Vec<State> = states.iter().enumerate()
+                .filter(|(i, _)| *i != active)
+                .map(|(_, s)| *s)
+                .collect();
+            opponents[opp_idx].observe_opponents(states[active].count_points(), &opp_view);
             let opp_mov = opponents[opp_idx].your_move(&states[active], dice);
             states[active].apply_move(opp_mov);
         }
@@ -785,6 +801,11 @@ fn play_training_game(
                 }
             } else {
                 let opp_idx = passive - 1;
+                let opp_view: Vec<State> = states.iter().enumerate()
+                    .filter(|(i, _)| *i != passive)
+                    .map(|(_, s)| *s)
+                    .collect();
+                opponents[opp_idx].observe_opponents(states[passive].count_points(), &opp_view);
                 let opp_mov = opponents[opp_idx].opponents_move(
                     &states[passive], on_white, new_locked,
                 );
@@ -954,7 +975,7 @@ pub fn self_play_train(
                     0 => vec![Box::new(champion.clone())],
                     // 1v1: vs self
                     1 => vec![
-                        Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000) }),
+                        Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000), context: OpponentContext::default() }),
                     ],
                     // 3-player: vs 2 GA champions
                     2 => vec![Box::new(champion.clone()), Box::new(champion.clone())],
@@ -963,13 +984,13 @@ pub fn self_play_train(
                     // 3-player: vs GA + self
                     4 => vec![
                         Box::new(champion.clone()),
-                        Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000) }),
+                        Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000), context: OpponentContext::default() }),
                     ],
                     // 4-player: vs 2 GA + self
                     _ => vec![
                         Box::new(champion.clone()),
                         Box::new(champion.clone()),
-                        Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000) }),
+                        Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000), context: OpponentContext::default() }),
                     ],
                 };
                 play_training_game(&thread_model, &device, &mut opps, epsilon, &mut rng)
