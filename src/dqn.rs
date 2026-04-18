@@ -889,6 +889,7 @@ pub fn self_play_train(
     games_per_iteration: usize,
     epochs_per_iteration: usize,
     bench_games: usize,
+    checkpoints: bool,
 ) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
     MyBackend::seed(&device, TRAIN_SEED);
@@ -902,6 +903,9 @@ pub fn self_play_train(
     let genes = Arc::new(bot::default_genes());
     let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
     let start_time = std::time::Instant::now();
+
+    // Per-iteration stats for end-of-training summary (iter, avg_score, winrate).
+    let mut iteration_stats: Vec<(usize, f32, Option<f64>)> = Vec::new();
 
     for iteration in 0..num_iterations {
         let epsilon = (0.2 * (0.95f32).powi(iteration as i32)).max(0.07);
@@ -996,12 +1000,21 @@ pub fn self_play_train(
         // Train on replay buffer
         train_with_epochs(all_samples, artifact_dir, epochs_per_iteration, 4e-4);
 
+        // Optional: persist a per-iteration checkpoint.
+        if checkpoints {
+            let src = format!("{artifact_dir}/model.mpk");
+            let dst = format!("{artifact_dir}/iter-{}.mpk", iteration + 1);
+            if let Err(e) = std::fs::copy(&src, &dst) {
+                eprintln!("  Failed to save iter-{} checkpoint: {e}", iteration + 1);
+            }
+        }
+
         let elapsed = start_time.elapsed().as_secs();
         let mins = elapsed / 60;
         let secs = elapsed % 60;
 
         use std::io::Write;
-        if bench_games > 0 {
+        let winrate_opt = if bench_games > 0 {
             let winrate = benchmark_vs_ga(artifact_dir, &champion, bench_games);
             println!(
                 "  Iteration {:>3}/{}: avg score {:.1}, winrate {:.1}%, elapsed {}m{}s",
@@ -1010,6 +1023,7 @@ pub fn self_play_train(
             if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
                 writeln!(f, "{},{avg_score:.2},{:.2}", iteration + 1, winrate * 100.0).ok();
             }
+            Some(winrate)
         } else {
             println!(
                 "  Iteration {:>3}/{}: avg score {:.1}, elapsed {}m{}s",
@@ -1018,10 +1032,31 @@ pub fn self_play_train(
             if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
                 writeln!(f, "{},{avg_score:.2}", iteration + 1).ok();
             }
-        }
+            None
+        };
+
+        iteration_stats.push((iteration + 1, avg_score, winrate_opt));
     }
 
     println!("\nSelf-play training complete. Model saved to {artifact_dir}/model");
+
+    // End-of-training summary: best-by-winrate and best-by-avg-score iterations.
+    if bench_games > 0 {
+        let best_wr = iteration_stats
+            .iter()
+            .filter_map(|&(i, s, w)| w.map(|w| (i, s, w)))
+            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+        let best_score = iteration_stats
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        if let Some((i, s, w)) = best_wr {
+            println!("  Best winrate:    iter {i:>3}: {:.1}% (avg score {s:.1})", w * 100.0);
+        }
+        if let Some(&(i, s, w)) = best_score {
+            let wr_str = w.map(|w| format!("{:.1}%", w * 100.0)).unwrap_or_else(|| "-".into());
+            println!("  Best avg score:  iter {i:>3}: {s:.1} (winrate {wr_str})");
+        }
+    }
 }
 
 #[cfg(feature = "dqn")]
