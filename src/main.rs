@@ -43,7 +43,7 @@ fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
         BotType::Mcts => {
             let champion = bot::DNA::load_weights("champion.txt", genes)
                 .expect("No champion.txt found. Run `train ga` first.");
-            Box::new(mcts::MonteCarlo::with_ga(500, champion))
+            Box::new(mcts::MonteCarlo::with_ga(200, champion))
         }
         BotType::Opportunist => Box::<strategy::Opportunist>::default(),
         BotType::Conservative => Box::<strategy::Conservative>::default(),
