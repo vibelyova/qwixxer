@@ -354,31 +354,13 @@ impl Row {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mark {
     pub row: usize,
     pub number: u8,
 }
 
-impl std::str::FromStr for Mark {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (row, number) = s.split_at(1);
-        anyhow::ensure!(row.len() == 1, "Invalid row format");
-        let row = match row.chars().next().unwrap() {
-            'r' | 'R' => 0,
-            'y' | 'Y' => 1,
-            'g' | 'G' => 2,
-            'b' | 'B' => 3,
-            _ => anyhow::bail!("Invalid row format"),
-        };
-        let number = number.parse()?;
-        Ok(Mark { row, number })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Move {
     Strike,
     Single(Mark),
@@ -386,6 +368,7 @@ pub enum Move {
 }
 
 /// Result of applying meta-rules to a move list.
+#[derive(Debug)]
 pub enum MetaDecision {
     /// A forced move (smart lock or smart strike) — use immediately.
     Forced(Move),
@@ -510,28 +493,6 @@ impl From<((usize, u8), (usize, u8))> for Move {
                 number: second.1,
             },
         )
-    }
-}
-
-impl std::str::FromStr for Move {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<_> = s.split_whitespace().collect();
-        anyhow::ensure!(parts.len() == 1 || parts.len() == 2, "Invalid move format");
-
-        match parts[0] {
-            "strike" => Ok(Move::Strike),
-            _ => {
-                let mark: Mark = parts[0].parse()?;
-                if parts.len() == 1 {
-                    Ok(Move::Single(mark))
-                } else {
-                    let mark2: Mark = parts[1].parse()?;
-                    Ok(Move::Double(mark, mark2))
-                }
-            }
-        }
     }
 }
 
@@ -860,48 +821,6 @@ mod tests {
         assert!(moves.is_empty());
     }
 
-    // ---- Parsing ----
-
-    #[test]
-    fn parse_mark() {
-        let mark: Mark = "r5".parse().unwrap();
-        assert_eq!(mark.row, 0);
-        assert_eq!(mark.number, 5);
-
-        let mark: Mark = "G10".parse().unwrap();
-        assert_eq!(mark.row, 2);
-        assert_eq!(mark.number, 10);
-    }
-
-    #[test]
-    fn parse_move_strike() {
-        let mov: Move = "strike".parse().unwrap();
-        assert!(matches!(mov, Move::Strike));
-    }
-
-    #[test]
-    fn parse_move_single() {
-        let mov: Move = "b7".parse().unwrap();
-        match mov {
-            Move::Single(m) => { assert_eq!(m.row, 3); assert_eq!(m.number, 7); }
-            _ => panic!("expected single"),
-        }
-    }
-
-    #[test]
-    fn parse_move_double() {
-        let mov: Move = "r4 g10".parse().unwrap();
-        match mov {
-            Move::Double(m1, m2) => {
-                assert_eq!(m1.row, 0);
-                assert_eq!(m1.number, 4);
-                assert_eq!(m2.row, 2);
-                assert_eq!(m2.number, 10);
-            }
-            _ => panic!("expected double"),
-        }
-    }
-
     // ---- Metrics ----
 
     #[test]
@@ -925,5 +844,263 @@ mod tests {
         // 2 has 1 way (1+1), 12 has 1 way (6+6) → 2/36
         let p = state.probability();
         assert!((p - 2.0 / 36.0).abs() < 1e-6);
+    }
+
+    // ---- Test helpers ----
+
+    /// Build a State from 4 (ascending, total, free) row configs and strike count.
+    fn make_state(rows: [(bool, u8, Option<u8>); 4], strikes: u8) -> State {
+        let mut r = [Row::default(); 4];
+        for (i, (asc, total, free)) in rows.iter().enumerate() {
+            r[i] = Row { ascending: *asc, total: *total, free: *free };
+        }
+        State { strikes, rows: r }
+    }
+
+    fn single(row: usize, number: u8) -> Move {
+        Move::Single(Mark { row, number })
+    }
+
+    fn double(r1: usize, n1: u8, r2: usize, n2: u8) -> Move {
+        Move::Double(Mark { row: r1, number: n1 }, Mark { row: r2, number: n2 })
+    }
+
+    // ---- find_smart_lock ----
+
+    #[test]
+    fn find_smart_lock_returns_first_lock() {
+        // Red has 5 marks, free=11, can mark 12 to lock (first lock of game)
+        let state = make_state(
+            [(true, 5, Some(11)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 0, Some(12))],
+            0,
+        );
+        let moves = vec![single(0, 12), single(1, 5)];
+        let result = state.find_smart_lock(&moves, 0);
+        assert_eq!(result, Some(single(0, 12)));
+    }
+
+    #[test]
+    fn find_smart_lock_forces_winning_game_ending_lock() {
+        // Already 1 row locked. Another lock ends the game. We're winning.
+        let state = make_state(
+            [(true, 5, Some(11)), (true, 7, None), (false, 0, Some(12)), (false, 0, Some(12))],
+            0,
+        );
+        // points = 15 + 28 + 0 + 0 = 43. After lock Red (total becomes 7): 28 + 28 = 56.
+        // opp_score = 43 - score_gap. We want score_gap = 30 → opp_score = 13. After lock 56 > 13.
+        let moves = vec![single(0, 12)];
+        let result = state.find_smart_lock(&moves, 30);
+        assert_eq!(result, Some(single(0, 12)));
+    }
+
+    #[test]
+    fn find_smart_lock_blocks_losing_game_ending_lock() {
+        let state = make_state(
+            [(true, 5, Some(11)), (true, 7, None), (false, 0, Some(12)), (false, 0, Some(12))],
+            0,
+        );
+        // points = 43. After lock: 56. If opp_score = 100, we'd lose.
+        // score_gap = our_score - opp_score = 43 - 100 = -57
+        let moves = vec![single(0, 12)];
+        let result = state.find_smart_lock(&moves, -57);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn find_smart_lock_picks_highest_scoring_when_multiple() {
+        // Both Red (asc) and Blue (desc) can be locked as first-lock.
+        // Red (total=5) locking 12: total becomes 7 → 28 points on that row.
+        // Blue (total=8) locking 2: total becomes 10 → 55 points on that row.
+        // Blue lock scores higher, should be picked.
+        let state = make_state(
+            [(true, 5, Some(11)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 8, Some(3))],
+            0,
+        );
+        let moves = vec![single(0, 12), single(3, 2)];
+        let result = state.find_smart_lock(&moves, 0);
+        assert_eq!(result, Some(single(3, 2)));
+    }
+
+    #[test]
+    fn find_smart_lock_returns_none_when_no_locking_moves() {
+        let state = State::default();
+        let moves = vec![single(0, 5), single(2, 9)];
+        assert_eq!(state.find_smart_lock(&moves, 0), None);
+    }
+
+    // ---- prune_dominated: singles on same row ----
+
+    #[test]
+    fn prune_keeps_closer_single_on_same_row() {
+        // Red free=5. Both moves are singles on Red.
+        // Red 5 (0 blanks) dominates Red 7 (2 blanks).
+        let state = make_state(
+            [(true, 0, Some(5)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 0, Some(12))],
+            0,
+        );
+        let moves = vec![single(0, 5), single(0, 7)];
+        let pruned = state.prune_dominated(&moves);
+        assert_eq!(pruned, vec![single(0, 5)]);
+    }
+
+    #[test]
+    fn prune_keeps_same_row_strike_passes_through() {
+        let state = make_state(
+            [(true, 0, Some(5)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 0, Some(12))],
+            0,
+        );
+        let moves = vec![single(0, 5), Move::Strike];
+        let pruned = state.prune_dominated(&moves);
+        // Strike passes through, single is kept
+        assert!(pruned.contains(&Move::Strike));
+        assert!(pruned.contains(&single(0, 5)));
+    }
+
+    // ---- prune_dominated: cross-row singles (Rule 2) ----
+
+    #[test]
+    fn prune_prefers_higher_total_row_equal_blanks_and_progress() {
+        // Red (asc, total=5) free=5: mark 5 → 0 blanks, progress=4 (5-1)
+        // Green (desc, total=2) free=9: mark 9 → 0 blanks, progress=4 (13-9)
+        // Equal blanks and progress. Red has higher total, should be kept.
+        let state = make_state(
+            [(true, 5, Some(5)), (true, 0, Some(2)), (false, 2, Some(9)), (false, 0, Some(12))],
+            0,
+        );
+        let moves = vec![single(0, 5), single(2, 9)];
+        let pruned = state.prune_dominated(&moves);
+        assert_eq!(pruned, vec![single(0, 5)]);
+    }
+
+    // ---- prune_dominated: doubles ----
+
+    #[test]
+    fn prune_keeps_double_closer_to_free() {
+        // Red free=5, Green free=9
+        // Double(Red 5, Green 9): post-Red free=6, post-Green free=8. 0 blanks total.
+        // Double(Red 7, Green 9): post-Red free=8, post-Green free=8. 2 blanks on Red.
+        // First dominates (same Green result, better Red free).
+        let state = make_state(
+            [(true, 0, Some(5)), (true, 0, Some(2)), (false, 0, Some(9)), (false, 0, Some(12))],
+            0,
+        );
+        let moves = vec![double(0, 5, 2, 9), double(0, 7, 2, 9)];
+        let pruned = state.prune_dominated(&moves);
+        assert_eq!(pruned, vec![double(0, 5, 2, 9)]);
+    }
+
+    #[test]
+    fn prune_keeps_both_doubles_if_different_row_pairs() {
+        // Double on (Red, Green) and (Yellow, Blue) don't compare
+        let state = make_state(
+            [(true, 0, Some(5)), (true, 0, Some(5)), (false, 0, Some(9)), (false, 0, Some(9))],
+            0,
+        );
+        let moves = vec![double(0, 5, 2, 9), double(1, 5, 3, 9)];
+        let pruned = state.prune_dominated(&moves);
+        // Neither dominates — different rows affected
+        assert_eq!(pruned.len(), 2);
+    }
+
+    #[test]
+    fn prune_locked_vs_unlocked_incomparable() {
+        // Red.total=5, can lock via 12. Two options:
+        //   Double(Red 11, Red 12): final total=8 (5+1+2 lock bonus), locked.
+        //   Double(Red 11, Green 9): final Red total=6, free=12 (not locked).
+        // Locked Red has more marks but no future options — neither dominates.
+        let state = make_state(
+            [(true, 5, Some(11)), (true, 0, Some(2)), (false, 0, Some(9)), (false, 0, Some(12))],
+            0,
+        );
+        let moves = vec![double(0, 11, 0, 12), double(0, 11, 2, 9)];
+        let pruned = state.prune_dominated(&moves);
+        // Neither should be pruned — both kept
+        assert_eq!(pruned.len(), 2);
+    }
+
+    // ---- apply_meta_rules ----
+
+    #[test]
+    fn apply_meta_rules_forces_strike_when_winning_with_3_strikes() {
+        // strikes=3, winning. Should force strike.
+        let state = make_state(
+            [(true, 5, Some(11)), (true, 3, Some(5)), (false, 2, Some(10)), (false, 0, Some(12))],
+            3,
+        );
+        // points = 15 + 6 + 3 + 0 - 15 = 9. After strike: 9 - 5 = 4.
+        // We want score_gap high enough that opp_score < 4. score_gap=10 → opp=-1.
+        let dice = [1, 1, 1, 1, 1, 1]; // white sum = 2
+        match state.apply_meta_rules(dice, 10) {
+            MetaDecision::Forced(Move::Strike) => {}
+            other => panic!("expected Forced(Strike), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn apply_meta_rules_forces_first_lock() {
+        let state = make_state(
+            [(true, 5, Some(11)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 0, Some(12))],
+            0,
+        );
+        // Dice that allow marking Red 12: white=W1+W2, and we need to reach 12 on Red.
+        // Simplest: white sum = 12 (6+6). Or W1+Red = 12.
+        let dice = [6, 6, 6, 1, 1, 1];
+        match state.apply_meta_rules(dice, 0) {
+            MetaDecision::Forced(mov) => {
+                // Should force marking Red 12 (locks Red)
+                let mut s = state;
+                s.apply_move(mov);
+                assert_eq!(s.count_locked(), 1);
+            }
+            other => panic!("expected Forced(lock), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn apply_meta_rules_filters_losing_lock_from_choices() {
+        // 1 row already locked. Red can be locked via 12 (would end game).
+        // We're losing — losing lock should be filtered.
+        let state = make_state(
+            [(true, 5, Some(11)), (true, 7, None), (false, 0, Some(12)), (false, 0, Some(12))],
+            0,
+        );
+        // points = 15 + 28 = 43. After lock Red: 28 + 28 = 56.
+        // opp_score = 100 → we'd lose. score_gap = 43 - 100 = -57.
+        let dice = [6, 6, 6, 1, 1, 1]; // white=12 and W1+Red=12
+        let decision = state.apply_meta_rules(dice, -57);
+        match decision {
+            MetaDecision::Choices(moves) => {
+                // Red 12 would lock → should be filtered out
+                let has_red_12 = moves.iter().any(|m| {
+                    matches!(m, Move::Single(mark) if mark.row == 0 && mark.number == 12)
+                });
+                assert!(!has_red_12, "losing lock should be filtered: {:?}", moves);
+            }
+            other => panic!("expected Choices, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn apply_meta_rules_allows_tying_lock() {
+        // All rows except Red are locked. Red lock would end the game with exactly a tie.
+        // find_smart_lock requires strict win (>), so the lock must not be forced,
+        // and the lock-into-loss filter uses strict < so a tying lock stays in Choices.
+        let state = make_state(
+            [(true, 5, Some(11)), (true, 7, None), (false, 0, None), (false, 0, None)],
+            0,
+        );
+        // points = 15 + 28 = 43. After Red lock: 28 + 28 = 56. Tie when opp_score = 56.
+        // score_gap = 43 - 56 = -13.
+        // Dice [6,6,1,1,1,1]: white=12 → only Red 12 markable (others locked).
+        let dice = [6, 6, 1, 1, 1, 1];
+        match state.apply_meta_rules(dice, -13) {
+            MetaDecision::Forced(m) => panic!("tie shouldn't force lock, got {:?}", m),
+            MetaDecision::Choices(moves) => {
+                let has_red_12 = moves.iter().any(|m| {
+                    matches!(m, Move::Single(mark) if mark.row == 0 && mark.number == 12)
+                });
+                assert!(has_red_12, "tying lock should be available in choices: {:?}", moves);
+            }
+        }
     }
 }
