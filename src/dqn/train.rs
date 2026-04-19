@@ -5,8 +5,8 @@
 
 use crate::bot::{self, DNA};
 use crate::dqn::{
-    state_features, DqnStrategy, MyBackend, OpponentContext, QwixxModel, QwixxModelConfig,
-    NUM_FEATURES, TRAIN_SEED,
+    state_features, win_rank_score, DqnStrategy, MyBackend, OpponentContext, QwixxModel,
+    QwixxModelConfig, LOG_VAR_MAX, LOG_VAR_MIN, NUM_FEATURES, TRAIN_SEED,
 };
 use crate::mcts::MonteCarlo;
 use crate::state::{Move, State};
@@ -17,7 +17,6 @@ use burn::{
         dataloader::{batcher::Batcher, DataLoaderBuilder},
         dataset::{Dataset, InMemDataset},
     },
-    nn::loss::{MseLoss, Reduction::Mean},
     optim::AdamConfig,
     prelude::*,
     record::CompactRecorder,
@@ -45,11 +44,32 @@ fn make_context(our_state: &State, opponent_state: &State) -> OpponentContext {
 // ---- Training step impls on the shared model ----
 
 impl<B: Backend> QwixxModel<B> {
+    /// Gaussian negative log-likelihood loss:
+    ///   L = 0.5 · log σ² + 0.5 · (x − μ)² · exp(−log σ²)
+    ///     = 0.5 · log_var + 0.5 · residual² / var
+    ///
+    /// `log_var` is clamped to `[LOG_VAR_MIN, LOG_VAR_MAX]` for numerical
+    /// stability. The additive `0.5·log(2π)` constant is dropped.
     pub fn forward_step(&self, batch: QwixxBatch<B>) -> RegressionOutput<B> {
-        let targets = batch.targets.clone().unsqueeze_dim(1);
+        // output: [B, 2] with columns [mean, log_var].
         let output = self.forward(batch.inputs);
-        let loss = MseLoss::new().forward(output.clone(), targets.clone(), Mean);
-        RegressionOutput { loss, output, targets }
+        let mean = output.clone().narrow(1, 0, 1);
+        let log_var = output.narrow(1, 1, 1).clamp(LOG_VAR_MIN, LOG_VAR_MAX);
+
+        // targets is a 1D tensor from the batcher; reshape to [B, 1].
+        let targets = batch.targets.clone().unsqueeze_dim(1);
+        let residual = targets.clone() - mean.clone();
+        let squared = residual.clone() * residual;
+
+        // inv_var = 1/σ² = exp(−log_var). Using exp of the negation avoids
+        // division, so a near-zero variance never blows up numerically.
+        let inv_var = log_var.clone().neg().exp();
+        let nll = log_var + squared * inv_var;
+        let loss = nll.mean().mul_scalar(0.5);
+
+        // Pass `mean` as the `output` field so downstream regression metrics
+        // (RMSE, etc.) remain interpretable as score-prediction quality.
+        RegressionOutput { loss, output: mean, targets }
     }
 }
 
@@ -282,12 +302,12 @@ pub fn train(samples: Vec<TrainingSample>, artifact_dir: &str) {
 // ---- Self-play RL training ----
 
 /// Batched forward pass: evaluates all provided feature vectors in one model
-/// call. Returns one value per input (empty input → empty output).
+/// call. Returns `(mean, log_var)` per input (empty input → empty output).
 fn batch_eval_features(
     model: &QwixxModel<MyBackend>,
     device: &burn::backend::ndarray::NdArrayDevice,
     features_list: &[[f32; NUM_FEATURES]],
-) -> Vec<f32> {
+) -> Vec<(f32, f32)> {
     if features_list.is_empty() {
         return Vec::new();
     }
@@ -295,8 +315,9 @@ fn batch_eval_features(
     let flat: Vec<f32> = features_list.iter().flat_map(|f| f.iter().copied()).collect();
     let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), device)
         .reshape([n, NUM_FEATURES]);
-    let output = model.forward(input).reshape([n]);
-    output.into_data().to_vec::<f32>().unwrap()
+    let output = model.forward(input);
+    let values = output.into_data().to_vec::<f32>().unwrap();
+    (0..n).map(|i| (values[2 * i], values[2 * i + 1])).collect()
 }
 
 /// DQN wrapper used during self-play training. Picks moves with ε-greedy
@@ -340,10 +361,16 @@ impl Strategy for RecordingDqn {
                         })
                         .collect();
                     let values = batch_eval_features(&self.model, &self.device, &features_list);
+                    let threshold =
+                        (state.count_points() - self.context.score_gap_to_leader) as f32;
                     let best = values
                         .iter()
                         .enumerate()
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                        .max_by(|(_, a), (_, b)| {
+                            win_rank_score(a.0, a.1, threshold)
+                                .partial_cmp(&win_rank_score(b.0, b.1, threshold))
+                                .unwrap()
+                        })
                         .unwrap()
                         .0;
                     moves[best]
@@ -389,15 +416,18 @@ impl Strategy for RecordingDqn {
         features_list.push(state_features(&skip_state, &self.context));
 
         let values = batch_eval_features(&self.model, &self.device, &features_list);
-        let skip_value = *values.last().unwrap();
-        let (best_idx, best_value) = values[..moves.len()]
+        let threshold = (state.count_points() - self.context.score_gap_to_leader) as f32;
+        let skip = values.last().unwrap();
+        let skip_rank = win_rank_score(skip.0, skip.1, threshold);
+
+        let (best_idx, best_rank) = values[..moves.len()]
             .iter()
-            .copied()
             .enumerate()
+            .map(|(i, v)| (i, win_rank_score(v.0, v.1, threshold)))
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap();
 
-        if best_value > skip_value {
+        if best_rank > skip_rank {
             // Only record when we actually mark — matches prior behavior.
             self.recorded.borrow_mut().push(features_list[best_idx]);
             Some(moves[best_idx])
@@ -464,14 +494,15 @@ fn play_training_game(
         return (Vec::new(), final_score);
     }
 
-    // Batched forward pass for TD(λ) bootstrap values.
+    // Batched forward pass for TD(λ) bootstrap values. We bootstrap the
+    // *mean* prediction only; the variance head isn't in the bootstrap target.
     let values = batch_eval_features(model, device, &recorded_features);
 
     // G_t = (1-λ)·V(s_{t+1}) + λ·G_{t+1}, with G_{n-1} = final_score.
     let mut targets = vec![0.0f32; n];
     targets[n - 1] = final_score;
     for t in (0..n - 1).rev() {
-        targets[t] = (1.0 - lambda) * values[t + 1] + lambda * targets[t + 1];
+        targets[t] = (1.0 - lambda) * values[t + 1].0 + lambda * targets[t + 1];
     }
 
     let samples = recorded_features

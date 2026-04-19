@@ -3,6 +3,17 @@
 //! Defines the model architecture, feature extraction, and the inference-side
 //! [`DqnStrategy`]. Training code lives in the [`train`] submodule (behind the
 //! `dqn` feature).
+//!
+//! The model predicts a Gaussian over the final score: a mean `μ(s)` and a
+//! raw `log_var(s) = log σ²(s)` per state. Move selection ranks candidates by
+//! P(win) under a Normal approximation:
+//!
+//! ```text
+//! P(win | m) ≈ Φ((μ_m - c) / sqrt(σ²_m + σ²_opp))
+//! ```
+//!
+//! where `c` is the leading opponent's (current) score and we approximate
+//! `σ²_opp` with the candidate's own variance (see [`win_rank_score`]).
 
 #[cfg(feature = "dqn")]
 pub mod train;
@@ -22,8 +33,13 @@ pub type MyBackend = NdArray;
 /// Number of input features for the state representation.
 pub const NUM_FEATURES: usize = 21;
 
-/// Global seed for reproducible training. Used by `dqn_train`.
+/// Global seed for reproducible training. Used by `dqn::train`.
 pub const TRAIN_SEED: u64 = 42;
+
+/// Clamp bounds for `log_var`. Keeps `var ∈ [e^-5, e^10] ≈ [0.0067, 22 026]`,
+/// covering all plausible score variances without allowing numerical blowup.
+pub const LOG_VAR_MIN: f32 = -5.0;
+pub const LOG_VAR_MAX: f32 = 10.0;
 
 /// Context about opponents, updated via `observe_opponents`.
 #[derive(Clone, Debug, Default)]
@@ -73,13 +89,30 @@ pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURE
     features
 }
 
+/// Score a move candidate by P(win) under a Gaussian approximation, using the
+/// max-opponent approach. Monotonic in `Φ((μ - c) / sqrt(2σ²))`, so argmax of
+/// this function equals argmax of P(win).
+///
+/// We use the candidate's own variance as a proxy for both players' variance
+/// (both are playing the same game from similar states), which gives a
+/// ranking-stable √(2σ²) denominator up to the factor of √2. We drop the √2
+/// since monotonic transforms don't change argmax — equivalent to ranking by
+/// `(μ − c) / σ`.
+pub fn win_rank_score(mean: f32, log_var: f32, threshold: f32) -> f32 {
+    let log_var_clamped = log_var.clamp(LOG_VAR_MIN, LOG_VAR_MAX);
+    // exp(-log_var / 2) = 1 / σ.
+    let inv_sigma = (-0.5 * log_var_clamped).exp();
+    (mean - threshold) * inv_sigma
+}
+
 // ---- Model ----
 
 #[derive(Module, Debug)]
 pub struct QwixxModel<B: Backend> {
     layer1: Linear<B>,
     layer2: Linear<B>,
-    output: Linear<B>,
+    output_mean: Linear<B>,
+    output_log_var: Linear<B>,
     activation: Relu,
 }
 
@@ -96,25 +129,32 @@ impl QwixxModelConfig {
         QwixxModel {
             layer1: LinearConfig::new(NUM_FEATURES, self.hidden1).with_bias(true).init(device),
             layer2: LinearConfig::new(self.hidden1, self.hidden2).with_bias(true).init(device),
-            output: LinearConfig::new(self.hidden2, 1).with_bias(true).init(device),
+            output_mean: LinearConfig::new(self.hidden2, 1).with_bias(true).init(device),
+            output_log_var: LinearConfig::new(self.hidden2, 1).with_bias(true).init(device),
             activation: Relu::new(),
         }
     }
 }
 
 impl<B: Backend> QwixxModel<B> {
+    /// Forward pass returning `[batch, 2]`: column 0 is predicted mean of the
+    /// final score, column 1 is raw `log σ²`. Training clamps `log_var` in the
+    /// loss; inference callers clamp via [`win_rank_score`].
     pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
         let x = self.activation.forward(self.layer1.forward(input));
         let x = self.activation.forward(self.layer2.forward(x));
-        self.output.forward(x)
+        let mean = self.output_mean.forward(x.clone());
+        let log_var = self.output_log_var.forward(x);
+        Tensor::cat(vec![mean, log_var], 1)
     }
 
-    /// Evaluate a single state, returning the predicted value.
-    pub fn evaluate_state(&self, features: &[f32; NUM_FEATURES], device: &B::Device) -> f32 {
+    /// Evaluate a single state, returning `(mean, log_var)`.
+    pub fn evaluate_state(&self, features: &[f32; NUM_FEATURES], device: &B::Device) -> (f32, f32) {
         let input = Tensor::<B, 1>::from_floats(features.as_slice(), device)
             .reshape([1, NUM_FEATURES]);
         let output = self.forward(input);
-        output.into_data().to_vec::<f32>().unwrap()[0]
+        let v = output.into_data().to_vec::<f32>().unwrap();
+        (v[0], v[1])
     }
 }
 
@@ -124,7 +164,8 @@ pub struct DqnStrategy {
     model: QwixxModel<MyBackend>,
     device: burn::backend::ndarray::NdArrayDevice,
     context: OpponentContext,
-    cache: std::collections::HashMap<[u32; NUM_FEATURES], f32>,
+    /// Cache stores `(mean, log_var)` pairs keyed by feature bits.
+    cache: std::collections::HashMap<[u32; NUM_FEATURES], (f32, f32)>,
 }
 
 impl std::fmt::Debug for DqnStrategy {
@@ -169,7 +210,8 @@ impl DqnStrategy {
     }
 
     /// Evaluate a state with a custom opponent context (for state explorer).
-    pub fn evaluate_with_context(&self, state: &State, ctx: &OpponentContext) -> f32 {
+    /// Returns `(mean, log_var)`.
+    pub fn evaluate_with_context(&self, state: &State, ctx: &OpponentContext) -> (f32, f32) {
         let features = state_features(state, ctx);
         self.model.evaluate_state(&features, &self.device)
     }
@@ -183,7 +225,7 @@ impl DqnStrategy {
     }
 
     #[allow(dead_code)]
-    fn evaluate(&mut self, state: &State) -> f32 {
+    fn evaluate(&mut self, state: &State) -> (f32, f32) {
         let features = state_features(state, &self.context);
         let key = Self::features_key(&features);
         if let Some(&cached) = self.cache.get(&key) {
@@ -195,12 +237,13 @@ impl DqnStrategy {
     }
 
     /// Batch evaluate multiple states at once — single forward pass.
-    fn evaluate_batch(&mut self, states: &[State]) -> Vec<f32> {
+    /// Returns `(mean, log_var)` per state.
+    fn evaluate_batch(&mut self, states: &[State]) -> Vec<(f32, f32)> {
         if states.is_empty() {
             return Vec::new();
         }
 
-        let mut results = vec![0.0f32; states.len()];
+        let mut results = vec![(0.0f32, 0.0f32); states.len()];
         let mut uncached_indices = Vec::new();
         let mut uncached_features = Vec::new();
 
@@ -216,19 +259,20 @@ impl DqnStrategy {
             }
         }
 
-        // Batch forward pass for uncached states
+        // Batch forward pass for uncached states — output shape [n, 2], row = [mean, log_var].
         if !uncached_features.is_empty() {
             let n = uncached_features.len();
             let flat: Vec<f32> = uncached_features.iter().flat_map(|f| f.iter().copied()).collect();
             let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), &self.device)
                 .reshape([n, NUM_FEATURES]);
-            let output = self.model.forward(input).reshape([n]);
+            let output = self.model.forward(input);
             let values = output.into_data().to_vec::<f32>().unwrap();
 
             for (j, &idx) in uncached_indices.iter().enumerate() {
-                results[idx] = values[j];
+                let pair = (values[j * 2], values[j * 2 + 1]);
+                results[idx] = pair;
                 let key = Self::features_key(&uncached_features[j]);
-                self.cache.insert(key, values[j]);
+                self.cache.insert(key, pair);
             }
         }
 
@@ -244,7 +288,8 @@ impl Strategy for DqnStrategy {
             MetaDecision::Choices(moves) => moves,
         };
 
-        // Batch: compute all resulting states, evaluate in one pass
+        // Batch-evaluate all resulting states. Rank by P(win) approximation
+        // using the max-opponent threshold.
         let result_states: Vec<State> = moves
             .iter()
             .map(|&mov| {
@@ -254,11 +299,16 @@ impl Strategy for DqnStrategy {
             })
             .collect();
         let values = self.evaluate_batch(&result_states);
+        let threshold = (state.count_points() - self.context.score_gap_to_leader) as f32;
 
         moves
             .into_iter()
             .enumerate()
-            .max_by(|(i, _), (j, _)| values[*i].partial_cmp(&values[*j]).unwrap())
+            .max_by(|(i, _), (j, _)| {
+                let a = win_rank_score(values[*i].0, values[*i].1, threshold);
+                let b = win_rank_score(values[*j].0, values[*j].1, threshold);
+                a.partial_cmp(&b).unwrap()
+            })
             .unwrap()
             .1
     }
@@ -274,7 +324,7 @@ impl Strategy for DqnStrategy {
             return None;
         }
 
-        // Batch: compute all resulting states + skip state, evaluate in one pass
+        // Batch-evaluate mark states + skip state; rank by P(win) approximation.
         let mut eval_states: Vec<State> = moves
             .iter()
             .map(|&mov| {
@@ -284,21 +334,24 @@ impl Strategy for DqnStrategy {
                 s
             })
             .collect();
-        // Add skip state (no mark, just lock)
         let mut skip_state = *state;
         skip_state.lock(locked);
         eval_states.push(skip_state);
 
         let values = self.evaluate_batch(&eval_states);
-        let skip_value = *values.last().unwrap();
+        let threshold = (state.count_points() - self.context.score_gap_to_leader) as f32;
 
-        let (best_idx, best_value) = values[..moves.len()]
+        let skip = values.last().unwrap();
+        let skip_rank = win_rank_score(skip.0, skip.1, threshold);
+
+        let (best_idx, best_rank) = values[..moves.len()]
             .iter()
             .enumerate()
+            .map(|(i, v)| (i, win_rank_score(v.0, v.1, threshold)))
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap();
 
-        if *best_value > skip_value {
+        if best_rank > skip_rank {
             Some(moves[best_idx])
         } else {
             None

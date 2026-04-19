@@ -452,7 +452,8 @@ impl WebGame {
 #[derive(Serialize)]
 struct ExplorerResult {
     ga_value: f64,
-    dqn_value: f32,
+    dqn_mean: f32,
+    dqn_log_var: f32,
     score: isize,
     blanks: u8,
     probability: f32,
@@ -521,7 +522,7 @@ impl StateExplorer {
             max_opponent_strikes: input.max_opponent_strikes,
             score_gap_to_leader: input.score_gap,
         };
-        let dqn_value = self.dqn.evaluate_with_context(&state, &ctx);
+        let (dqn_mean, dqn_log_var) = self.dqn.evaluate_with_context(&state, &ctx);
 
         // Compute weighted probability: sum of P(free) * (total+1) per row
         let totals = state.row_totals();
@@ -537,7 +538,8 @@ impl StateExplorer {
 
         let result = ExplorerResult {
             ga_value,
-            dqn_value,
+            dqn_mean,
+            dqn_log_var,
             score: state.count_points(),
             blanks: state.blanks(),
             probability: state.probability(),

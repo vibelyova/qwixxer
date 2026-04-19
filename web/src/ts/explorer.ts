@@ -5,7 +5,8 @@ import './style.css';
 
 interface EvalResult {
     ga_value: number;
-    dqn_value: number;
+    dqn_mean: number;
+    dqn_log_var: number;
     score: number;
     blanks: number;
     probability: number;
@@ -199,7 +200,8 @@ function renderEvaluation(result: EvalResult): void {
         ['Probability', (result.probability * 100).toFixed(1) + '%'],
         ['Weighted Prob', result.weighted_probability.toFixed(3)],
         ['GA Value', result.ga_value.toFixed(4)],
-        ['DQN Value', result.dqn_value.toFixed(4)],
+        ['DQN Mean', result.dqn_mean.toFixed(2)],
+        ['DQN σ', Math.exp(0.5 * result.dqn_log_var).toFixed(2)],
     ];
 
     for (const [label, value] of metrics) {
