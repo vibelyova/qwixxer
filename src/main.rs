@@ -372,13 +372,13 @@ fn run_train() {
 
 #[cfg(feature = "dqn")]
 fn run_dqn_train() {
-    let samples = dqn::generate_training_data(1500, 500);
-    dqn::train(samples, "dqn_model");
+    let samples = dqn::train::generate_training_data(1500, 500);
+    dqn::train::train(samples, "dqn_model");
 }
 
 #[cfg(feature = "dqn")]
 fn run_dqn_selfplay(iterations: usize, bench_games: usize, checkpoints: bool) {
-    dqn::self_play_train("dqn_model", iterations, 20000, 10, bench_games, checkpoints);
+    dqn::train::self_play_train("dqn_model", iterations, 20000, 10, bench_games, checkpoints);
 }
 
 fn main() {

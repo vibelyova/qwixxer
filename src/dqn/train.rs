@@ -1,99 +1,39 @@
-// ---- Imports for inference (always available with `burn` feature) ----
+//! DQN training: MC-supervised pretraining + TD(λ) self-play RL.
+//!
+//! Only compiled with the `dqn` feature. The inference side ([`crate::dqn`])
+//! is always available so native and wasm binaries can share the same model.
+
+use crate::bot::{self, DNA};
+use crate::dqn::{
+    state_features, DqnStrategy, MyBackend, OpponentContext, QwixxModel, QwixxModelConfig,
+    NUM_FEATURES, TRAIN_SEED,
+};
+use crate::mcts::MonteCarlo;
 use crate::state::{Move, State};
 use crate::strategy::Strategy;
 use burn::{
-    backend::ndarray::NdArray,
-    nn::{Linear, LinearConfig, Relu},
-    prelude::*,
-    record::{NamedMpkBytesRecorder, HalfPrecisionSettings, Recorder},
-};
-
-// ---- Imports for training (only with `dqn` feature) ----
-#[cfg(feature = "dqn")]
-use crate::bot::{self, DNA};
-#[cfg(feature = "dqn")]
-use crate::mcts::MonteCarlo;
-#[cfg(feature = "dqn")]
-use burn::{
     backend::Autodiff,
     data::{
-        dataloader::{DataLoaderBuilder, batcher::Batcher},
+        dataloader::{batcher::Batcher, DataLoaderBuilder},
         dataset::{Dataset, InMemDataset},
     },
     nn::loss::{MseLoss, Reduction::Mean},
     optim::AdamConfig,
+    prelude::*,
     record::CompactRecorder,
     tensor::backend::AutodiffBackend,
-    train::{Learner, RegressionOutput, SupervisedTraining, TrainOutput, TrainStep, InferenceStep, metric::LossMetric},
+    train::{
+        metric::LossMetric, InferenceStep, Learner, RegressionOutput, SupervisedTraining,
+        TrainOutput, TrainStep,
+    },
 };
-#[cfg(feature = "dqn")]
-use rayon::prelude::*;
-#[cfg(feature = "dqn")]
 use rand::{rngs::SmallRng, Rng, SeedableRng};
-#[cfg(feature = "dqn")]
+use rayon::prelude::*;
 use std::sync::Arc;
 
-// Backend type aliases
-type MyBackend = NdArray;
-#[cfg(feature = "dqn")]
 type MyAutodiffBackend = Autodiff<MyBackend>;
 
-/// Number of input features for the state representation.
-pub const NUM_FEATURES: usize = 21;
-
-/// Global seed for reproducible training. Change to get a different run.
-pub const TRAIN_SEED: u64 = 42;
-
-/// Context about opponents, updated via observe_opponents.
-#[derive(Clone, Debug, Default)]
-pub struct OpponentContext {
-    pub num_opponents: u8,
-    pub max_opponent_strikes: u8,
-    pub score_gap_to_leader: isize, // positive = we're ahead
-}
-
-/// Extract features from a game state as a fixed-size float array.
-pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURES] {
-    let totals = state.row_totals();
-    let frees = state.row_free_values();
-    let locked = state.locked();
-
-    let mut features = [0.0f32; NUM_FEATURES];
-    for i in 0..4 {
-        // Row progress (0=start, 1=done). Locked = 1.0 (completed).
-        // Ascending (rows 0,1): (free-2)/10. Descending (rows 2,3): (12-free)/10.
-        features[i] = match frees[i] {
-            Some(f) if i < 2 => (f as f32 - 2.0) / 10.0,
-            Some(f) => (12.0 - f as f32) / 10.0,
-            None => 1.0,
-        };
-        // Row mark count normalized
-        features[4 + i] = totals[i] as f32 / 11.0;
-        // Row locked
-        features[8 + i] = if locked[i] { 1.0 } else { 0.0 };
-        // Per-row weighted probability: P(free) * (total+1), normalized
-        features[12 + i] = match frees[i] {
-            Some(f) => {
-                let ways = 6.0 - (7.0f32 - f as f32).abs();
-                (ways / 6.0) * (totals[i] as f32 + 1.0) / 11.0
-            }
-            None => 0.0,
-        };
-    }
-    // Strikes normalized
-    features[16] = state.strikes as f32 / 4.0;
-    // Blanks normalized
-    features[17] = state.blanks() as f32 / 40.0;
-    // Opponent context
-    features[18] = ctx.num_opponents as f32 / 4.0;
-    features[19] = ctx.max_opponent_strikes as f32 / 4.0;
-    features[20] = (ctx.score_gap_to_leader as f32 / 100.0).clamp(-1.0, 1.0);
-
-    features
-}
-
 /// Build opponent context from a 2-player game state.
-#[cfg(feature = "dqn")]
 fn make_context(our_state: &State, opponent_state: &State) -> OpponentContext {
     OpponentContext {
         num_opponents: 1,
@@ -102,54 +42,31 @@ fn make_context(our_state: &State, opponent_state: &State) -> OpponentContext {
     }
 }
 
-// ---- Model (inference, always available) ----
-
-#[derive(Module, Debug)]
-pub struct QwixxModel<B: Backend> {
-    layer1: Linear<B>,
-    layer2: Linear<B>,
-    output: Linear<B>,
-    activation: Relu,
-}
-
-#[derive(Config, Debug)]
-pub struct QwixxModelConfig {
-    #[config(default = 128)]
-    pub hidden1: usize,
-    #[config(default = 64)]
-    pub hidden2: usize,
-}
-
-impl QwixxModelConfig {
-    pub fn init<B: Backend>(&self, device: &B::Device) -> QwixxModel<B> {
-        QwixxModel {
-            layer1: LinearConfig::new(NUM_FEATURES, self.hidden1).with_bias(true).init(device),
-            layer2: LinearConfig::new(self.hidden1, self.hidden2).with_bias(true).init(device),
-            output: LinearConfig::new(self.hidden2, 1).with_bias(true).init(device),
-            activation: Relu::new(),
-        }
+/// Build opponent context for player 0 given all player states.
+///
+/// `score_gap_to_leader = our_score - max(opponent scores)` — positive when we
+/// are ahead, negative when behind. Matches `DqnStrategy::observe_opponents`
+/// so training and inference see the same feature distribution.
+fn make_context_multi(our_state: &State, all_states: &[State]) -> OpponentContext {
+    let our_score = our_state.count_points();
+    let mut max_strikes = 0u8;
+    let mut max_opp_score: Option<isize> = None;
+    let mut num_opponents = 0u8;
+    for s in all_states.iter().skip(1) {
+        num_opponents += 1;
+        max_strikes = max_strikes.max(s.strikes);
+        let score = s.count_points();
+        max_opp_score = Some(max_opp_score.map_or(score, |m| m.max(score)));
+    }
+    OpponentContext {
+        num_opponents,
+        max_opponent_strikes: max_strikes,
+        score_gap_to_leader: our_score - max_opp_score.unwrap_or(0),
     }
 }
 
-impl<B: Backend> QwixxModel<B> {
-    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
-        let x = self.activation.forward(self.layer1.forward(input));
-        let x = self.activation.forward(self.layer2.forward(x));
-        self.output.forward(x)
-    }
+// ---- Training step impls on the shared model ----
 
-    /// Evaluate a single state, returning the predicted value.
-    pub fn evaluate_state(&self, features: &[f32; NUM_FEATURES], device: &B::Device) -> f32 {
-        let input = Tensor::<B, 1>::from_floats(features.as_slice(), device)
-            .reshape([1, NUM_FEATURES]);
-        let output = self.forward(input);
-        output.into_data().to_vec::<f32>().unwrap()[0]
-    }
-}
-
-// ---- Training step impls (dqn feature only) ----
-
-#[cfg(feature = "dqn")]
 impl<B: Backend> QwixxModel<B> {
     pub fn forward_step(&self, batch: QwixxBatch<B>) -> RegressionOutput<B> {
         let targets = batch.targets.clone().unsqueeze_dim(1);
@@ -159,7 +76,6 @@ impl<B: Backend> QwixxModel<B> {
     }
 }
 
-#[cfg(feature = "dqn")]
 impl<B: AutodiffBackend> TrainStep for QwixxModel<B> {
     type Input = QwixxBatch<B>;
     type Output = RegressionOutput<B>;
@@ -170,7 +86,6 @@ impl<B: AutodiffBackend> TrainStep for QwixxModel<B> {
     }
 }
 
-#[cfg(feature = "dqn")]
 impl<B: Backend> InferenceStep for QwixxModel<B> {
     type Input = QwixxBatch<B>;
     type Output = RegressionOutput<B>;
@@ -180,33 +95,25 @@ impl<B: Backend> InferenceStep for QwixxModel<B> {
     }
 }
 
-// (DqnStrategy defined below after training code, with cache + batch)
+// ---- Training samples / batcher ----
 
-// ===========================================================================
-// Training code (native only, requires `dqn` feature)
-// ===========================================================================
-
-#[cfg(feature = "dqn")]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TrainingSample {
     pub features: Vec<f32>,
     pub value: f32,
 }
 
-#[cfg(feature = "dqn")]
 #[derive(Clone)]
 pub struct QwixxBatcher<B: Backend> {
     _phantom: std::marker::PhantomData<B>,
 }
 
-#[cfg(feature = "dqn")]
 #[derive(Clone, Debug)]
 pub struct QwixxBatch<B: Backend> {
     pub inputs: Tensor<B, 2>,
     pub targets: Tensor<B, 1>,
 }
 
-#[cfg(feature = "dqn")]
 impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
     fn batch(&self, items: Vec<TrainingSample>, device: &B::Device) -> QwixxBatch<B> {
         let batch_size = items.len();
@@ -237,8 +144,8 @@ impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
                 // Swap ascending(0,1)↔descending(2,3) pairs
                 if rng.gen::<bool>() {
                     for &base in &[0, 4, 8, 12] {
-                        f.swap(base, base + 2);     // 0↔2, 4↔6, 8↔10, 12↔14
-                        f.swap(base + 1, base + 3); // 1↔3, 5↔7, 9↔11, 13↔15
+                        f.swap(base, base + 2);
+                        f.swap(base + 1, base + 3);
                     }
                 }
                 f
@@ -254,9 +161,8 @@ impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
     }
 }
 
-// ---- Data generation ----
+// ---- MC-supervised data generation ----
 
-#[cfg(feature = "dqn")]
 /// Generate training data by playing games and evaluating states with MC.
 pub fn generate_training_data(num_games: usize, mc_sims: usize) -> Vec<TrainingSample> {
     let genes = Arc::new(bot::default_genes());
@@ -347,9 +253,8 @@ pub fn generate_training_data(num_games: usize, mc_sims: usize) -> Vec<TrainingS
     samples
 }
 
-// ---- Training ----
+// ---- MC-supervised training ----
 
-#[cfg(feature = "dqn")]
 pub fn train(samples: Vec<TrainingSample>, artifact_dir: &str) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
 
@@ -397,195 +302,8 @@ pub fn train(samples: Vec<TrainingSample>, artifact_dir: &str) {
     println!("Model saved to {artifact_dir}/model");
 }
 
-// ---- Strategy using trained model ----
+// ---- Self-play RL training helpers ----
 
-pub struct DqnStrategy {
-    model: QwixxModel<MyBackend>,
-    device: burn::backend::ndarray::NdArrayDevice,
-    context: OpponentContext,
-    cache: std::collections::HashMap<[u32; NUM_FEATURES], f32>,
-}
-
-impl std::fmt::Debug for DqnStrategy {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DqnStrategy")
-    }
-}
-
-impl DqnStrategy {
-    pub fn load(artifact_dir: &str) -> Self {
-        use burn::record::CompactRecorder;
-        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-        let model = QwixxModelConfig::new()
-            .init::<MyBackend>(&device)
-            .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
-            .expect("Failed to load model");
-        DqnStrategy { model, device, context: OpponentContext::default(), cache: std::collections::HashMap::new() }
-    }
-
-    /// Load model from embedded bytes (works in WASM and native).
-    pub fn load_from_bytes(model_bytes: &[u8]) -> Self {
-        use burn::module::Module;
-        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-        let recorder = NamedMpkBytesRecorder::<HalfPrecisionSettings>::new();
-        let record: <QwixxModel<MyBackend> as Module<MyBackend>>::Record = recorder
-            .load(model_bytes.to_vec(), &device)
-            .expect("Failed to load model from bytes");
-        let model = QwixxModelConfig::new()
-            .init::<MyBackend>(&device)
-            .load_record(record);
-        DqnStrategy { model, device, context: OpponentContext::default(), cache: std::collections::HashMap::new() }
-    }
-
-    /// Evaluate a state with a custom opponent context (for state explorer).
-    pub fn evaluate_with_context(&self, state: &State, ctx: &OpponentContext) -> f32 {
-        let features = state_features(state, ctx);
-        self.model.evaluate_state(&features, &self.device)
-    }
-
-    fn features_key(features: &[f32; NUM_FEATURES]) -> [u32; NUM_FEATURES] {
-        let mut key = [0u32; NUM_FEATURES];
-        for i in 0..NUM_FEATURES {
-            key[i] = features[i].to_bits();
-        }
-        key
-    }
-
-    #[allow(dead_code)]
-    fn evaluate(&mut self, state: &State) -> f32 {
-        let features = state_features(state, &self.context);
-        let key = Self::features_key(&features);
-        if let Some(&cached) = self.cache.get(&key) {
-            return cached;
-        }
-        let value = self.model.evaluate_state(&features, &self.device);
-        self.cache.insert(key, value);
-        value
-    }
-
-    /// Batch evaluate multiple states at once — single forward pass.
-    fn evaluate_batch(&mut self, states: &[State]) -> Vec<f32> {
-        if states.is_empty() {
-            return Vec::new();
-        }
-
-        let mut results = vec![0.0f32; states.len()];
-        let mut uncached_indices = Vec::new();
-        let mut uncached_features = Vec::new();
-
-        // Check cache first
-        for (i, state) in states.iter().enumerate() {
-            let features = state_features(state, &self.context);
-            let key = Self::features_key(&features);
-            if let Some(&cached) = self.cache.get(&key) {
-                results[i] = cached;
-            } else {
-                uncached_indices.push(i);
-                uncached_features.push(features);
-            }
-        }
-
-        // Batch forward pass for uncached states
-        if !uncached_features.is_empty() {
-            let n = uncached_features.len();
-            let flat: Vec<f32> = uncached_features.iter().flat_map(|f| f.iter().copied()).collect();
-            let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), &self.device)
-                .reshape([n, NUM_FEATURES]);
-            let output = self.model.forward(input).reshape([n]);
-            let values = output.into_data().to_vec::<f32>().unwrap();
-
-            for (j, &idx) in uncached_indices.iter().enumerate() {
-                results[idx] = values[j];
-                let key = Self::features_key(&uncached_features[j]);
-                self.cache.insert(key, values[j]);
-            }
-        }
-
-        results
-    }
-
-}
-
-impl Strategy for DqnStrategy {
-    fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
-        use crate::state::MetaDecision;
-        let moves = match state.apply_meta_rules(dice, self.context.score_gap_to_leader) {
-            MetaDecision::Forced(mov) => return mov,
-            MetaDecision::Choices(moves) => moves,
-        };
-
-        // Batch: compute all resulting states, evaluate in one pass
-        let result_states: Vec<State> = moves
-            .iter()
-            .map(|&mov| {
-                let mut s = *state;
-                s.apply_move(mov);
-                s
-            })
-            .collect();
-        let values = self.evaluate_batch(&result_states);
-
-        moves
-            .into_iter()
-            .enumerate()
-            .max_by(|(i, _), (j, _)| values[*i].partial_cmp(&values[*j]).unwrap())
-            .unwrap()
-            .1
-    }
-
-    fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
-        let moves = state.generate_opponent_moves(number);
-
-        if let Some(mov) = state.find_smart_lock(&moves, self.context.score_gap_to_leader) {
-            return Some(mov);
-        }
-
-        if moves.is_empty() {
-            return None;
-        }
-
-        // Batch: compute all resulting states + skip state, evaluate in one pass
-        let mut eval_states: Vec<State> = moves
-            .iter()
-            .map(|&mov| {
-                let mut s = *state;
-                s.apply_move(mov);
-                s.lock(locked);
-                s
-            })
-            .collect();
-        // Add skip state (no mark, just lock)
-        let mut skip_state = *state;
-        skip_state.lock(locked);
-        eval_states.push(skip_state);
-
-        let values = self.evaluate_batch(&eval_states);
-        let skip_value = *values.last().unwrap();
-
-        let (best_idx, best_value) = values[..moves.len()]
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .unwrap();
-
-        if *best_value > skip_value {
-            Some(moves[best_idx])
-        } else {
-            None
-        }
-    }
-
-    fn observe_opponents(&mut self, our_score: isize, opponents: &[State]) {
-        self.context.num_opponents = opponents.len() as u8;
-        self.context.max_opponent_strikes = opponents.iter().map(|s| s.strikes).max().unwrap_or(0);
-        let max_opp_score = opponents.iter().map(|s| s.count_points()).max().unwrap_or(0);
-        self.context.score_gap_to_leader = our_score - max_opp_score;
-    }
-}
-
-// ---- Self-play RL training ----
-
-#[cfg(feature = "dqn")]
 /// Pick a move from candidates using the model, with epsilon-greedy exploration.
 fn pick_move_with_model(
     model: &QwixxModel<MyBackend>,
@@ -614,7 +332,6 @@ fn pick_move_with_model(
         .unwrap()
 }
 
-#[cfg(feature = "dqn")]
 /// Pick an opponent-turn move using the model.
 fn pick_passive_move_with_model(
     model: &QwixxModel<MyBackend>,
@@ -666,7 +383,6 @@ fn pick_passive_move_with_model(
     }
 }
 
-#[cfg(feature = "dqn")]
 /// A simple wrapper to use the DQN model as an opponent (no epsilon, no recording).
 struct DqnSelfPlayOpponent {
     model: QwixxModel<MyBackend>,
@@ -675,22 +391,26 @@ struct DqnSelfPlayOpponent {
     context: OpponentContext,
 }
 
-#[cfg(feature = "dqn")]
 impl std::fmt::Debug for DqnSelfPlayOpponent {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "DqnSelfPlayOpponent")
     }
 }
 
-#[cfg(feature = "dqn")]
 impl Strategy for DqnSelfPlayOpponent {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
         use crate::state::MetaDecision;
         match state.apply_meta_rules(dice, self.context.score_gap_to_leader) {
             MetaDecision::Forced(mov) => mov,
-            MetaDecision::Choices(moves) => {
-                pick_move_with_model(&self.model, &self.device, state, &moves, 0.0, &mut self.rng, &self.context)
-            }
+            MetaDecision::Choices(moves) => pick_move_with_model(
+                &self.model,
+                &self.device,
+                state,
+                &moves,
+                0.0,
+                &mut self.rng,
+                &self.context,
+            ),
         }
     }
 
@@ -706,33 +426,8 @@ impl Strategy for DqnSelfPlayOpponent {
     }
 }
 
-#[cfg(feature = "dqn")]
-/// Build opponent context for player 0 given all player states.
-///
-/// `score_gap_to_leader = our_score - max(opponent scores)` — positive when we
-/// are ahead, negative when behind. Matches `DqnStrategy::observe_opponents`
-/// so training and inference see the same feature distribution.
-fn make_context_multi(our_state: &State, all_states: &[State]) -> OpponentContext {
-    let our_score = our_state.count_points();
-    let mut max_strikes = 0u8;
-    let mut max_opp_score: Option<isize> = None;
-    let mut num_opponents = 0u8;
-    for s in all_states.iter().skip(1) {
-        num_opponents += 1;
-        max_strikes = max_strikes.max(s.strikes);
-        let score = s.count_points();
-        max_opp_score = Some(max_opp_score.map_or(score, |m| m.max(score)));
-    }
-    OpponentContext {
-        num_opponents,
-        max_opponent_strikes: max_strikes,
-        score_gap_to_leader: our_score - max_opp_score.unwrap_or(0),
-    }
-}
-
-#[cfg(feature = "dqn")]
 /// Play a training game: DQN is player 0, opponents are arbitrary strategies.
-/// Records (state_features, final_score) for player 0.
+/// Records (state_features, TD(λ) target) for player 0.
 fn play_training_game(
     model: &QwixxModel<MyBackend>,
     device: &burn::backend::ndarray::NdArrayDevice,
@@ -771,7 +466,9 @@ fn play_training_game(
         } else {
             // Opponent's active turn — deliver observe_opponents first, mirroring Game::play.
             let opp_idx = active - 1;
-            let opp_view: Vec<State> = states.iter().enumerate()
+            let opp_view: Vec<State> = states
+                .iter()
+                .enumerate()
                 .filter(|(i, _)| *i != active)
                 .map(|(_, s)| *s)
                 .collect();
@@ -801,13 +498,17 @@ fn play_training_game(
                 }
             } else {
                 let opp_idx = passive - 1;
-                let opp_view: Vec<State> = states.iter().enumerate()
+                let opp_view: Vec<State> = states
+                    .iter()
+                    .enumerate()
                     .filter(|(i, _)| *i != passive)
                     .map(|(_, s)| *s)
                     .collect();
                 opponents[opp_idx].observe_opponents(states[passive].count_points(), &opp_view);
                 let opp_mov = opponents[opp_idx].opponents_move(
-                    &states[passive], on_white, new_locked,
+                    &states[passive],
+                    on_white,
+                    new_locked,
                 );
                 if let Some(mov) = opp_mov {
                     states[passive].apply_move(mov);
@@ -861,10 +562,8 @@ fn play_training_game(
     (samples, final_score)
 }
 
-#[cfg(feature = "dqn")]
-/// Self-play RL training loop with replay buffer and mixed opponents.
-/// Keeps samples from the last `buffer_iterations` rounds to prevent forgetting.
-#[cfg(feature = "dqn")]
+// ---- Self-play benchmark + training loop ----
+
 fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 {
     use crate::game::{Game, Player};
 
@@ -874,6 +573,7 @@ fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 
         .map_init(
             || DqnStrategy::load(artifact_dir),
             |template, i| {
+                // Cheap: model tensors are Arc-backed; fresh cache + default context per game.
                 let dqn = DqnStrategy {
                     model: template.model.clone(),
                     device: template.device.clone(),
@@ -903,7 +603,6 @@ fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 
     wins as f64 / num_games as f64
 }
 
-#[cfg(feature = "dqn")]
 pub fn self_play_train(
     artifact_dir: &str,
     num_iterations: usize,
@@ -915,7 +614,8 @@ pub fn self_play_train(
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
     MyBackend::seed(&device, TRAIN_SEED);
     let buffer_iterations = 3;
-    let mut replay_buffer: std::collections::VecDeque<Vec<TrainingSample>> = std::collections::VecDeque::new();
+    let mut replay_buffer: std::collections::VecDeque<Vec<TrainingSample>> =
+        std::collections::VecDeque::new();
 
     let scores_log_path = format!("{artifact_dir}/training_scores.csv");
     // Write header
@@ -970,34 +670,42 @@ pub fn self_play_train(
             .map(|(game_idx, (config, thread_model))| {
                 let seed = TRAIN_SEED.wrapping_add((iteration * games_per_iteration + game_idx) as u64);
                 let mut rng = SmallRng::seed_from_u64(seed);
+                let dqn_self = || -> Box<dyn Strategy> {
+                    Box::new(DqnSelfPlayOpponent {
+                        model: thread_model.clone(),
+                        device: device.clone(),
+                        rng: SmallRng::seed_from_u64(seed + 1_000_000),
+                        context: OpponentContext::default(),
+                    })
+                };
                 let mut opps: Vec<Box<dyn Strategy>> = match config {
                     // 1v1: vs GA champion
                     0 => vec![Box::new(champion.clone())],
                     // 1v1: vs self
-                    1 => vec![
-                        Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000), context: OpponentContext::default() }),
-                    ],
+                    1 => vec![dqn_self()],
                     // 3-player: vs 2 GA champions
                     2 => vec![Box::new(champion.clone()), Box::new(champion.clone())],
                     // 4-player: vs 3 GA champions
-                    3 => vec![Box::new(champion.clone()), Box::new(champion.clone()), Box::new(champion.clone())],
-                    // 3-player: vs GA + self
-                    4 => vec![
+                    3 => vec![
                         Box::new(champion.clone()),
-                        Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000), context: OpponentContext::default() }),
+                        Box::new(champion.clone()),
+                        Box::new(champion.clone()),
                     ],
+                    // 3-player: vs GA + self
+                    4 => vec![Box::new(champion.clone()), dqn_self()],
                     // 4-player: vs 2 GA + self
                     _ => vec![
                         Box::new(champion.clone()),
                         Box::new(champion.clone()),
-                        Box::new(DqnSelfPlayOpponent { model: thread_model.clone(), device: device.clone(), rng: SmallRng::seed_from_u64(seed + 1_000_000), context: OpponentContext::default() }),
+                        dqn_self(),
                     ],
                 };
                 play_training_game(&thread_model, &device, &mut opps, epsilon, &mut rng)
             })
             .collect();
 
-        let new_samples: Vec<TrainingSample> = game_results.iter().flat_map(|(s, _)| s.iter().cloned()).collect();
+        let new_samples: Vec<TrainingSample> =
+            game_results.iter().flat_map(|(s, _)| s.iter().cloned()).collect();
         let game_scores: Vec<f32> = game_results.iter().map(|(_, score)| *score).collect();
         let avg_score = if game_scores.is_empty() {
             0.0
@@ -1080,7 +788,6 @@ pub fn self_play_train(
     }
 }
 
-#[cfg(feature = "dqn")]
 /// Train with a specific number of epochs, loading from existing model if present.
 fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epochs: usize, lr: f64) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
