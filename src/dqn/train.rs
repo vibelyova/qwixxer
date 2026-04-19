@@ -42,29 +42,6 @@ fn make_context(our_state: &State, opponent_state: &State) -> OpponentContext {
     }
 }
 
-/// Build opponent context for player 0 given all player states.
-///
-/// `score_gap_to_leader = our_score - max(opponent scores)` — positive when we
-/// are ahead, negative when behind. Matches `DqnStrategy::observe_opponents`
-/// so training and inference see the same feature distribution.
-fn make_context_multi(our_state: &State, all_states: &[State]) -> OpponentContext {
-    let our_score = our_state.count_points();
-    let mut max_strikes = 0u8;
-    let mut max_opp_score: Option<isize> = None;
-    let mut num_opponents = 0u8;
-    for s in all_states.iter().skip(1) {
-        num_opponents += 1;
-        max_strikes = max_strikes.max(s.strikes);
-        let score = s.count_points();
-        max_opp_score = Some(max_opp_score.map_or(score, |m| m.max(score)));
-    }
-    OpponentContext {
-        num_opponents,
-        max_opponent_strikes: max_strikes,
-        score_gap_to_leader: our_score - max_opp_score.unwrap_or(0),
-    }
-}
-
 // ---- Training step impls on the shared model ----
 
 impl<B: Backend> QwixxModel<B> {
@@ -302,120 +279,131 @@ pub fn train(samples: Vec<TrainingSample>, artifact_dir: &str) {
     println!("Model saved to {artifact_dir}/model");
 }
 
-// ---- Self-play RL training helpers ----
+// ---- Self-play RL training ----
 
-/// Pick a move from candidates using the model, with epsilon-greedy exploration.
-fn pick_move_with_model(
+/// Batched forward pass: evaluates all provided feature vectors in one model
+/// call. Returns one value per input (empty input → empty output).
+fn batch_eval_features(
     model: &QwixxModel<MyBackend>,
     device: &burn::backend::ndarray::NdArrayDevice,
-    state: &State,
-    moves: &[Move],
-    epsilon: f32,
-    rng: &mut SmallRng,
-    ctx: &OpponentContext,
-) -> Move {
-    if rng.gen::<f32>() < epsilon {
-        return moves[rng.gen_range(0..moves.len())];
+    features_list: &[[f32; NUM_FEATURES]],
+) -> Vec<f32> {
+    if features_list.is_empty() {
+        return Vec::new();
     }
-
-    *moves
-        .iter()
-        .max_by(|&&a, &&b| {
-            let mut sa = *state;
-            sa.apply_move(a);
-            let va = model.evaluate_state(&state_features(&sa, ctx), device);
-            let mut sb = *state;
-            sb.apply_move(b);
-            let vb = model.evaluate_state(&state_features(&sb, ctx), device);
-            va.partial_cmp(&vb).unwrap()
-        })
-        .unwrap()
+    let n = features_list.len();
+    let flat: Vec<f32> = features_list.iter().flat_map(|f| f.iter().copied()).collect();
+    let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), device)
+        .reshape([n, NUM_FEATURES]);
+    let output = model.forward(input).reshape([n]);
+    output.into_data().to_vec::<f32>().unwrap()
 }
 
-/// Pick an opponent-turn move using the model.
-fn pick_passive_move_with_model(
-    model: &QwixxModel<MyBackend>,
-    device: &burn::backend::ndarray::NdArrayDevice,
-    state: &State,
-    number: u8,
-    locked: [bool; 4],
-    ctx: &OpponentContext,
-) -> Option<Move> {
-    let moves = state.generate_opponent_moves(number);
-    if moves.is_empty() {
-        return None;
-    }
-
-    // Smart lock
-    if let Some(mov) = state.find_smart_lock(&moves, ctx.score_gap_to_leader) {
-        return Some(mov);
-    }
-
-    let best = moves
-        .iter()
-        .max_by(|&&a, &&b| {
-            let mut sa = *state;
-            sa.apply_move(a);
-            sa.lock(locked);
-            let va = model.evaluate_state(&state_features(&sa, ctx), device);
-            let mut sb = *state;
-            sb.apply_move(b);
-            sb.lock(locked);
-            let vb = model.evaluate_state(&state_features(&sb, ctx), device);
-            va.partial_cmp(&vb).unwrap()
-        })
-        .copied()
-        .unwrap();
-
-    let mut mark_state = *state;
-    mark_state.apply_move(best);
-    mark_state.lock(locked);
-    let mut skip_state = *state;
-    skip_state.lock(locked);
-
-    let mark_val = model.evaluate_state(&state_features(&mark_state, ctx), device);
-    let skip_val = model.evaluate_state(&state_features(&skip_state, ctx), device);
-
-    if mark_val > skip_val {
-        Some(best)
-    } else {
-        None
-    }
-}
-
-/// A simple wrapper to use the DQN model as an opponent (no epsilon, no recording).
-struct DqnSelfPlayOpponent {
+/// DQN wrapper used during self-play training. Picks moves with ε-greedy
+/// exploration and records post-move features into a shared buffer that the
+/// training loop drains after `Game::play` returns.
+///
+/// Features are computed against `self.context` (the pre-move observation) —
+/// matching `DqnStrategy`'s convention so training/inference distributions align.
+struct RecordingDqn {
     model: QwixxModel<MyBackend>,
     device: burn::backend::ndarray::NdArrayDevice,
+    epsilon: f32,
     rng: SmallRng,
     context: OpponentContext,
+    /// Shared with the training loop. Stays inside one rayon closure per game
+    /// so Rc<RefCell<..>> is sufficient — no synchronization needed.
+    recorded: std::rc::Rc<std::cell::RefCell<Vec<[f32; NUM_FEATURES]>>>,
 }
 
-impl std::fmt::Debug for DqnSelfPlayOpponent {
+impl std::fmt::Debug for RecordingDqn {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DqnSelfPlayOpponent")
+        write!(f, "RecordingDqn")
     }
 }
 
-impl Strategy for DqnSelfPlayOpponent {
+impl Strategy for RecordingDqn {
     fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
         use crate::state::MetaDecision;
-        match state.apply_meta_rules(dice, self.context.score_gap_to_leader) {
-            MetaDecision::Forced(mov) => mov,
-            MetaDecision::Choices(moves) => pick_move_with_model(
-                &self.model,
-                &self.device,
-                state,
-                &moves,
-                0.0,
-                &mut self.rng,
-                &self.context,
-            ),
-        }
+        let mov = match state.apply_meta_rules(dice, self.context.score_gap_to_leader) {
+            MetaDecision::Forced(m) => m,
+            MetaDecision::Choices(moves) => {
+                if self.rng.gen::<f32>() < self.epsilon {
+                    moves[self.rng.gen_range(0..moves.len())]
+                } else {
+                    let features_list: Vec<[f32; NUM_FEATURES]> = moves
+                        .iter()
+                        .map(|&m| {
+                            let mut s = *state;
+                            s.apply_move(m);
+                            state_features(&s, &self.context)
+                        })
+                        .collect();
+                    let values = batch_eval_features(&self.model, &self.device, &features_list);
+                    let best = values
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                        .unwrap()
+                        .0;
+                    moves[best]
+                }
+            }
+        };
+        // Record features of the resulting state (post-our-move, pre-opponents-passive).
+        let mut post = *state;
+        post.apply_move(mov);
+        let features = state_features(&post, &self.context);
+        self.recorded.borrow_mut().push(features);
+        mov
     }
 
     fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
-        pick_passive_move_with_model(&self.model, &self.device, state, number, locked, &self.context)
+        let moves = state.generate_opponent_moves(number);
+
+        if let Some(mov) = state.find_smart_lock(&moves, self.context.score_gap_to_leader) {
+            let mut post = *state;
+            post.apply_move(mov);
+            post.lock(locked);
+            let features = state_features(&post, &self.context);
+            self.recorded.borrow_mut().push(features);
+            return Some(mov);
+        }
+
+        if moves.is_empty() {
+            return None;
+        }
+
+        // Batched eval: all mark states + the skip state.
+        let mut features_list: Vec<[f32; NUM_FEATURES]> = moves
+            .iter()
+            .map(|&m| {
+                let mut s = *state;
+                s.apply_move(m);
+                s.lock(locked);
+                state_features(&s, &self.context)
+            })
+            .collect();
+        let mut skip_state = *state;
+        skip_state.lock(locked);
+        features_list.push(state_features(&skip_state, &self.context));
+
+        let values = batch_eval_features(&self.model, &self.device, &features_list);
+        let skip_value = *values.last().unwrap();
+        let (best_idx, best_value) = values[..moves.len()]
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap();
+
+        if best_value > skip_value {
+            // Only record when we actually mark — matches prior behavior.
+            self.recorded.borrow_mut().push(features_list[best_idx]);
+            Some(moves[best_idx])
+        } else {
+            None
+        }
     }
 
     fn observe_opponents(&mut self, our_score: isize, opponents: &[State]) {
@@ -426,125 +414,60 @@ impl Strategy for DqnSelfPlayOpponent {
     }
 }
 
-/// Play a training game: DQN is player 0, opponents are arbitrary strategies.
-/// Records (state_features, TD(λ) target) for player 0.
+/// Play a training game using the shared `Game::play` loop with a `RecordingDqn`
+/// as player 0. Returns (TD(λ) training samples, final score for player 0).
 fn play_training_game(
     model: &QwixxModel<MyBackend>,
     device: &burn::backend::ndarray::NdArrayDevice,
-    opponents: &mut [Box<dyn Strategy>],
+    opponents: Vec<Box<dyn Strategy>>,
     epsilon: f32,
-    rng: &mut SmallRng,
+    seed: u64,
 ) -> (Vec<TrainingSample>, f32) {
-    let num_players = 1 + opponents.len();
-    let mut states: Vec<State> = (0..num_players).map(|_| State::default()).collect();
-    let mut recorded_features: Vec<[f32; NUM_FEATURES]> = Vec::new();
-    let mut turn = 0u32;
+    use crate::game::{Game, Player};
 
-    loop {
-        // Game over check
-        if states.iter().any(|s| s.strikes >= 4) { break; }
-        if states.iter().any(|s| s.count_locked() >= 2) { break; }
+    let recorded: std::rc::Rc<std::cell::RefCell<Vec<[f32; NUM_FEATURES]>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
 
-        let dice: [u8; 6] = core::array::from_fn(|_| rng.gen_range(1..=6));
-        let on_white = dice[0] + dice[1];
-        let active = (turn as usize) % num_players;
+    let recording = RecordingDqn {
+        model: model.clone(),
+        device: device.clone(),
+        epsilon,
+        rng: SmallRng::seed_from_u64(seed),
+        context: OpponentContext::default(),
+        recorded: std::rc::Rc::clone(&recorded),
+    };
 
-        if active == 0 {
-            // DQN's active turn
-            let ctx = make_context_multi(&states[0], &states);
-            let mov = match states[0].apply_meta_rules(dice, ctx.score_gap_to_leader) {
-                crate::state::MetaDecision::Forced(mov) => mov,
-                crate::state::MetaDecision::Choices(moves) => {
-                    pick_move_with_model(model, device, &states[0], &moves, epsilon, rng, &ctx)
-                }
-            };
-            let mut s = states[0];
-            s.apply_move(mov);
-            let ctx_after = make_context_multi(&s, &states);
-            recorded_features.push(state_features(&s, &ctx_after));
-            states[0].apply_move(mov);
-        } else {
-            // Opponent's active turn — deliver observe_opponents first, mirroring Game::play.
-            let opp_idx = active - 1;
-            let opp_view: Vec<State> = states
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != active)
-                .map(|(_, s)| *s)
-                .collect();
-            opponents[opp_idx].observe_opponents(states[active].count_points(), &opp_view);
-            let opp_mov = opponents[opp_idx].your_move(&states[active], dice);
-            states[active].apply_move(opp_mov);
-        }
-
-        let mut new_locked = states[active].locked();
-
-        // Passive turns for all non-active players
-        for idx in 1..num_players {
-            let passive = (active + idx) % num_players;
-            if passive == 0 {
-                // DQN's passive turn
-                let ctx = make_context_multi(&states[0], &states);
-                let our_mov = pick_passive_move_with_model(
-                    model, device, &states[0], on_white, new_locked, &ctx,
-                );
-                if let Some(mov) = our_mov {
-                    let mut s = states[0];
-                    s.apply_move(mov);
-                    s.lock(new_locked);
-                    let ctx_after = make_context_multi(&s, &states);
-                    recorded_features.push(state_features(&s, &ctx_after));
-                    states[0].apply_move(mov);
-                }
-            } else {
-                let opp_idx = passive - 1;
-                let opp_view: Vec<State> = states
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != passive)
-                    .map(|(_, s)| *s)
-                    .collect();
-                opponents[opp_idx].observe_opponents(states[passive].count_points(), &opp_view);
-                let opp_mov = opponents[opp_idx].opponents_move(
-                    &states[passive],
-                    on_white,
-                    new_locked,
-                );
-                if let Some(mov) = opp_mov {
-                    states[passive].apply_move(mov);
-                }
-            }
-            for (row, locked) in states[passive].locked().iter().enumerate() {
-                new_locked[row] |= *locked;
-            }
-        }
-
-        // Propagate all locks
-        for s in states.iter_mut() {
-            s.lock(new_locked);
-        }
-
-        turn += 1;
-        if turn > 200 { break; }
+    let mut players: Vec<Player> = Vec::with_capacity(1 + opponents.len());
+    players.push(Player::new(
+        Box::new(recording),
+        Box::new(SmallRng::seed_from_u64(seed.wrapping_add(1))),
+    ));
+    for (i, opp) in opponents.into_iter().enumerate() {
+        players.push(Player::new(
+            opp,
+            Box::new(SmallRng::seed_from_u64(seed.wrapping_add(2 + i as u64))),
+        ));
     }
 
-    let final_score = states[0].count_points() as f32;
+    let mut game = Game::new(players);
+    game.play();
 
-    // Compute TD(lambda) targets backwards through the trajectory
+    let final_score = game.players[0].state.count_points() as f32;
+
+    // Drain the recorded buffer (still shared with the RecordingDqn inside player 0).
+    let recorded_features: Vec<[f32; NUM_FEATURES]> =
+        std::mem::take(&mut *recorded.borrow_mut());
+
     let lambda = 0.8f32;
     let n = recorded_features.len();
     if n == 0 {
         return (Vec::new(), final_score);
     }
 
-    // Get model's value estimates for each recorded state
-    let values: Vec<f32> = recorded_features
-        .iter()
-        .map(|f| model.evaluate_state(f, device))
-        .collect();
+    // Batched forward pass for TD(λ) bootstrap values.
+    let values = batch_eval_features(model, device, &recorded_features);
 
-    // Compute targets: G_t = (1-lambda)*V(s_{t+1}) + lambda*G_{t+1}
-    // G_{n-1} = final_score
+    // G_t = (1-λ)·V(s_{t+1}) + λ·G_{t+1}, with G_{n-1} = final_score.
     let mut targets = vec![0.0f32; n];
     targets[n - 1] = final_score;
     for t in (0..n - 1).rev() {
@@ -669,16 +592,17 @@ pub fn self_play_train(
             .enumerate()
             .map(|(game_idx, (config, thread_model))| {
                 let seed = TRAIN_SEED.wrapping_add((iteration * games_per_iteration + game_idx) as u64);
-                let mut rng = SmallRng::seed_from_u64(seed);
+                // Deterministic DQN self-play opponents — DqnStrategy shares the same
+                // batched-eval path as inference. Cheap clones: tensors are Arc-backed.
                 let dqn_self = || -> Box<dyn Strategy> {
-                    Box::new(DqnSelfPlayOpponent {
+                    Box::new(DqnStrategy {
                         model: thread_model.clone(),
                         device: device.clone(),
-                        rng: SmallRng::seed_from_u64(seed + 1_000_000),
                         context: OpponentContext::default(),
+                        cache: std::collections::HashMap::new(),
                     })
                 };
-                let mut opps: Vec<Box<dyn Strategy>> = match config {
+                let opps: Vec<Box<dyn Strategy>> = match config {
                     // 1v1: vs GA champion
                     0 => vec![Box::new(champion.clone())],
                     // 1v1: vs self
@@ -700,7 +624,7 @@ pub fn self_play_train(
                         dqn_self(),
                     ],
                 };
-                play_training_game(&thread_model, &device, &mut opps, epsilon, &mut rng)
+                play_training_game(&thread_model, &device, opps, epsilon, seed)
             })
             .collect();
 
