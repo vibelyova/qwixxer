@@ -13,13 +13,12 @@ path = "src/main.rs"
 
 [features]
 default = ["dqn", "parallel"]
-dqn = ["burn", "burn/train", "serde", "parallel"]
-burn = ["dep:burn"]
+dqn = ["burn/train", "serde", "parallel"]
 parallel = ["rayon"]
 
 [dependencies]
 anyhow = "1"
-burn = { version = "0.20.1", features = ["ndarray"], optional = true }
+burn = { version = "0.20.1", features = ["ndarray"] }
 clap = { version = "4.6.0", features = ["derive"] }
 env_logger = "0.11.8"
 itertools = "0.12"
