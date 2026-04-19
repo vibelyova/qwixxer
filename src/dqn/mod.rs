@@ -89,20 +89,23 @@ pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURE
     features
 }
 
-/// Score a move candidate by P(win) under a Gaussian approximation, using the
-/// max-opponent approach. Monotonic in `Φ((μ - c) / sqrt(2σ²))`, so argmax of
-/// this function equals argmax of P(win).
+/// Score a move candidate by P(win) under a Gaussian approximation with the
+/// max-opponent as the comparison target. Monotonic in
+/// `Φ((μ_us − μ_opp) / sqrt(σ²_us + σ²_opp))`, so argmax of this function equals
+/// argmax of P(win).
 ///
-/// We use the candidate's own variance as a proxy for both players' variance
-/// (both are playing the same game from similar states), which gives a
-/// ranking-stable √(2σ²) denominator up to the factor of √2. We drop the √2
-/// since monotonic transforms don't change argmax — equivalent to ranking by
-/// `(μ − c) / σ`.
-pub fn win_rank_score(mean: f32, log_var: f32, threshold: f32) -> f32 {
-    let log_var_clamped = log_var.clamp(LOG_VAR_MIN, LOG_VAR_MAX);
-    // exp(-log_var / 2) = 1 / σ.
-    let inv_sigma = (-0.5 * log_var_clamped).exp();
-    (mean - threshold) * inv_sigma
+/// Requires evaluating V on the leading opponent's actual state — the caller
+/// supplies `(opp_mean, opp_log_var)` from that evaluation.
+pub fn win_rank_score(
+    us_mean: f32,
+    us_log_var: f32,
+    opp_mean: f32,
+    opp_log_var: f32,
+) -> f32 {
+    let us_lv = us_log_var.clamp(LOG_VAR_MIN, LOG_VAR_MAX);
+    let opp_lv = opp_log_var.clamp(LOG_VAR_MIN, LOG_VAR_MAX);
+    let total_var = us_lv.exp() + opp_lv.exp();
+    (us_mean - opp_mean) / total_var.sqrt()
 }
 
 // ---- Model ----
@@ -164,6 +167,15 @@ pub struct DqnStrategy {
     model: QwixxModel<MyBackend>,
     device: burn::backend::ndarray::NdArrayDevice,
     context: OpponentContext,
+    /// State of the current leading opponent (max score). Captured by
+    /// `observe_opponents`; used in ranking to evaluate V on the leader's
+    /// actual state so we have both μ_opp and σ²_opp.
+    leader_state: Option<State>,
+    /// Scores of non-leader opponents — needed to build the leader's own
+    /// `OpponentContext` (their gap, etc.).
+    non_leader_opp_scores: Vec<isize>,
+    /// Max strikes among non-leader opponents (for the leader's max-opp-strikes feature).
+    non_leader_opp_max_strikes: u8,
     /// Cache stores `(mean, log_var)` pairs keyed by feature bits.
     cache: std::collections::HashMap<[u32; NUM_FEATURES], (f32, f32)>,
 }
@@ -186,6 +198,9 @@ impl DqnStrategy {
             model,
             device,
             context: OpponentContext::default(),
+            leader_state: None,
+            non_leader_opp_scores: Vec::new(),
+            non_leader_opp_max_strikes: 0,
             cache: std::collections::HashMap::new(),
         }
     }
@@ -205,6 +220,9 @@ impl DqnStrategy {
             model,
             device,
             context: OpponentContext::default(),
+            leader_state: None,
+            non_leader_opp_scores: Vec::new(),
+            non_leader_opp_max_strikes: 0,
             cache: std::collections::HashMap::new(),
         }
     }
@@ -214,6 +232,34 @@ impl DqnStrategy {
     pub fn evaluate_with_context(&self, state: &State, ctx: &OpponentContext) -> (f32, f32) {
         let features = state_features(state, ctx);
         self.model.evaluate_state(&features, &self.device)
+    }
+
+    /// Run V on the stored leader's state, building the leader's own
+    /// `OpponentContext` from `our_state` and the non-leader opp info
+    /// captured by `observe_opponents`. Returns `(0.0, 0.0)` if there is no
+    /// leader (single-player case; shouldn't occur in a real Qwixx game).
+    fn leader_prediction(&mut self, our_state: &State) -> (f32, f32) {
+        let Some(leader) = self.leader_state else {
+            return (0.0, 0.0);
+        };
+        let our_score = our_state.count_points();
+        let max_other = std::iter::once(our_score)
+            .chain(self.non_leader_opp_scores.iter().copied())
+            .max()
+            .unwrap_or(our_score);
+        let leader_ctx = OpponentContext {
+            num_opponents: self.context.num_opponents,
+            max_opponent_strikes: our_state.strikes.max(self.non_leader_opp_max_strikes),
+            score_gap_to_leader: leader.count_points() - max_other,
+        };
+        let features = state_features(&leader, &leader_ctx);
+        let key = Self::features_key(&features);
+        if let Some(&cached) = self.cache.get(&key) {
+            return cached;
+        }
+        let value = self.model.evaluate_state(&features, &self.device);
+        self.cache.insert(key, value);
+        value
     }
 
     fn features_key(features: &[f32; NUM_FEATURES]) -> [u32; NUM_FEATURES] {
@@ -288,8 +334,9 @@ impl Strategy for DqnStrategy {
             MetaDecision::Choices(moves) => moves,
         };
 
-        // Batch-evaluate all resulting states. Rank by P(win) approximation
-        // using the max-opponent threshold.
+        // Evaluate V on the leading opponent's actual state first, then rank
+        // candidate post-move states by the full P(win) formula.
+        let (opp_mean, opp_log_var) = self.leader_prediction(state);
         let result_states: Vec<State> = moves
             .iter()
             .map(|&mov| {
@@ -299,14 +346,13 @@ impl Strategy for DqnStrategy {
             })
             .collect();
         let values = self.evaluate_batch(&result_states);
-        let threshold = (state.count_points() - self.context.score_gap_to_leader) as f32;
 
         moves
             .into_iter()
             .enumerate()
             .max_by(|(i, _), (j, _)| {
-                let a = win_rank_score(values[*i].0, values[*i].1, threshold);
-                let b = win_rank_score(values[*j].0, values[*j].1, threshold);
+                let a = win_rank_score(values[*i].0, values[*i].1, opp_mean, opp_log_var);
+                let b = win_rank_score(values[*j].0, values[*j].1, opp_mean, opp_log_var);
                 a.partial_cmp(&b).unwrap()
             })
             .unwrap()
@@ -324,7 +370,7 @@ impl Strategy for DqnStrategy {
             return None;
         }
 
-        // Batch-evaluate mark states + skip state; rank by P(win) approximation.
+        let (opp_mean, opp_log_var) = self.leader_prediction(state);
         let mut eval_states: Vec<State> = moves
             .iter()
             .map(|&mov| {
@@ -339,15 +385,14 @@ impl Strategy for DqnStrategy {
         eval_states.push(skip_state);
 
         let values = self.evaluate_batch(&eval_states);
-        let threshold = (state.count_points() - self.context.score_gap_to_leader) as f32;
 
         let skip = values.last().unwrap();
-        let skip_rank = win_rank_score(skip.0, skip.1, threshold);
+        let skip_rank = win_rank_score(skip.0, skip.1, opp_mean, opp_log_var);
 
         let (best_idx, best_rank) = values[..moves.len()]
             .iter()
             .enumerate()
-            .map(|(i, v)| (i, win_rank_score(v.0, v.1, threshold)))
+            .map(|(i, v)| (i, win_rank_score(v.0, v.1, opp_mean, opp_log_var)))
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap();
 
@@ -363,5 +408,31 @@ impl Strategy for DqnStrategy {
         self.context.max_opponent_strikes = opponents.iter().map(|s| s.strikes).max().unwrap_or(0);
         let max_opp_score = opponents.iter().map(|s| s.count_points()).max().unwrap_or(0);
         self.context.score_gap_to_leader = our_score - max_opp_score;
+
+        // Identify the leader (max score) and cache the non-leader opp info
+        // so `leader_prediction` can reconstruct the leader's context on demand.
+        if opponents.is_empty() {
+            self.leader_state = None;
+            self.non_leader_opp_scores.clear();
+            self.non_leader_opp_max_strikes = 0;
+        } else {
+            let leader_idx = (0..opponents.len())
+                .max_by_key(|&i| opponents[i].count_points())
+                .unwrap();
+            self.leader_state = Some(opponents[leader_idx]);
+            self.non_leader_opp_scores = opponents
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != leader_idx)
+                .map(|(_, s)| s.count_points())
+                .collect();
+            self.non_leader_opp_max_strikes = opponents
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != leader_idx)
+                .map(|(_, s)| s.strikes)
+                .max()
+                .unwrap_or(0);
+        }
     }
 }

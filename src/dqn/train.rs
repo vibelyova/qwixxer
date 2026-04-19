@@ -332,9 +332,34 @@ struct RecordingDqn {
     epsilon: f32,
     rng: SmallRng,
     context: OpponentContext,
+    /// State of the current leading opponent — see [`DqnStrategy::leader_state`].
+    leader_state: Option<State>,
+    non_leader_opp_scores: Vec<isize>,
+    non_leader_opp_max_strikes: u8,
     /// Shared with the training loop. Stays inside one rayon closure per game
     /// so Rc<RefCell<..>> is sufficient — no synchronization needed.
     recorded: std::rc::Rc<std::cell::RefCell<Vec<[f32; NUM_FEATURES]>>>,
+}
+
+impl RecordingDqn {
+    /// Run V on the stored leader's state (no cache — per-game, few turns).
+    fn leader_prediction(&self, our_state: &State) -> (f32, f32) {
+        let Some(leader) = self.leader_state else {
+            return (0.0, 0.0);
+        };
+        let our_score = our_state.count_points();
+        let max_other = std::iter::once(our_score)
+            .chain(self.non_leader_opp_scores.iter().copied())
+            .max()
+            .unwrap_or(our_score);
+        let leader_ctx = OpponentContext {
+            num_opponents: self.context.num_opponents,
+            max_opponent_strikes: our_state.strikes.max(self.non_leader_opp_max_strikes),
+            score_gap_to_leader: leader.count_points() - max_other,
+        };
+        let features = state_features(&leader, &leader_ctx);
+        self.model.evaluate_state(&features, &self.device)
+    }
 }
 
 impl std::fmt::Debug for RecordingDqn {
@@ -352,6 +377,7 @@ impl Strategy for RecordingDqn {
                 if self.rng.gen::<f32>() < self.epsilon {
                     moves[self.rng.gen_range(0..moves.len())]
                 } else {
+                    let (opp_mean, opp_log_var) = self.leader_prediction(state);
                     let features_list: Vec<[f32; NUM_FEATURES]> = moves
                         .iter()
                         .map(|&m| {
@@ -361,14 +387,12 @@ impl Strategy for RecordingDqn {
                         })
                         .collect();
                     let values = batch_eval_features(&self.model, &self.device, &features_list);
-                    let threshold =
-                        (state.count_points() - self.context.score_gap_to_leader) as f32;
                     let best = values
                         .iter()
                         .enumerate()
                         .max_by(|(_, a), (_, b)| {
-                            win_rank_score(a.0, a.1, threshold)
-                                .partial_cmp(&win_rank_score(b.0, b.1, threshold))
+                            win_rank_score(a.0, a.1, opp_mean, opp_log_var)
+                                .partial_cmp(&win_rank_score(b.0, b.1, opp_mean, opp_log_var))
                                 .unwrap()
                         })
                         .unwrap()
@@ -401,7 +425,7 @@ impl Strategy for RecordingDqn {
             return None;
         }
 
-        // Batched eval: all mark states + the skip state.
+        let (opp_mean, opp_log_var) = self.leader_prediction(state);
         let mut features_list: Vec<[f32; NUM_FEATURES]> = moves
             .iter()
             .map(|&m| {
@@ -416,14 +440,13 @@ impl Strategy for RecordingDqn {
         features_list.push(state_features(&skip_state, &self.context));
 
         let values = batch_eval_features(&self.model, &self.device, &features_list);
-        let threshold = (state.count_points() - self.context.score_gap_to_leader) as f32;
         let skip = values.last().unwrap();
-        let skip_rank = win_rank_score(skip.0, skip.1, threshold);
+        let skip_rank = win_rank_score(skip.0, skip.1, opp_mean, opp_log_var);
 
         let (best_idx, best_rank) = values[..moves.len()]
             .iter()
             .enumerate()
-            .map(|(i, v)| (i, win_rank_score(v.0, v.1, threshold)))
+            .map(|(i, v)| (i, win_rank_score(v.0, v.1, opp_mean, opp_log_var)))
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap();
 
@@ -441,6 +464,30 @@ impl Strategy for RecordingDqn {
         self.context.max_opponent_strikes = opponents.iter().map(|s| s.strikes).max().unwrap_or(0);
         let max_opp_score = opponents.iter().map(|s| s.count_points()).max().unwrap_or(0);
         self.context.score_gap_to_leader = our_score - max_opp_score;
+
+        if opponents.is_empty() {
+            self.leader_state = None;
+            self.non_leader_opp_scores.clear();
+            self.non_leader_opp_max_strikes = 0;
+        } else {
+            let leader_idx = (0..opponents.len())
+                .max_by_key(|&i| opponents[i].count_points())
+                .unwrap();
+            self.leader_state = Some(opponents[leader_idx]);
+            self.non_leader_opp_scores = opponents
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != leader_idx)
+                .map(|(_, s)| s.count_points())
+                .collect();
+            self.non_leader_opp_max_strikes = opponents
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != leader_idx)
+                .map(|(_, s)| s.strikes)
+                .max()
+                .unwrap_or(0);
+        }
     }
 }
 
@@ -464,6 +511,9 @@ fn play_training_game(
         epsilon,
         rng: SmallRng::seed_from_u64(seed),
         context: OpponentContext::default(),
+        leader_state: None,
+        non_leader_opp_scores: Vec::new(),
+        non_leader_opp_max_strikes: 0,
         recorded: std::rc::Rc::clone(&recorded),
     };
 
@@ -532,6 +582,9 @@ fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 
                     model: template.model.clone(),
                     device: template.device.clone(),
                     context: OpponentContext::default(),
+                    leader_state: None,
+                    non_leader_opp_scores: Vec::new(),
+                    non_leader_opp_max_strikes: 0,
                     cache: std::collections::HashMap::new(),
                 };
                 let rotation = i % 2;
@@ -630,6 +683,9 @@ pub fn self_play_train(
                         model: thread_model.clone(),
                         device: device.clone(),
                         context: OpponentContext::default(),
+                        leader_state: None,
+                        non_leader_opp_scores: Vec::new(),
+                        non_leader_opp_max_strikes: 0,
                         cache: std::collections::HashMap::new(),
                     })
                 };
