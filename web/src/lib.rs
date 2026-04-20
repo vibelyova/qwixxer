@@ -516,11 +516,15 @@ impl StateExplorer {
             })
             .collect();
 
-        // DQN evaluation
+        // DQN evaluation. Explorer doesn't model a specific opponent state, so
+        // the new aggregate fields default to "no opp threat".
         let ctx = qwixxer::dqn::OpponentContext {
             num_opponents: input.num_opponents,
             max_opponent_strikes: input.max_opponent_strikes,
             score_gap_to_leader: input.score_gap,
+            max_opp_locks: 0,
+            max_opp_total_progress: 0.0,
+            opp_lockable_rows: 0,
         };
         let (dqn_mean, dqn_log_var) = self.dqn.evaluate_with_context(&state, &ctx);
 

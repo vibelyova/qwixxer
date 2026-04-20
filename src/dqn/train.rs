@@ -5,8 +5,9 @@
 
 use crate::bot::{self, DNA};
 use crate::dqn::{
-    state_features, win_rank_score, DqnStrategy, MyBackend, OpponentContext, QwixxModel,
-    QwixxModelConfig, LOG_VAR_MAX, LOG_VAR_MIN, NUM_FEATURES, TRAIN_SEED,
+    build_opponent_context_for, state_features, win_rank_score, DqnStrategy, MyBackend,
+    OpponentContext, QwixxModel, QwixxModelConfig, LOG_VAR_MAX, LOG_VAR_MIN, NUM_FEATURES,
+    TRAIN_SEED,
 };
 use crate::mcts::MonteCarlo;
 use crate::state::{Move, State};
@@ -34,11 +35,7 @@ type MyAutodiffBackend = Autodiff<MyBackend>;
 
 /// Build opponent context from a 2-player game state.
 fn make_context(our_state: &State, opponent_state: &State) -> OpponentContext {
-    OpponentContext {
-        num_opponents: 1,
-        max_opponent_strikes: opponent_state.strikes,
-        score_gap_to_leader: our_state.count_points() - opponent_state.count_points(),
-    }
+    build_opponent_context_for(our_state.count_points(), opponent_state, &[])
 }
 
 // ---- Training step impls on the shared model ----
@@ -334,8 +331,8 @@ struct RecordingDqn {
     context: OpponentContext,
     /// State of the current leading opponent — see [`DqnStrategy::leader_state`].
     leader_state: Option<State>,
-    non_leader_opp_scores: Vec<isize>,
-    non_leader_opp_max_strikes: u8,
+    /// Non-leader opponent states, for reconstructing the leader's context.
+    non_leader_states: Vec<State>,
     /// Shared with the training loop. Stays inside one rayon closure per game
     /// so Rc<RefCell<..>> is sufficient — no synchronization needed.
     recorded: std::rc::Rc<std::cell::RefCell<Vec<[f32; NUM_FEATURES]>>>,
@@ -347,16 +344,11 @@ impl RecordingDqn {
         let Some(leader) = self.leader_state else {
             return (0.0, 0.0);
         };
-        let our_score = our_state.count_points();
-        let max_other = std::iter::once(our_score)
-            .chain(self.non_leader_opp_scores.iter().copied())
-            .max()
-            .unwrap_or(our_score);
-        let leader_ctx = OpponentContext {
-            num_opponents: self.context.num_opponents,
-            max_opponent_strikes: our_state.strikes.max(self.non_leader_opp_max_strikes),
-            score_gap_to_leader: leader.count_points() - max_other,
-        };
+        let leader_ctx = build_opponent_context_for(
+            leader.count_points(),
+            our_state,
+            &self.non_leader_states,
+        );
         let features = state_features(&leader, &leader_ctx);
         self.model.evaluate_state(&features, &self.device)
     }
@@ -460,34 +452,25 @@ impl Strategy for RecordingDqn {
     }
 
     fn observe_opponents(&mut self, our_score: isize, opponents: &[State]) {
-        self.context.num_opponents = opponents.len() as u8;
-        self.context.max_opponent_strikes = opponents.iter().map(|s| s.strikes).max().unwrap_or(0);
-        let max_opp_score = opponents.iter().map(|s| s.count_points()).max().unwrap_or(0);
-        self.context.score_gap_to_leader = our_score - max_opp_score;
-
         if opponents.is_empty() {
+            self.context = OpponentContext::default();
             self.leader_state = None;
-            self.non_leader_opp_scores.clear();
-            self.non_leader_opp_max_strikes = 0;
-        } else {
-            let leader_idx = (0..opponents.len())
-                .max_by_key(|&i| opponents[i].count_points())
-                .unwrap();
-            self.leader_state = Some(opponents[leader_idx]);
-            self.non_leader_opp_scores = opponents
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != leader_idx)
-                .map(|(_, s)| s.count_points())
-                .collect();
-            self.non_leader_opp_max_strikes = opponents
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != leader_idx)
-                .map(|(_, s)| s.strikes)
-                .max()
-                .unwrap_or(0);
+            self.non_leader_states.clear();
+            return;
         }
+        let leader_idx = (0..opponents.len())
+            .max_by_key(|&i| opponents[i].count_points())
+            .unwrap();
+        let leader = opponents[leader_idx];
+        let non_leader: Vec<State> = opponents
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != leader_idx)
+            .map(|(_, s)| *s)
+            .collect();
+        self.context = build_opponent_context_for(our_score, &leader, &non_leader);
+        self.leader_state = Some(leader);
+        self.non_leader_states = non_leader;
     }
 }
 
@@ -512,8 +495,7 @@ fn play_training_game(
         rng: SmallRng::seed_from_u64(seed),
         context: OpponentContext::default(),
         leader_state: None,
-        non_leader_opp_scores: Vec::new(),
-        non_leader_opp_max_strikes: 0,
+        non_leader_states: Vec::new(),
         recorded: std::rc::Rc::clone(&recorded),
     };
 
@@ -583,8 +565,7 @@ fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 
                     device: template.device.clone(),
                     context: OpponentContext::default(),
                     leader_state: None,
-                    non_leader_opp_scores: Vec::new(),
-                    non_leader_opp_max_strikes: 0,
+                    non_leader_states: Vec::new(),
                     cache: std::collections::HashMap::new(),
                 };
                 let rotation = i % 2;
@@ -684,8 +665,7 @@ pub fn self_play_train(
                         device: device.clone(),
                         context: OpponentContext::default(),
                         leader_state: None,
-                        non_leader_opp_scores: Vec::new(),
-                        non_leader_opp_max_strikes: 0,
+                        non_leader_states: Vec::new(),
                         cache: std::collections::HashMap::new(),
                     })
                 };

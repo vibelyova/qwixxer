@@ -31,7 +31,7 @@ use burn::{
 pub type MyBackend = NdArray;
 
 /// Number of input features for the state representation.
-pub const NUM_FEATURES: usize = 21;
+pub const NUM_FEATURES: usize = 25;
 
 /// Global seed for reproducible training. Used by `dqn::train`.
 pub const TRAIN_SEED: u64 = 42;
@@ -41,12 +41,120 @@ pub const TRAIN_SEED: u64 = 42;
 pub const LOG_VAR_MIN: f32 = -5.0;
 pub const LOG_VAR_MAX: f32 = 10.0;
 
-/// Context about opponents, updated via `observe_opponents`.
+/// Context about opponents, updated via `observe_opponents`. All fields are
+/// pre-computed aggregates over opponents only; `state_features` combines
+/// them with our own state to derive the global "max player X" features.
 #[derive(Clone, Debug, Default)]
 pub struct OpponentContext {
     pub num_opponents: u8,
     pub max_opponent_strikes: u8,
     pub score_gap_to_leader: isize, // positive = we're ahead
+    pub max_opp_locks: u8,
+    /// Max over opponents of (sum of 4 row-progresses / 4). Range [0, 1].
+    pub max_opp_total_progress: f32,
+    /// Count of opponent rows that are lockable (≥5 marks, not locked).
+    pub opp_lockable_rows: u8,
+}
+
+// ---- Helpers used by both `state_features` and `observe_opponents` ----
+
+fn row_progress(free: Option<u8>, ascending: bool) -> f32 {
+    match free {
+        Some(f) if ascending => (f as f32 - 2.0) / 10.0,
+        Some(f) => (12.0 - f as f32) / 10.0,
+        None => 1.0,
+    }
+}
+
+/// Sum of the 4 row-progresses divided by 4 — range [0, 1]. Grows as the
+/// player's free pointers advance; reaches 1.0 only when all 4 rows are locked.
+pub fn total_progress(state: &State) -> f32 {
+    let frees = state.row_free_values();
+    let sum: f32 = (0..4).map(|i| row_progress(frees[i], i < 2)).sum();
+    sum / 4.0
+}
+
+/// Count of rows that could be locked on a lucky next roll: non-locked with ≥5 marks.
+pub fn lockable_rows(state: &State) -> u8 {
+    let totals = state.row_totals();
+    let locked = state.locked();
+    (0..4).filter(|&i| !locked[i] && totals[i] >= 5).count() as u8
+}
+
+/// Compute the `OpponentContext` for a player whose score is `our_score` and
+/// whose first opponent is `first_opp` plus any `extra_opps`. Used by
+/// `observe_opponents` (viewing opponents from the DqnStrategy's perspective)
+/// and by `leader_prediction` (viewing opponents from the leader's perspective).
+pub(crate) fn build_opponent_context_for(
+    our_score: isize,
+    first_opp: &State,
+    extra_opps: &[State],
+) -> OpponentContext {
+    let num_opponents = 1 + extra_opps.len() as u8;
+    let mut max_opp_strikes = first_opp.strikes;
+    let mut max_opp_score = first_opp.count_points();
+    let mut max_opp_locks = first_opp.count_locked();
+    let mut max_opp_total_progress = total_progress(first_opp);
+    let mut opp_lockable_rows_sum = lockable_rows(first_opp);
+
+    for s in extra_opps {
+        max_opp_strikes = max_opp_strikes.max(s.strikes);
+        max_opp_score = max_opp_score.max(s.count_points());
+        max_opp_locks = max_opp_locks.max(s.count_locked());
+        let tp = total_progress(s);
+        if tp > max_opp_total_progress {
+            max_opp_total_progress = tp;
+        }
+        opp_lockable_rows_sum += lockable_rows(s);
+    }
+
+    OpponentContext {
+        num_opponents,
+        max_opponent_strikes: max_opp_strikes,
+        score_gap_to_leader: our_score - max_opp_score,
+        max_opp_locks,
+        max_opp_total_progress,
+        opp_lockable_rows: opp_lockable_rows_sum,
+    }
+}
+
+/// Aggregate weighted-probability: for each possible white-dice sum, weight by
+/// P(rolling that sum) and the max (total+1)/11 across rows that could use it.
+/// Avoids the per-row double-counting when multiple rows share a free pointer.
+pub fn aggregate_weighted_probability(state: &State) -> f32 {
+    let frees = state.row_free_values();
+    let totals = state.row_totals();
+    let locked = state.locked();
+
+    let mut total = 0.0f32;
+    for s in 2u8..=12 {
+        let ways = 6 - ((s as i32) - 7).abs();
+        let p_s = ways as f32 / 36.0;
+
+        let mut best_value = 0.0f32;
+        for i in 0..4 {
+            if locked[i] {
+                continue;
+            }
+            let Some(f) = frees[i] else { continue };
+            let ascending = i < 2;
+            let can_mark = match (ascending, s) {
+                (true, 12) if totals[i] < 5 => false,
+                (false, 2) if totals[i] < 5 => false,
+                (true, _) => f <= s,
+                (false, _) => f >= s,
+            };
+            if !can_mark {
+                continue;
+            }
+            let value = (totals[i] as f32 + 1.0) / 11.0;
+            if value > best_value {
+                best_value = value;
+            }
+        }
+        total += p_s * best_value;
+    }
+    total
 }
 
 /// Extract features from a game state as a fixed-size float array.
@@ -58,12 +166,7 @@ pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURE
     let mut features = [0.0f32; NUM_FEATURES];
     for i in 0..4 {
         // Row progress (0=start, 1=done). Locked = 1.0 (completed).
-        // Ascending (rows 0,1): (free-2)/10. Descending (rows 2,3): (12-free)/10.
-        features[i] = match frees[i] {
-            Some(f) if i < 2 => (f as f32 - 2.0) / 10.0,
-            Some(f) => (12.0 - f as f32) / 10.0,
-            None => 1.0,
-        };
+        features[i] = row_progress(frees[i], i < 2);
         // Row mark count normalized
         features[4 + i] = totals[i] as f32 / 11.0;
         // Row locked
@@ -77,14 +180,34 @@ pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURE
             None => 0.0,
         };
     }
-    // Strikes normalized
-    features[16] = state.strikes as f32 / 4.0;
-    // Blanks normalized
+    // Our own stats. Max in-play strikes is 3 (4 ends the game).
+    features[16] = state.strikes as f32 / 3.0;
     features[17] = state.blanks() as f32 / 40.0;
-    // Opponent context
+
+    // Opponent / global context.
     features[18] = ctx.num_opponents as f32 / 4.0;
-    features[19] = ctx.max_opponent_strikes as f32 / 4.0;
-    features[20] = (ctx.score_gap_to_leader as f32 / 100.0).clamp(-1.0, 1.0);
+    // Score-gap clamped to [-1, 1] at ±100 points.
+    features[19] = (ctx.score_gap_to_leader as f32 / 100.0).clamp(-1.0, 1.0);
+
+    // Max-across-all-players (game-end proximity signals).
+    // Normalized by the maximum in-play value (game ends beyond that):
+    //   strikes: max in-play = 3 (4 ends the game).
+    //   locks:   max in-play = 1 (2 ends the game) — so the feature is ∈ {0, 1}.
+    let max_player_strikes = state.strikes.max(ctx.max_opponent_strikes);
+    features[20] = max_player_strikes as f32 / 3.0;
+    let max_player_locks = state.count_locked().max(ctx.max_opp_locks);
+    features[21] = (max_player_locks as f32).min(1.0);
+
+    // Game-duration proxy: leading player's row-progress sum (normalized).
+    features[22] = total_progress(state).max(ctx.max_opp_total_progress);
+
+    // Aggregate probability over usable dice sums.
+    features[23] = aggregate_weighted_probability(state);
+
+    // Count of rows ready to lock across all players. Not divided by num_players
+    // on purpose — multi-player games genuinely have more threat.
+    let our_lockable = lockable_rows(state);
+    features[24] = (our_lockable + ctx.opp_lockable_rows) as f32 / 8.0;
 
     features
 }
@@ -171,11 +294,9 @@ pub struct DqnStrategy {
     /// `observe_opponents`; used in ranking to evaluate V on the leader's
     /// actual state so we have both μ_opp and σ²_opp.
     leader_state: Option<State>,
-    /// Scores of non-leader opponents — needed to build the leader's own
-    /// `OpponentContext` (their gap, etc.).
-    non_leader_opp_scores: Vec<isize>,
-    /// Max strikes among non-leader opponents (for the leader's max-opp-strikes feature).
-    non_leader_opp_max_strikes: u8,
+    /// States of non-leader opponents, needed to build the leader's own
+    /// `OpponentContext` (their gap, strikes, locks, etc.) on demand.
+    non_leader_states: Vec<State>,
     /// Cache stores `(mean, log_var)` pairs keyed by feature bits.
     cache: std::collections::HashMap<[u32; NUM_FEATURES], (f32, f32)>,
 }
@@ -199,8 +320,7 @@ impl DqnStrategy {
             device,
             context: OpponentContext::default(),
             leader_state: None,
-            non_leader_opp_scores: Vec::new(),
-            non_leader_opp_max_strikes: 0,
+            non_leader_states: Vec::new(),
             cache: std::collections::HashMap::new(),
         }
     }
@@ -221,8 +341,7 @@ impl DqnStrategy {
             device,
             context: OpponentContext::default(),
             leader_state: None,
-            non_leader_opp_scores: Vec::new(),
-            non_leader_opp_max_strikes: 0,
+            non_leader_states: Vec::new(),
             cache: std::collections::HashMap::new(),
         }
     }
@@ -235,23 +354,18 @@ impl DqnStrategy {
     }
 
     /// Run V on the stored leader's state, building the leader's own
-    /// `OpponentContext` from `our_state` and the non-leader opp info
-    /// captured by `observe_opponents`. Returns `(0.0, 0.0)` if there is no
-    /// leader (single-player case; shouldn't occur in a real Qwixx game).
+    /// `OpponentContext` from `our_state` plus the stored non-leader states.
+    /// Returns `(0.0, 0.0)` if there is no leader.
     fn leader_prediction(&mut self, our_state: &State) -> (f32, f32) {
         let Some(leader) = self.leader_state else {
             return (0.0, 0.0);
         };
-        let our_score = our_state.count_points();
-        let max_other = std::iter::once(our_score)
-            .chain(self.non_leader_opp_scores.iter().copied())
-            .max()
-            .unwrap_or(our_score);
-        let leader_ctx = OpponentContext {
-            num_opponents: self.context.num_opponents,
-            max_opponent_strikes: our_state.strikes.max(self.non_leader_opp_max_strikes),
-            score_gap_to_leader: leader.count_points() - max_other,
-        };
+        // Leader's "opponents" are us + the non-leader opponents.
+        let leader_ctx = build_opponent_context_for(
+            leader.count_points(),
+            our_state,
+            &self.non_leader_states,
+        );
         let features = state_features(&leader, &leader_ctx);
         let key = Self::features_key(&features);
         if let Some(&cached) = self.cache.get(&key) {
@@ -404,35 +518,28 @@ impl Strategy for DqnStrategy {
     }
 
     fn observe_opponents(&mut self, our_score: isize, opponents: &[State]) {
-        self.context.num_opponents = opponents.len() as u8;
-        self.context.max_opponent_strikes = opponents.iter().map(|s| s.strikes).max().unwrap_or(0);
-        let max_opp_score = opponents.iter().map(|s| s.count_points()).max().unwrap_or(0);
-        self.context.score_gap_to_leader = our_score - max_opp_score;
-
-        // Identify the leader (max score) and cache the non-leader opp info
-        // so `leader_prediction` can reconstruct the leader's context on demand.
         if opponents.is_empty() {
+            self.context = OpponentContext::default();
             self.leader_state = None;
-            self.non_leader_opp_scores.clear();
-            self.non_leader_opp_max_strikes = 0;
-        } else {
-            let leader_idx = (0..opponents.len())
-                .max_by_key(|&i| opponents[i].count_points())
-                .unwrap();
-            self.leader_state = Some(opponents[leader_idx]);
-            self.non_leader_opp_scores = opponents
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != leader_idx)
-                .map(|(_, s)| s.count_points())
-                .collect();
-            self.non_leader_opp_max_strikes = opponents
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != leader_idx)
-                .map(|(_, s)| s.strikes)
-                .max()
-                .unwrap_or(0);
+            self.non_leader_states.clear();
+            // Preserve the gap semantics from before (no opp → 0 gap).
+            self.context.score_gap_to_leader = 0;
+            return;
         }
+
+        let leader_idx = (0..opponents.len())
+            .max_by_key(|&i| opponents[i].count_points())
+            .unwrap();
+        let leader = opponents[leader_idx];
+        let non_leader: Vec<State> = opponents
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != leader_idx)
+            .map(|(_, s)| *s)
+            .collect();
+
+        self.context = build_opponent_context_for(our_score, &leader, &non_leader);
+        self.leader_state = Some(leader);
+        self.non_leader_states = non_leader;
     }
 }
