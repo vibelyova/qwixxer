@@ -325,6 +325,23 @@ impl DqnStrategy {
         }
     }
 
+    /// Construct a strategy around an already-loaded model. Used by diagnostic
+    /// binaries that want to spin up many fresh strategies sharing the same
+    /// model (tensors are Arc-backed, so cloning is cheap).
+    pub fn from_model(
+        model: QwixxModel<MyBackend>,
+        device: burn::backend::ndarray::NdArrayDevice,
+    ) -> Self {
+        DqnStrategy {
+            model,
+            device,
+            context: OpponentContext::default(),
+            leader_state: None,
+            non_leader_states: Vec::new(),
+            cache: std::collections::HashMap::new(),
+        }
+    }
+
     /// Load model from embedded bytes (works in WASM and native).
     pub fn load_from_bytes(model_bytes: &[u8]) -> Self {
         use burn::module::Module;

@@ -33,6 +33,12 @@ use std::sync::Arc;
 
 type MyAutodiffBackend = Autodiff<MyBackend>;
 
+/// Weight on the σ loss in the combined `L = L_μ + α · L_σ`. The μ loss (MSE
+/// in raw score units) is ~100–2500 per sample; σ loss (Gaussian NLL) is
+/// O(1–10). A small α prevents σ's backbone gradients from dominating μ's.
+/// Tune if σ calibration isn't converging after a few iterations.
+const SIGMA_LOSS_WEIGHT: f32 = 1.0;
+
 /// Build opponent context from a 2-player game state.
 fn make_context(our_state: &State, opponent_state: &State) -> OpponentContext {
     build_opponent_context_for(our_state.count_points(), opponent_state, &[])
@@ -41,31 +47,40 @@ fn make_context(our_state: &State, opponent_state: &State) -> OpponentContext {
 // ---- Training step impls on the shared model ----
 
 impl<B: Backend> QwixxModel<B> {
-    /// Gaussian negative log-likelihood loss:
-    ///   L = 0.5 · log σ² + 0.5 · (x − μ)² · exp(−log σ²)
-    ///     = 0.5 · log_var + 0.5 · residual² / var
+    /// Dual loss that decouples μ and σ training:
     ///
-    /// `log_var` is clamped to `[LOG_VAR_MIN, LOG_VAR_MAX]` for numerical
-    /// stability. The additive `0.5·log(2π)` constant is dropped.
+    /// - **μ head**: plain MSE toward the TD(λ) target `G_t`. Keeps μ sample-
+    ///   efficient (bootstrap benefits) without σ interfering.
+    /// - **σ head**: Gaussian NLL using the *actual final score* as the
+    ///   residual reference (not `G_t`). This side-steps TD smoothing so σ
+    ///   learns `Var(X_final | s)`, the quantity we actually want. μ is
+    ///   detached from this term so σ gradients can't corrupt μ training.
+    ///
+    /// Total: `L = L_μ + α · L_σ`. See `SIGMA_LOSS_WEIGHT`.
     pub fn forward_step(&self, batch: QwixxBatch<B>) -> RegressionOutput<B> {
-        // output: [B, 2] with columns [mean, log_var].
         let output = self.forward(batch.inputs);
         let mean = output.clone().narrow(1, 0, 1);
         let log_var = output.narrow(1, 1, 1).clamp(LOG_VAR_MIN, LOG_VAR_MAX);
 
-        // targets is a 1D tensor from the batcher; reshape to [B, 1].
         let targets = batch.targets.clone().unsqueeze_dim(1);
-        let residual = targets.clone() - mean.clone();
-        let squared = residual.clone() * residual;
+        let final_scores = batch.final_scores.clone().unsqueeze_dim(1);
 
-        // inv_var = 1/σ² = exp(−log_var). Using exp of the negation avoids
-        // division, so a near-zero variance never blows up numerically.
+        // μ loss: MSE toward G_t.
+        let mu_residual = targets.clone() - mean.clone();
+        let mu_loss = (mu_residual.clone() * mu_residual).mean();
+
+        // σ loss: Gaussian NLL with residual measured against the real final
+        // score, not the TD-smoothed target. Detach μ so σ's gradient can't
+        // flow back into the mean head.
+        let mean_detached = mean.clone().detach();
+        let sigma_residual = final_scores - mean_detached;
+        let sigma_sq = sigma_residual.clone() * sigma_residual;
         let inv_var = log_var.clone().neg().exp();
-        let nll = log_var + squared * inv_var;
-        let loss = nll.mean().mul_scalar(0.5);
+        let sigma_nll = log_var + sigma_sq * inv_var;
+        let sigma_loss = sigma_nll.mean().mul_scalar(0.5);
 
-        // Pass `mean` as the `output` field so downstream regression metrics
-        // (RMSE, etc.) remain interpretable as score-prediction quality.
+        let loss = mu_loss + sigma_loss.mul_scalar(SIGMA_LOSS_WEIGHT);
+
         RegressionOutput { loss, output: mean, targets }
     }
 }
@@ -94,7 +109,12 @@ impl<B: Backend> InferenceStep for QwixxModel<B> {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TrainingSample {
     pub features: Vec<f32>,
+    /// TD(λ) target G_t used for μ regression. Smoothed, sample-efficient.
     pub value: f32,
+    /// Actual final score of the trajectory this sample was recorded on. Used
+    /// to train σ against an unbiased estimator of Var(X_final | s), bypassing
+    /// the TD-smoothing bias that a joint NLL on `value` would introduce.
+    pub final_score: f32,
 }
 
 #[derive(Clone)]
@@ -105,7 +125,10 @@ pub struct QwixxBatcher<B: Backend> {
 #[derive(Clone, Debug)]
 pub struct QwixxBatch<B: Backend> {
     pub inputs: Tensor<B, 2>,
+    /// TD(λ) targets (used to train μ).
     pub targets: Tensor<B, 1>,
+    /// Actual final scores of each sample's trajectory (used to train σ).
+    pub final_scores: Tensor<B, 1>,
 }
 
 impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
@@ -146,12 +169,14 @@ impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
             })
             .collect();
         let targets: Vec<f32> = items.iter().map(|s| s.value).collect();
+        let final_scores: Vec<f32> = items.iter().map(|s| s.final_score).collect();
 
         let inputs = Tensor::<B, 1>::from_floats(inputs.as_slice(), device)
             .reshape([batch_size, NUM_FEATURES]);
         let targets = Tensor::<B, 1>::from_floats(targets.as_slice(), device);
+        let final_scores = Tensor::<B, 1>::from_floats(final_scores.as_slice(), device);
 
-        QwixxBatch { inputs, targets }
+        QwixxBatch { inputs, targets, final_scores }
     }
 }
 
@@ -205,6 +230,10 @@ pub fn generate_training_data(num_games: usize, mc_sims: usize) -> Vec<TrainingS
                         local_samples.push(TrainingSample {
                             features: features.to_vec(),
                             value: mc_value as f32,
+                            // MC pretraining doesn't have a sampled final score;
+                            // reuse the MC mean. σ head learns ≈ 0 here and is
+                            // rehydrated properly by self-play training.
+                            final_score: mc_value as f32,
                         });
                     }
 
@@ -543,6 +572,7 @@ fn play_training_game(
         .map(|(features, target)| TrainingSample {
             features: features.to_vec(),
             value: target,
+            final_score,
         })
         .collect();
     (samples, final_score)
