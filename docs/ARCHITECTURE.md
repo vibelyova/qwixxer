@@ -14,7 +14,9 @@ qwixxer/
     game.rs            -- Game loop, players, DiceSource trait
     strategy/mod.rs    -- Strategy trait + Interactive, Conservative, Opportunist, Random
     bot.rs             -- Genetic algorithm: DNA, genes, Population, evolution
-    dqn.rs             -- DQN neural net: model, features, training, self-play RL
+    dqn/
+      mod.rs           -- DQN model, feature extraction, DqnStrategy, P(win) ranking helpers
+      train.rs         -- TD(lambda) targets, decoupled mu/sigma losses, self-play loop
     mcts.rs            -- Monte Carlo tree search with pluggable rollout policy
   web/
     Cargo.toml         -- WASM crate (qwixxer-web), depends on qwixxer with burn feature only
@@ -167,17 +169,25 @@ The `instinct(&self, state: &State) -> f64` method computes the weighted sum. We
 
 **Move selection**: For active turns, evaluates `instinct()` on each resulting state (including Strike) and picks the maximum. For passive turns, also compares against the skip state (with locks applied) to decide whether marking is worthwhile.
 
-### DQN Neural Net (`dqn.rs`)
+### DQN Neural Net (`dqn/mod.rs`, `dqn/train.rs`)
 
-**Architecture**: 21-input MLP with ReLU activations.
+**Architecture**: 25-input MLP with ReLU activations, two-head output.
 
 ```
-Input (21) -> Linear(128) -> ReLU -> Linear(64) -> ReLU -> Linear(1)
+Input (25) -> Linear(128) -> ReLU -> Linear(64) -> ReLU -> Linear(2)
+                                                           |    |
+                                                           mu   log sigma^2
 ```
 
-Total parameters: `21*128 + 128 + 128*64 + 64 + 64*1 + 1 = 11,073`.
+Total parameters: `25*128 + 128 + 128*64 + 64 + 64*2 + 2 = 11,778`.
 
-The model outputs a scalar state value (TD value learner, not a true DQN — closer to TD-Gammon). Move selection: apply each candidate move to the state, evaluate the resulting state, pick the highest value. Uses batch evaluation (single forward pass for all candidates) with a HashMap cache for repeated states.
+The model outputs two scalars per state: `mu(s)` (expected final score, TD value learner) and `log sigma^2(s)` (log-variance of the final-score distribution). At inference, `log sigma^2` is clamped to `[LOG_VAR_MIN, LOG_VAR_MAX] = [-5.0, 10.0]`.
+
+**Move ranking via P(win)**: Instead of picking `argmax mu(s')`, the DQN ranks candidates with `win_rank_score(mu_us, log_var_us, mu_opp, log_var_opp) = (mu_us - mu_opp) / sqrt(sigma^2_us + sigma^2_opp)` — monotonic in the Gaussian-approximation probability `P(score_us > score_opp)`. The leading opponent's `(mu_opp, log_var_opp)` is obtained by a forward pass on the opponent's actual state, batched with all our candidates in one forward call.
+
+**Per-candidate opponent context**: Each candidate post-move state rebuilds *both* its own `OpponentContext` (from the post-move our_score) and the opponent's view (from the opponent's score and our post-move state). This matters because context-derived features (score_gap, max_opp_strikes, max_opp_locks, max_opp_total_progress) change across candidates — different moves leave different gaps. Both our and opp feature vectors are batched together (`2N` rows) and evaluated in a single forward pass per decision.
+
+Uses a HashMap cache keyed by quantized features for repeated states.
 
 **Meta-rules** (`State::apply_meta_rules`): Before the model evaluates moves, shared strategic rules are applied:
 - **Smart lock**: Always lock to win the game (2+ locked rows and ahead). Always lock the first row. Never lock into a game-ending loss.
@@ -188,7 +198,7 @@ These meta-rules are shared by DQN, GA, and training code via `State::apply_meta
 
 **Opponent awareness**: `observe_opponents()` updates an `OpponentContext` with `num_opponents`, `max_opponent_strikes`, and `score_gap_to_leader`, which feed into the last 3 input features.
 
-### Feature Extraction (21 features)
+### Feature Extraction (25 features)
 
 | Index | Feature | Normalization |
 |-------|---------|---------------|
@@ -196,11 +206,17 @@ These meta-rules are shared by DQN, GA, and training code via `State::apply_meta
 | 4-7 | Row mark counts | /11 |
 | 8-11 | Row locked flags | 0 or 1 |
 | 12-15 | Per-row weighted probability: `P(rolling free) * (total+1)` | /(6*11) |
-| 16 | Strikes | /4 |
-| 17 | Blanks | /40 |
+| 16 | Our strikes | /3 (max in-play; 4 ends the game) |
+| 17 | Our blanks | /40 |
 | 18 | Number of opponents | /4 |
-| 19 | Max opponent strikes | /4 |
-| 20 | Score gap to leader | /100, clamped to [-1, 1] |
+| 19 | Score gap to leader | /100, clamped to [-1, 1] |
+| 20 | Max strikes across all players (ours + opponents) | /3 |
+| 21 | Max locks across all players | capped at 1 (2 ends the game) |
+| 22 | Max total row-progress across all players (game-duration proxy) | 0.0-1.0 |
+| 23 | Aggregate probability over usable dice sums | 0.0-1.0 |
+| 24 | Total lockable rows across all players | /8 |
+
+Features 20-24 are game-end-proximity signals: they let the network predict how much of the game remains, which is the dominant driver of remaining-score variance.
 
 ### Monte Carlo Tree Search (`mcts.rs`)
 
@@ -249,12 +265,16 @@ The rollout policy is pluggable via `RolloutFactory = Arc<dyn Fn() -> Box<dyn St
 2. For each iteration (default 40, 20,000 games per iteration):
    a. Play games with epsilon-greedy exploration (epsilon decays from 0.2 to 0.07)
    b. 4 training configurations (5,000 games each): 3p vs 2 GA, 4p vs 3 GA, 3p vs GA + self-play copy, 4p vs 2 GA + self-play copy
-   c. Record state features at each decision point for player 0 (the DQN agent)
+   c. Record `(state_features, TD_target, final_score)` tuples at each decision point for player 0 (the DQN agent)
    d. Compute TD(lambda=0.8) targets: `G_t = (1-0.8) * V(s_{t+1}) + 0.8 * G_{t+1}`, with `G_{n-1} = final_score`
    e. Add new samples to a replay buffer (last 3 iterations retained, VecDeque)
    f. Retrain for 10 epochs on the full replay buffer (Adam lr=4e-4, batch 1024)
    g. Optionally benchmark against GA each iteration (`--bench N`)
    h. Save per-iteration checkpoint (iter-N.mpk)
+
+**Decoupled loss (mu + sigma)**: The joint loss is `L = L_mu + alpha * L_sigma` with `alpha = 1.0` (see `SIGMA_LOSS_WEIGHT`).
+- `L_mu = mean((G_t - mu)^2)` — MSE on the TD(lambda) target.
+- `L_sigma = 0.5 * mean(log_var + (final_score - mu.detach())^2 * exp(-log_var))` — Gaussian NLL against the **final-score residual** (not the TD target). `mu.detach()` prevents sigma's gradient from corrupting mu training. Training sigma against TD residuals was tried first and failed (corr = -0.44 vs empirical MC sigma), because G_t has lower variance than the true final-score distribution; training against final-score residuals gives an unbiased estimator (corr = +0.91, see `examples/sigma_validation.rs`).
 
 **Data augmentation**: The batcher randomly swaps symmetric row features (3 independent swaps, 8 permutations): red↔yellow, green↔blue, ascending↔descending pairs.
 
@@ -262,7 +282,7 @@ The rollout policy is pluggable via `RolloutFactory = Arc<dyn Fn() -> Box<dyn St
 
 **Training infrastructure**: Self-play games are parallelized with rayon. Models are pre-cloned (Arc-backed NdArray tensors make cloning cheap) instead of saving/loading from disk. LTO and `target-cpu=native` enabled for release builds.
 
-**Key finding**: Win rate peaks around iteration 9-10 (~58.8%) then declines while avg score keeps climbing (~65). The model optimizes for score (TD target = final game score), not win rate. Early stopping at the win-rate peak produces the best competitive model.
+**Key finding**: With P(win) ranking and 25-feature inputs, win rate peaks at **60.3% vs GA** around iterations 4-15 and then plateaus while avg score keeps climbing. The upper ceiling is structural — empirical Monte Carlo rollouts confirm that within-decision sigma variation across candidates is typically only 4-5%, so the P(win) ranker degenerates to argmax-mu at most decisions. Early stopping at the win-rate peak still produces the best checkpoint.
 
 ---
 

@@ -526,3 +526,86 @@ DQN at iteration 9 (~58.8% vs GA, 99% CI: 58.5-59.1%)
 ```
 
 The DQN's advantage over GA comes primarily from meta-rules (smart lock/strike) rather than neural net evaluation.
+
+---
+
+## Phase 11: Variance-Aware Ranking (P(win) Formula)
+
+Motivation: the score-maximizing DQN plateaus at ~58.8% vs GA even though it clearly beats GA on expected points. Hypothesis: `argmax μ(s')` is the wrong objective when you're behind — you want to *maximize the probability of finishing ahead*, which under a Gaussian approximation is monotonic in `(μ_us − μ_opp) / √(σ²_us + σ²_opp)`. This requires the net to predict σ as well as μ.
+
+### Two-head model: μ + log σ²
+
+Changed the output layer from `Linear(1)` to `Linear(2)`: first scalar is `μ`, second is `log σ²`. Clamped `log σ²` to `[-5.0, 10.0]` at inference.
+
+Initial joint Gaussian NLL loss: `L = 0.5 * (log σ² + (G_t − μ)² / σ²)`. Trained end-to-end. Benchmark vs GA: no improvement, sometimes worse. Investigation followed.
+
+### Why σ was wrong: TD target ≠ final-score distribution
+
+Ran `examples/sigma_validation.rs` — for each decision in real games, compare DQN's `(μ, σ)` to empirical `(μ, σ)` from 10k Monte Carlo rollouts from the post-move state.
+
+Result: **Pearson correlation(DQN σ, empirical σ) = −0.44**. The variance head was *anti-correlated* with truth.
+
+Root cause: we were training σ against `(G_t − μ)²`, where `G_t` is the TD(λ=0.8) target. G_t is a smoothed estimate of expected return; it has systematically *lower variance* than the actual final-score distribution because TD smoothing averages across the tail of the trajectory. Training σ on G_t residuals gives a biased estimator of `Var(X_final | s)`.
+
+### Fix: decoupled losses with final-score residuals
+
+Split the loss:
+- `L_μ = mean((G_t − μ)²)` — MSE on the TD target, unchanged.
+- `L_σ = 0.5 * mean(log σ² + (final_score − μ.detach())² * exp(−log σ²))` — Gaussian NLL against **actual final-score residual**. `μ.detach()` critical: without it, σ's gradient corrupts μ training (raising μ reduces `L_σ` if σ is under-predicting).
+
+Total: `L = L_μ + α * L_σ` with `α = 1.0`.
+
+Re-validated: **Pearson(DQN σ, empirical σ) = +0.91**, DQN median σ = 20.6 vs empirical 19.8. The variance head now tracks empirical truth.
+
+### P(win) ranking at decision time
+
+`win_rank_score(μ_us, log_σ²_us, μ_opp, log_σ²_opp) = (μ_us − μ_opp) / √(σ²_us + σ²_opp)`.
+
+Requires the opponent's μ/σ from a forward pass on the leading opponent's actual state. Batched efficiently: all our candidates + all their corresponding opp-views are packed into a single `2N`-row forward call per decision. A `rank_candidates_with_opp_context` helper in `dqn/mod.rs` does this.
+
+### Per-candidate opponent context
+
+Initial bug: we computed opp's features once per decision (using `self.context` captured in `observe_opponents`), but opp's context depends on our post-move state — `score_gap_to_leader`, `max_opp_strikes`, `max_opp_locks`, and `max_opp_total_progress` all change when we take different candidate moves. Fix: rebuild opp's `OpponentContext` per candidate via `build_opponent_context_for(opp_score, post_our_state, non_leader_states)`. Same fix applied to our own features (the pre-move our_score was being used against the post-move state).
+
+### New game-end-proximity features (21 → 25)
+
+While investigating σ, realized the network had no direct signal for how much game remains. Added four features, all normalized to `[0, 1]`:
+- `max_player_strikes / 3` (our strikes vs opp strikes, whichever is higher)
+- `max_player_locks` (capped at 1, since 2 ends the game)
+- `max_player_total_progress` (sum of row-progress across 4 rows, max across players)
+- `aggregate_weighted_probability` (across all usable dice sums)
+- `total_lockable_rows / 8`
+
+Replaced the old `max_opponent_strikes` feature with the symmetric "max across all players" version; split `score_gap` position slightly. Final count: **25 features**.
+
+### Score-distribution normality check
+
+Before committing to Gaussian P(win), ran `examples/score_distribution.rs`: rolls out 20,000 trajectories from a single mid-game snapshot. The resulting final-score distribution has skew +0.04, excess kurtosis −0.34 — well within "Normal enough" for the `Φ(...)` approximation.
+
+### Results
+
+| Change | Peak winrate vs GA |
+|--------|--------------------|
+| Baseline (21-feature, argmax μ) | 58.8% |
+| 21-feature + P(win) + joint NLL | ~55-57% (σ anti-correlated) |
+| 25-feature + P(win) + decoupled μ/σ loss | ~59.9% |
+| + per-candidate opp context re-inference | **60.3%** |
+
+Peak achieved at iterations 4-15 with warm-start from a prior self-play checkpoint. Winrate plateaus at ~59.7-60.0% from iteration 5 onward while avg score climbs from 63.4 → 68.9.
+
+### Why the gain is small (and probably near the ceiling)
+
+Empirical diagnostics from `sigma_validation`:
+- Median σ is ~20 points across decisions.
+- **Within-decision σ spread** (std of σ across candidates at the same decision) has coefficient of variation ~4-5%.
+
+That means at most decisions, `√(σ²_us + σ²_opp)` is approximately constant across candidates, so the P(win) ranker reduces to `argmax(μ_us − μ_opp)` which is argmax-μ up to a shift. The formula only matters at decisions where candidates differ meaningfully in risk — and those are rare in Qwixx because the shared-dice structure means your remaining score is dominated by *how long the game continues*, which is the same across your candidates.
+
+Qwixx's structural ceiling against a well-tuned GA is probably in the 60-62% range; squeezing further would likely require fundamentally different approaches (e.g., search at decision time).
+
+### Diagnostic tools retained
+
+- `examples/sigma_probe.rs` — prints per-candidate `(μ, σ)` at every decision of a single game.
+- `examples/sigma_validation.rs` — batched MC rollouts from real-game decisions, compares DQN (μ, σ) to empirical (μ, σ); writes CSV.
+- `examples/score_distribution.rs` — dumps the final-score distribution from a fixed snapshot.
+- `scripts/sigma_validation_plots.py` — produces μ/σ scatter and σ-vs-turn plots from the CSV.
