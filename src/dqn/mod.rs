@@ -85,7 +85,7 @@ pub fn lockable_rows(state: &State) -> u8 {
 /// whose first opponent is `first_opp` plus any `extra_opps`. Used by
 /// `observe_opponents` (viewing opponents from the DqnStrategy's perspective)
 /// and by `leader_prediction` (viewing opponents from the leader's perspective).
-pub(crate) fn build_opponent_context_for(
+pub fn build_opponent_context_for(
     our_score: isize,
     first_opp: &State,
     extra_opps: &[State],
