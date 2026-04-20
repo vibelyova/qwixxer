@@ -118,6 +118,86 @@ pub fn build_opponent_context_for(
     }
 }
 
+/// Run the model on a batch of feature vectors in a single forward pass.
+/// Returns `(mean, log_var)` per input.
+pub fn batch_forward_features(
+    model: &QwixxModel<MyBackend>,
+    device: &burn::backend::ndarray::NdArrayDevice,
+    features_list: &[[f32; NUM_FEATURES]],
+) -> Vec<(f32, f32)> {
+    if features_list.is_empty() {
+        return Vec::new();
+    }
+    let n = features_list.len();
+    let flat: Vec<f32> = features_list.iter().flat_map(|f| f.iter().copied()).collect();
+    let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), device)
+        .reshape([n, NUM_FEATURES]);
+    let output = model.forward(input);
+    let values = output.into_data().to_vec::<f32>().unwrap();
+    (0..n).map(|i| (values[2 * i], values[2 * i + 1])).collect()
+}
+
+/// Rank candidate post-move states by `win_rank_score`, rebuilding *both*
+/// `OpponentContext`s per candidate — our own view (score_gap reflects our
+/// post-move score) and the leader's view (their gap reflects our post-move
+/// score). Batches all 2N feature vectors (N candidates + N opp views) into
+/// a single forward pass. Returns one rank score per candidate.
+///
+/// If there is no leader (single-player edge case), ranks by μ only using a
+/// default opponent context.
+pub fn rank_candidates_with_opp_context(
+    model: &QwixxModel<MyBackend>,
+    device: &burn::backend::ndarray::NdArrayDevice,
+    leader_state: Option<&State>,
+    non_leader_states: &[State],
+    our_post_states: &[State],
+) -> Vec<f32> {
+    let Some(leader) = leader_state else {
+        let default_ctx = OpponentContext::default();
+        let feats: Vec<[f32; NUM_FEATURES]> = our_post_states
+            .iter()
+            .map(|s| state_features(s, &default_ctx))
+            .collect();
+        return batch_forward_features(model, device, &feats)
+            .into_iter()
+            .map(|(mean, _)| mean)
+            .collect();
+    };
+
+    // Interleave [our_0, opp_0, our_1, opp_1, ...] so extraction is
+    // `values[2i] = our, values[2i+1] = opp`.
+    let mut features_list = Vec::with_capacity(our_post_states.len() * 2);
+    for post_our in our_post_states {
+        // Our context reflects post-move score (only field that actually
+        // moves per candidate — other fields depend on opponents' states
+        // which don't change during our move).
+        let our_ctx = build_opponent_context_for(
+            post_our.count_points(),
+            leader,
+            non_leader_states,
+        );
+        features_list.push(state_features(post_our, &our_ctx));
+
+        // Leader's context reflects us having moved (our score, strikes,
+        // locks, progress, lockable-row count all feed into their view).
+        let opp_ctx = build_opponent_context_for(
+            leader.count_points(),
+            post_our,
+            non_leader_states,
+        );
+        features_list.push(state_features(leader, &opp_ctx));
+    }
+    let values = batch_forward_features(model, device, &features_list);
+
+    (0..our_post_states.len())
+        .map(|i| {
+            let (mean, log_var) = values[2 * i];
+            let (opp_mean, opp_log_var) = values[2 * i + 1];
+            win_rank_score(mean, log_var, opp_mean, opp_log_var)
+        })
+        .collect()
+}
+
 /// Aggregate weighted-probability: for each possible white-dice sum, weight by
 /// P(rolling that sum) and the max (total+1)/11 across rows that could use it.
 /// Avoids the per-row double-counting when multiple rows share a free pointer.
@@ -370,29 +450,6 @@ impl DqnStrategy {
         self.model.evaluate_state(&features, &self.device)
     }
 
-    /// Run V on the stored leader's state, building the leader's own
-    /// `OpponentContext` from `our_state` plus the stored non-leader states.
-    /// Returns `(0.0, 0.0)` if there is no leader.
-    fn leader_prediction(&mut self, our_state: &State) -> (f32, f32) {
-        let Some(leader) = self.leader_state else {
-            return (0.0, 0.0);
-        };
-        // Leader's "opponents" are us + the non-leader opponents.
-        let leader_ctx = build_opponent_context_for(
-            leader.count_points(),
-            our_state,
-            &self.non_leader_states,
-        );
-        let features = state_features(&leader, &leader_ctx);
-        let key = Self::features_key(&features);
-        if let Some(&cached) = self.cache.get(&key) {
-            return cached;
-        }
-        let value = self.model.evaluate_state(&features, &self.device);
-        self.cache.insert(key, value);
-        value
-    }
-
     fn features_key(features: &[f32; NUM_FEATURES]) -> [u32; NUM_FEATURES] {
         let mut key = [0u32; NUM_FEATURES];
         for i in 0..NUM_FEATURES {
@@ -413,48 +470,6 @@ impl DqnStrategy {
         value
     }
 
-    /// Batch evaluate multiple states at once — single forward pass.
-    /// Returns `(mean, log_var)` per state.
-    fn evaluate_batch(&mut self, states: &[State]) -> Vec<(f32, f32)> {
-        if states.is_empty() {
-            return Vec::new();
-        }
-
-        let mut results = vec![(0.0f32, 0.0f32); states.len()];
-        let mut uncached_indices = Vec::new();
-        let mut uncached_features = Vec::new();
-
-        // Check cache first
-        for (i, state) in states.iter().enumerate() {
-            let features = state_features(state, &self.context);
-            let key = Self::features_key(&features);
-            if let Some(&cached) = self.cache.get(&key) {
-                results[i] = cached;
-            } else {
-                uncached_indices.push(i);
-                uncached_features.push(features);
-            }
-        }
-
-        // Batch forward pass for uncached states — output shape [n, 2], row = [mean, log_var].
-        if !uncached_features.is_empty() {
-            let n = uncached_features.len();
-            let flat: Vec<f32> = uncached_features.iter().flat_map(|f| f.iter().copied()).collect();
-            let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), &self.device)
-                .reshape([n, NUM_FEATURES]);
-            let output = self.model.forward(input);
-            let values = output.into_data().to_vec::<f32>().unwrap();
-
-            for (j, &idx) in uncached_indices.iter().enumerate() {
-                let pair = (values[j * 2], values[j * 2 + 1]);
-                results[idx] = pair;
-                let key = Self::features_key(&uncached_features[j]);
-                self.cache.insert(key, pair);
-            }
-        }
-
-        results
-    }
 }
 
 impl Strategy for DqnStrategy {
@@ -465,10 +480,7 @@ impl Strategy for DqnStrategy {
             MetaDecision::Choices(moves) => moves,
         };
 
-        // Evaluate V on the leading opponent's actual state first, then rank
-        // candidate post-move states by the full P(win) formula.
-        let (opp_mean, opp_log_var) = self.leader_prediction(state);
-        let result_states: Vec<State> = moves
+        let our_post_states: Vec<State> = moves
             .iter()
             .map(|&mov| {
                 let mut s = *state;
@@ -476,16 +488,21 @@ impl Strategy for DqnStrategy {
                 s
             })
             .collect();
-        let values = self.evaluate_batch(&result_states);
 
+        // Per-candidate opp-context re-inference: opp's view of the game depends
+        // on OUR post-move state (score_gap, max_opp_strikes), so each candidate
+        // gets its own opp evaluation, batched with ours in one forward pass.
+        let ranks = rank_candidates_with_opp_context(
+            &self.model,
+            &self.device,
+            self.leader_state.as_ref(),
+            &self.non_leader_states,
+            &our_post_states,
+        );
         moves
             .into_iter()
             .enumerate()
-            .max_by(|(i, _), (j, _)| {
-                let a = win_rank_score(values[*i].0, values[*i].1, opp_mean, opp_log_var);
-                let b = win_rank_score(values[*j].0, values[*j].1, opp_mean, opp_log_var);
-                a.partial_cmp(&b).unwrap()
-            })
+            .max_by(|(i, _), (j, _)| ranks[*i].partial_cmp(&ranks[*j]).unwrap())
             .unwrap()
             .1
     }
@@ -501,7 +518,8 @@ impl Strategy for DqnStrategy {
             return None;
         }
 
-        let (opp_mean, opp_log_var) = self.leader_prediction(state);
+        // Evaluate all mark candidates + the skip state. Opp context is re-
+        // inferred per candidate because our post-mark score changes their gap.
         let mut eval_states: Vec<State> = moves
             .iter()
             .map(|&mov| {
@@ -515,15 +533,18 @@ impl Strategy for DqnStrategy {
         skip_state.lock(locked);
         eval_states.push(skip_state);
 
-        let values = self.evaluate_batch(&eval_states);
-
-        let skip = values.last().unwrap();
-        let skip_rank = win_rank_score(skip.0, skip.1, opp_mean, opp_log_var);
-
-        let (best_idx, best_rank) = values[..moves.len()]
+        let ranks = rank_candidates_with_opp_context(
+            &self.model,
+            &self.device,
+            self.leader_state.as_ref(),
+            &self.non_leader_states,
+            &eval_states,
+        );
+        let skip_rank = *ranks.last().unwrap();
+        let (best_idx, best_rank) = ranks[..moves.len()]
             .iter()
+            .copied()
             .enumerate()
-            .map(|(i, v)| (i, win_rank_score(v.0, v.1, opp_mean, opp_log_var)))
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap();
 

@@ -5,9 +5,9 @@
 
 use crate::bot::{self, DNA};
 use crate::dqn::{
-    build_opponent_context_for, state_features, win_rank_score, DqnStrategy, MyBackend,
-    OpponentContext, QwixxModel, QwixxModelConfig, LOG_VAR_MAX, LOG_VAR_MIN, NUM_FEATURES,
-    TRAIN_SEED,
+    build_opponent_context_for, rank_candidates_with_opp_context, state_features, DqnStrategy,
+    MyBackend, OpponentContext, QwixxModel, QwixxModelConfig, LOG_VAR_MAX, LOG_VAR_MIN,
+    NUM_FEATURES, TRAIN_SEED,
 };
 use crate::mcts::MonteCarlo;
 use crate::state::{Move, State};
@@ -368,18 +368,16 @@ struct RecordingDqn {
 }
 
 impl RecordingDqn {
-    /// Run V on the stored leader's state (no cache — per-game, few turns).
-    fn leader_prediction(&self, our_state: &State) -> (f32, f32) {
-        let Some(leader) = self.leader_state else {
-            return (0.0, 0.0);
-        };
-        let leader_ctx = build_opponent_context_for(
-            leader.count_points(),
-            our_state,
+    /// Rank candidate post-move states by win probability with per-candidate
+    /// opp context, matching `DqnStrategy::your_move`.
+    fn rank(&self, our_post_states: &[State]) -> Vec<f32> {
+        rank_candidates_with_opp_context(
+            &self.model,
+            &self.device,
+            self.leader_state.as_ref(),
             &self.non_leader_states,
-        );
-        let features = state_features(&leader, &leader_ctx);
-        self.model.evaluate_state(&features, &self.device)
+            our_post_states,
+        )
     }
 }
 
@@ -398,24 +396,19 @@ impl Strategy for RecordingDqn {
                 if self.rng.gen::<f32>() < self.epsilon {
                     moves[self.rng.gen_range(0..moves.len())]
                 } else {
-                    let (opp_mean, opp_log_var) = self.leader_prediction(state);
-                    let features_list: Vec<[f32; NUM_FEATURES]> = moves
+                    let post_states: Vec<State> = moves
                         .iter()
                         .map(|&m| {
                             let mut s = *state;
                             s.apply_move(m);
-                            state_features(&s, &self.context)
+                            s
                         })
                         .collect();
-                    let values = batch_eval_features(&self.model, &self.device, &features_list);
-                    let best = values
+                    let ranks = self.rank(&post_states);
+                    let best = ranks
                         .iter()
                         .enumerate()
-                        .max_by(|(_, a), (_, b)| {
-                            win_rank_score(a.0, a.1, opp_mean, opp_log_var)
-                                .partial_cmp(&win_rank_score(b.0, b.1, opp_mean, opp_log_var))
-                                .unwrap()
-                        })
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
                         .unwrap()
                         .0;
                     moves[best]
@@ -446,34 +439,32 @@ impl Strategy for RecordingDqn {
             return None;
         }
 
-        let (opp_mean, opp_log_var) = self.leader_prediction(state);
-        let mut features_list: Vec<[f32; NUM_FEATURES]> = moves
+        let mut post_states: Vec<State> = moves
             .iter()
             .map(|&m| {
                 let mut s = *state;
                 s.apply_move(m);
                 s.lock(locked);
-                state_features(&s, &self.context)
+                s
             })
             .collect();
         let mut skip_state = *state;
         skip_state.lock(locked);
-        features_list.push(state_features(&skip_state, &self.context));
+        post_states.push(skip_state);
 
-        let values = batch_eval_features(&self.model, &self.device, &features_list);
-        let skip = values.last().unwrap();
-        let skip_rank = win_rank_score(skip.0, skip.1, opp_mean, opp_log_var);
-
-        let (best_idx, best_rank) = values[..moves.len()]
+        let ranks = self.rank(&post_states);
+        let skip_rank = *ranks.last().unwrap();
+        let (best_idx, best_rank) = ranks[..moves.len()]
             .iter()
+            .copied()
             .enumerate()
-            .map(|(i, v)| (i, win_rank_score(v.0, v.1, opp_mean, opp_log_var)))
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap();
 
         if best_rank > skip_rank {
             // Only record when we actually mark — matches prior behavior.
-            self.recorded.borrow_mut().push(features_list[best_idx]);
+            let features = state_features(&post_states[best_idx], &self.context);
+            self.recorded.borrow_mut().push(features);
             Some(moves[best_idx])
         } else {
             None
