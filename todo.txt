@@ -1,0 +1,39 @@
+- [x] add a lot of unit tests
+- clean up
+    - [x] remove blanks strategies
+    - [x] add gitignore
+    - [x] remove csv and other files that should not be committed
+    - re-organize code neatly into correct modules
+- overhaul web UI/UX
+    - fork me on github ribbon
+    - dice with dots instead of numbers
+    - remove dice after row locking
+    - make it more obvious whose turn it is
+    - make it more obvious what the bot did on your/its turn
+    - state explorer can have unreachable states
+    - add reset button to state explorer and game
+    - make game not reset on page reload
+    - add animations
+    - try rust frontend
+- profile with flamegraph to improve performance
+- implement elo-like ranking system for bots
+    - maybe implement elo tracking for players too
+- [x] improve hand crafted bots like conservative
+- account for being able to lock in weighted probability input (2/12 not always markable)
+- add mcts to web ui
+    - mcts can be a checkbox that works with any strategy
+    - we just need to feature-gate rayon within it
+- try shinking the model back to e.g. 64/32
+- input idea: probability of a strike on next turn (maybe weighted somehow)
+- input idea: probability of an opponent locking?
+- one more pruning: different rows, same total in rows, same row direction - less blanks dominates
+    and maybe fix the existing rule to only apply for rows in same direction too
+
+- try only self-play, without GA (to remove training bias)
+- try relaxing locking rules now that we have p(win)
+- try shallow mcts rollouts on top
+- try intermittent rewards with non-1 gamma
+- try somehow estimating correlation to factor in the covariance in p(win) estimation
+
+- analyze and try to fix non-symmetrical or anti-symmetrical decisions / states
+- fix the misinterpretation of the rules
