@@ -237,20 +237,45 @@ impl WebGame {
         self.bot_state.lock(locked);
     }
 
-    /// Execute the bot's active turn: roll dice, pick a move.
+    /// Execute the bot's active turn: roll dice, two-phase mark.
     fn do_bot_active(&mut self) {
         self.dice = roll_dice(&mut self.rng);
         self.white_sum = self.dice[0] + self.dice[1];
 
-        self.bot_strategy.observe_opponents(
-            self.bot_state.count_points(),
-            &[self.player_state],
-        );
-        let mov = self.bot_strategy.your_move(&self.bot_state, self.dice);
-        record_marks(&mut self.bot_marks, mov);
-        self.bot_state.apply_move(mov);
+        let opp_states = &[self.player_state];
 
-        self.message = format!("Bot played: {}", describe_move(&mov));
+        // Phase 1: white dice sum
+        let phase1 = self.bot_strategy.active_phase1(&self.bot_state, opp_states, self.dice);
+        let has_marked = phase1.is_some();
+        if let Some(mark) = phase1 {
+            record_marks(&mut self.bot_marks, Move::Single(mark));
+            self.bot_state.apply_mark(mark);
+        }
+
+        // Phase 2: white + color dice
+        let phase2 = self.bot_strategy.active_phase2(&self.bot_state, opp_states, self.dice, has_marked);
+        if let Some(mark) = phase2 {
+            record_marks(&mut self.bot_marks, Move::Single(mark));
+            self.bot_state.apply_mark(mark);
+        } else if !has_marked {
+            // No mark in either phase — strike
+            record_marks(&mut self.bot_marks, Move::Strike);
+            self.bot_state.apply_strike();
+        }
+
+        // Build message describing what the bot did
+        let msg = match (phase1, phase2) {
+            (Some(m1), Some(m2)) => format!(
+                "Bot marked: {} {} + {} {}",
+                ROW_NAMES[m1.row], m1.number, ROW_NAMES[m2.row], m2.number
+            ),
+            (Some(m), None) | (None, Some(m)) => format!(
+                "Bot marked: {} {}",
+                ROW_NAMES[m.row], m.number
+            ),
+            (None, None) => "Bot took a strike.".to_string(),
+        };
+        self.message = msg;
 
         // DON'T propagate locks yet — player gets their passive move first.
         self.phase = Phase::PlayerPassive;
@@ -267,17 +292,15 @@ impl WebGame {
     /// Execute the bot's passive turn (during player's active turn).
     fn do_bot_passive(&mut self) {
         let locked = self.player_state.locked();
-        self.bot_strategy.observe_opponents(
-            self.bot_state.count_points(),
-            &[self.player_state],
-        );
-        let bot_mov =
-            self.bot_strategy
-                .opponents_move(&self.bot_state, self.white_sum, locked);
-        if let Some(mov) = bot_mov {
-            record_marks(&mut self.bot_marks, mov);
-            self.bot_state.apply_move(mov);
+
+        let opp_states = &[self.player_state];
+        // active_player_idx = 0: the human is at index 0 in opp_states from bot's perspective
+        let bot_mark = self.bot_strategy.passive_phase1(&self.bot_state, opp_states, self.dice, 0);
+        if let Some(mark) = bot_mark {
+            record_marks(&mut self.bot_marks, Move::Single(mark));
+            self.bot_state.apply_mark(mark);
         }
+
         // Apply any locks from player's active turn to bot
         self.bot_state.lock(locked);
 

@@ -8,10 +8,10 @@
 use qwixxer::bot::{self, DNA};
 use qwixxer::dqn::{
     build_opponent_context_for, state_features, win_rank_score, MyBackend, OpponentContext,
-    QwixxModel, QwixxModelConfig, NUM_FEATURES,
+    QwixxModel, QwixxModelConfig,
 };
 use qwixxer::game::{Game, Player};
-use qwixxer::state::{MetaDecision, Move, State};
+use qwixxer::state::{Mark, State};
 use qwixxer::strategy::Strategy;
 use burn::module::Module;
 use burn::record::CompactRecorder;
@@ -30,9 +30,6 @@ type Log = Rc<RefCell<BufWriter<File>>>;
 struct ProbeDqn {
     model: QwixxModel<MyBackend>,
     device: burn::backend::ndarray::NdArrayDevice,
-    context: OpponentContext,
-    leader_state: Option<State>,
-    non_leader_states: Vec<State>,
     log: Log,
     game_idx: usize,
     turn: u32,
@@ -45,14 +42,33 @@ impl std::fmt::Debug for ProbeDqn {
 }
 
 impl ProbeDqn {
-    fn leader_prediction(&self, our_state: &State) -> (f32, f32) {
-        let Some(leader) = self.leader_state else {
+    /// Build opponent context from opp_states for our score.
+    fn build_context(our_score: isize, opp_states: &[State]) -> (OpponentContext, Option<State>, Vec<State>) {
+        if opp_states.is_empty() {
+            return (OpponentContext::default(), None, Vec::new());
+        }
+        let leader_idx = (0..opp_states.len())
+            .max_by_key(|&i| opp_states[i].count_points())
+            .unwrap();
+        let leader = opp_states[leader_idx];
+        let non_leader: Vec<State> = opp_states
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != leader_idx)
+            .map(|(_, s)| *s)
+            .collect();
+        let context = build_opponent_context_for(our_score, &leader, &non_leader);
+        (context, Some(leader), non_leader)
+    }
+
+    fn leader_prediction(&self, our_state: &State, leader_state: Option<State>, non_leader_states: &[State]) -> (f32, f32) {
+        let Some(leader) = leader_state else {
             return (0.0, 0.0);
         };
         let leader_ctx = build_opponent_context_for(
             leader.count_points(),
             our_state,
-            &self.non_leader_states,
+            non_leader_states,
         );
         let features = state_features(&leader, &leader_ctx);
         self.model.evaluate_state(&features, &self.device)
@@ -97,43 +113,39 @@ impl ProbeDqn {
 }
 
 impl Strategy for ProbeDqn {
-    fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
+    fn active_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
         let our_score = state.count_points();
-        let opp_score = our_score - self.context.score_gap_to_leader;
+        let (context, leader_state, non_leader_states) = Self::build_context(our_score, opp_states);
+        let opp_score = our_score - context.score_gap_to_leader;
 
-        let moves = match state.apply_meta_rules(dice, self.context.score_gap_to_leader) {
-            MetaDecision::Forced(mov) => {
-                // Still log a single-candidate row for forced moves so the CSV is complete.
-                let (opp_mean, opp_log_var) = self.leader_prediction(state);
-                let mut s = *state;
-                s.apply_move(mov);
-                let features = state_features(&s, &self.context);
-                let (mean, log_var) = self.model.evaluate_state(&features, &self.device);
-                let rank = win_rank_score(mean, log_var, opp_mean, opp_log_var);
-                self.log_candidate(
-                    "active_forced", 1, 0, mean, log_var, rank, true, our_score, opp_score,
-                    opp_mean, opp_log_var,
-                );
-                self.turn += 1;
-                return mov;
-            }
-            MetaDecision::Choices(moves) => moves,
-        };
+        let white_sum = dice[0] + dice[1];
+        let marks = state.generate_white_moves(white_sum);
 
-        let (opp_mean, opp_log_var) = self.leader_prediction(state);
+        if marks.is_empty() {
+            self.turn += 1;
+            return None;
+        }
 
-        let per: Vec<(usize, Move, f32, f32, f32)> = moves
+        let (opp_mean, opp_log_var) = self.leader_prediction(state, leader_state, &non_leader_states);
+
+        // Evaluate each white mark + skip
+        let mut per: Vec<(usize, Option<Mark>, f32, f32, f32)> = marks
             .iter()
             .enumerate()
             .map(|(i, &m)| {
                 let mut s = *state;
-                s.apply_move(m);
-                let features = state_features(&s, &self.context);
+                s.apply_mark(m);
+                let features = state_features(&s, &context);
                 let (mean, log_var) = self.model.evaluate_state(&features, &self.device);
                 let rank = win_rank_score(mean, log_var, opp_mean, opp_log_var);
-                (i, m, mean, log_var, rank)
+                (i, Some(m), mean, log_var, rank)
             })
             .collect();
+        // skip option
+        let skip_features = state_features(state, &context);
+        let (skip_mean, skip_log_var) = self.model.evaluate_state(&skip_features, &self.device);
+        let skip_rank = win_rank_score(skip_mean, skip_log_var, opp_mean, opp_log_var);
+        per.push((marks.len(), None, skip_mean, skip_log_var, skip_rank));
 
         let chosen_idx = per
             .iter()
@@ -143,7 +155,73 @@ impl Strategy for ProbeDqn {
 
         for (i, _m, mean, log_var, rank) in &per {
             self.log_candidate(
-                "active",
+                "active_phase1",
+                per.len(),
+                *i,
+                *mean,
+                *log_var,
+                *rank,
+                *i == chosen_idx,
+                our_score,
+                opp_score,
+                opp_mean,
+                opp_log_var,
+            );
+        }
+
+        per[chosen_idx].1
+    }
+
+    fn active_phase2(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Option<Mark> {
+        let our_score = state.count_points();
+        let (context, leader_state, non_leader_states) = Self::build_context(our_score, opp_states);
+        let opp_score = our_score - context.score_gap_to_leader;
+
+        let marks = state.generate_color_moves(dice);
+
+        if marks.is_empty() {
+            self.turn += 1;
+            return None;
+        }
+
+        let (opp_mean, opp_log_var) = self.leader_prediction(state, leader_state, &non_leader_states);
+
+        // The "no mark" state is a strike if we haven't marked yet in phase1
+        let no_mark_state = if has_marked {
+            *state
+        } else {
+            let mut s = *state;
+            s.apply_strike();
+            s
+        };
+
+        let mut per: Vec<(usize, Option<Mark>, f32, f32, f32)> = marks
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| {
+                let mut s = *state;
+                s.apply_mark(m);
+                let features = state_features(&s, &context);
+                let (mean, log_var) = self.model.evaluate_state(&features, &self.device);
+                let rank = win_rank_score(mean, log_var, opp_mean, opp_log_var);
+                (i, Some(m), mean, log_var, rank)
+            })
+            .collect();
+        // skip/strike option
+        let skip_features = state_features(&no_mark_state, &context);
+        let (skip_mean, skip_log_var) = self.model.evaluate_state(&skip_features, &self.device);
+        let skip_rank = win_rank_score(skip_mean, skip_log_var, opp_mean, opp_log_var);
+        per.push((marks.len(), None, skip_mean, skip_log_var, skip_rank));
+
+        let chosen_idx = per
+            .iter()
+            .max_by(|a, b| a.4.partial_cmp(&b.4).unwrap())
+            .unwrap()
+            .0;
+
+        for (i, _m, mean, log_var, rank) in &per {
+            self.log_candidate(
+                "active_phase2",
                 per.len(),
                 *i,
                 *mean,
@@ -157,64 +235,41 @@ impl Strategy for ProbeDqn {
             );
         }
         self.turn += 1;
+
         per[chosen_idx].1
     }
 
-    fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
+    fn passive_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], _active_player: usize) -> Option<Mark> {
         let our_score = state.count_points();
-        let opp_score = our_score - self.context.score_gap_to_leader;
-        let moves = state.generate_opponent_moves(number);
+        let (context, leader_state, non_leader_states) = Self::build_context(our_score, opp_states);
+        let opp_score = our_score - context.score_gap_to_leader;
 
-        if let Some(mov) = state.find_smart_lock(&moves, self.context.score_gap_to_leader) {
-            let (opp_mean, opp_log_var) = self.leader_prediction(state);
-            let mut s = *state;
-            s.apply_move(mov);
-            s.lock(locked);
-            let features = state_features(&s, &self.context);
-            let (mean, log_var) = self.model.evaluate_state(&features, &self.device);
-            let rank = win_rank_score(mean, log_var, opp_mean, opp_log_var);
-            self.log_candidate(
-                "passive_smartlock",
-                1,
-                0,
-                mean,
-                log_var,
-                rank,
-                true,
-                our_score,
-                opp_score,
-                opp_mean,
-                opp_log_var,
-            );
-            return Some(mov);
-        }
+        let white_sum = dice[0] + dice[1];
+        let marks = state.generate_white_moves(white_sum);
 
-        if moves.is_empty() {
+        if marks.is_empty() {
             return None;
         }
 
-        let (opp_mean, opp_log_var) = self.leader_prediction(state);
+        let (opp_mean, opp_log_var) = self.leader_prediction(state, leader_state, &non_leader_states);
 
-        // Candidates + skip.
-        let mut per: Vec<(usize, Option<Move>, f32, f32, f32)> = moves
+        // Candidates + skip
+        let mut per: Vec<(usize, Option<Mark>, f32, f32, f32)> = marks
             .iter()
             .enumerate()
             .map(|(i, &m)| {
                 let mut s = *state;
-                s.apply_move(m);
-                s.lock(locked);
-                let features = state_features(&s, &self.context);
+                s.apply_mark(m);
+                let features = state_features(&s, &context);
                 let (mean, log_var) = self.model.evaluate_state(&features, &self.device);
                 let rank = win_rank_score(mean, log_var, opp_mean, opp_log_var);
                 (i, Some(m), mean, log_var, rank)
             })
             .collect();
-        let mut skip_state = *state;
-        skip_state.lock(locked);
-        let skip_features = state_features(&skip_state, &self.context);
+        let skip_features = state_features(state, &context);
         let (skip_mean, skip_log_var) = self.model.evaluate_state(&skip_features, &self.device);
         let skip_rank = win_rank_score(skip_mean, skip_log_var, opp_mean, opp_log_var);
-        per.push((moves.len(), None, skip_mean, skip_log_var, skip_rank));
+        per.push((marks.len(), None, skip_mean, skip_log_var, skip_rank));
 
         let chosen_idx = per
             .iter()
@@ -239,28 +294,6 @@ impl Strategy for ProbeDqn {
         }
 
         per[chosen_idx].1
-    }
-
-    fn observe_opponents(&mut self, our_score: isize, opponents: &[State]) {
-        if opponents.is_empty() {
-            self.context = OpponentContext::default();
-            self.leader_state = None;
-            self.non_leader_states.clear();
-            return;
-        }
-        let leader_idx = (0..opponents.len())
-            .max_by_key(|&i| opponents[i].count_points())
-            .unwrap();
-        let leader = opponents[leader_idx];
-        let non_leader: Vec<State> = opponents
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != leader_idx)
-            .map(|(_, s)| *s)
-            .collect();
-        self.context = build_opponent_context_for(our_score, &leader, &non_leader);
-        self.leader_state = Some(leader);
-        self.non_leader_states = non_leader;
     }
 }
 
@@ -288,9 +321,6 @@ fn main() {
         let probe = ProbeDqn {
             model: model.clone(),
             device: device.clone(),
-            context: OpponentContext::default(),
-            leader_state: None,
-            non_leader_states: Vec::new(),
             log: Rc::clone(&log),
             game_idx,
             turn: 0,
