@@ -437,7 +437,7 @@ pub enum MetaDecision {
 /// True if state `better` strictly dominates `worse`: no worse on any row and strictly better on one.
 /// Per row: higher total is better; among unlocked rows, free closer to start (asc) / end (desc) is better.
 /// Locked vs unlocked is incomparable (locked gains mark bonus but loses all future options).
-fn post_state_dominates(better: &State, worse: &State) -> bool {
+pub fn post_state_dominates(better: &State, worse: &State) -> bool {
     let mut any_strict = false;
     for row in 0..4 {
         let t1 = better.rows[row].total;

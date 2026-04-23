@@ -1,5 +1,24 @@
-use crate::state::{Mark, State};
+use crate::state::{post_state_dominates, Mark, State};
 use super::Bot;
+
+/// If any mark locks a row without ending the game, force it (pick highest
+/// scoring lock). Locking a first row is pure upside — no reason to skip it.
+fn find_safe_lock(state: &State, marks: &[Mark]) -> Option<Mark> {
+    marks
+        .iter()
+        .copied()
+        .filter(|&m| state.would_lock_row(m))
+        .filter(|&m| {
+            let mut s = *state;
+            s.apply_mark(m);
+            !would_end_game(&s)
+        })
+        .max_by_key(|&m| {
+            let mut s = *state;
+            s.apply_mark(m);
+            s.count_points()
+        })
+}
 
 /// Would a game end if `our_state` were the final state? Checks for 4+ strikes
 /// or 2+ locked rows. Locks are globally consistent (propagated by the game
@@ -45,6 +64,10 @@ fn passive_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice
     let marks = state.generate_white_moves(white_sum);
     if marks.is_empty() {
         return None;
+    }
+
+    if let Some(m) = find_safe_lock(state, &marks) {
+        return Some(m);
     }
 
     let mark_states: Vec<State> = marks
@@ -103,6 +126,10 @@ fn active_phase2_impl(
         return None;
     }
 
+    if let Some(m) = find_safe_lock(state, &marks) {
+        return Some(m);
+    }
+
     let mark_states: Vec<State> = marks
         .iter()
         .map(|&m| {
@@ -112,7 +139,6 @@ fn active_phase2_impl(
         })
         .collect();
 
-    // In phase2, opp_states are already post-phase1. Their score is current.
     let opp_best = opp_states
         .iter()
         .map(|s| s.count_points())
@@ -139,21 +165,63 @@ fn active_phase2_impl(
         s
     };
 
+    // Prune dominated: build full candidate list (marks + no-mark), prune,
+    // then split back. No-mark is always at the end.
     let mut candidates = mark_states;
     candidates.push(no_mark_state);
+    let keep: Vec<bool> = (0..candidates.len())
+        .map(|i| {
+            !candidates.iter().enumerate().any(|(j, s)| {
+                j != i && post_state_dominates(s, &candidates[i])
+            })
+        })
+        .collect();
+    // If no-mark got pruned, it's fine — a dominating mark exists.
+    // If all marks got pruned but no-mark survives, we skip.
+    let mut surviving_marks: Vec<Mark> = Vec::new();
+    let mut surviving_states: Vec<State> = Vec::new();
+    let mut no_mark_survived = false;
+    for (idx, &kept) in keep.iter().enumerate() {
+        if !kept { continue; }
+        if idx < marks.len() {
+            surviving_marks.push(marks[idx]);
+            surviving_states.push(candidates[idx]);
+        } else {
+            no_mark_survived = true;
+        }
+    }
+    if surviving_marks.is_empty() {
+        return None;
+    }
+    let mut candidates = surviving_states;
+    let marks = surviving_marks;
+    if no_mark_survived {
+        candidates.push(no_mark_state);
+    }
     let values = bot.evaluate_batch(&candidates, opp_states);
-    let no_mark_value = *values.last().unwrap();
-    let mark_values = &values[..marks.len()];
-    let best_idx = mark_values
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .unwrap()
-        .0;
-    if mark_values[best_idx] > no_mark_value {
-        Some(marks[best_idx])
+    if no_mark_survived {
+        let no_mark_value = *values.last().unwrap();
+        let mark_values = &values[..marks.len()];
+        let best_idx = mark_values
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap()
+            .0;
+        if mark_values[best_idx] > no_mark_value {
+            Some(marks[best_idx])
+        } else {
+            None
+        }
     } else {
-        None
+        // No-mark was dominated — a mark is strictly better. Pick the best.
+        let best_idx = values
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap()
+            .0;
+        Some(marks[best_idx])
     }
 }
 
@@ -399,7 +467,34 @@ fn active_phase1_impl(
         return Some(forced);
     }
 
-    // Evaluate all plans
+    // Force a non-game-ending lock if any surviving plan's phase1 mark locks.
+    // Check on post-phase1 state only (not full plan end-state).
+    for (phase1, _, _) in &plans {
+        if let Some(m) = phase1 {
+            if state.would_lock_row(*m) && {
+                let mut s = *state;
+                s.apply_mark(*m);
+                !would_end_game(&s)
+            } {
+                return Some(*m);
+            }
+        }
+    }
+
+    // Prune plans whose end-state is strictly dominated by another plan's.
+    {
+        let keep: Vec<bool> = (0..plans.len())
+            .map(|i| {
+                !plans.iter().enumerate().any(|(j, (_, _, s))| {
+                    j != i && post_state_dominates(s, &plans[i].2)
+                })
+            })
+            .collect();
+        let mut idx = 0;
+        plans.retain(|_| { let k = keep[idx]; idx += 1; k });
+    }
+
+    // Evaluate remaining plans
     let post_states: Vec<State> = plans.iter().map(|(_, _, s)| *s).collect();
     let values = bot.evaluate_batch(&post_states, opp_states);
 
