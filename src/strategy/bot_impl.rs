@@ -1,13 +1,53 @@
 use crate::state::{Mark, State};
 use super::Bot;
 
+/// Would a game end if `our_state` were the final state? Checks for 4+ strikes
+/// or 2+ locked rows. Locks are globally consistent (propagated by the game
+/// loop), so our state already reflects all global locks.
+fn would_end_game(our_state: &State) -> bool {
+    our_state.strikes >= 4 || our_state.count_locked() >= 2
+}
+
+/// Apply game-ending meta-rules to a list of (mark, post_state) candidates.
+///
+/// - If any candidate ends the game and guarantees a win (our score >
+///   `opp_best_score`), returns it immediately.
+/// - Removes candidates that end the game as a loss (our score < `opp_best_score`).
+///
+/// `opp_best_score` should be the worst-case (highest) opponent score —
+/// for phase1 that means their best possible post-phase1 score,
+/// for phase2 it's their current score (phase1 already applied).
+fn apply_endgame_rules(
+    marks: &[Mark],
+    candidates: &[State],
+    opp_best_score: isize,
+) -> Option<Mark> {
+    for (i, post) in candidates.iter().enumerate() {
+        if would_end_game(post) && post.count_points() > opp_best_score {
+            return Some(marks[i]);
+        }
+    }
+    None
+}
+
+fn remove_losing_endgame(
+    candidates: &[State],
+    opp_best_score: isize,
+) -> Vec<bool> {
+    candidates
+        .iter()
+        .map(|post| !(would_end_game(post) && post.count_points() < opp_best_score))
+        .collect()
+}
+
 fn passive_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
     let white_sum = dice[0] + dice[1];
     let marks = state.generate_white_moves(white_sum);
     if marks.is_empty() {
         return None;
     }
-    let mut candidates: Vec<State> = marks
+
+    let mark_states: Vec<State> = marks
         .iter()
         .map(|&m| {
             let mut s = *state;
@@ -15,6 +55,25 @@ fn passive_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice
             s
         })
         .collect();
+
+    // Opponent best score: they might also mark in phase1 (simultaneous).
+    let opp_best = opp_best_phase1_score(opp_states, white_sum);
+
+    // Force a winning game-end.
+    if let Some(m) = apply_endgame_rules(&marks, &mark_states, opp_best) {
+        return Some(m);
+    }
+
+    let keep = remove_losing_endgame(&mark_states, opp_best);
+    let marks: Vec<Mark> = marks.iter().copied().zip(keep.iter()).filter(|(_, &k)| k).map(|(m, _)| m).collect();
+    let mark_states: Vec<State> = mark_states.into_iter().zip(keep.iter()).filter(|(_, &k)| k).map(|(s, _)| s).collect();
+
+    if marks.is_empty() {
+        return None;
+    }
+
+    // Evaluate: marks + skip
+    let mut candidates = mark_states;
     candidates.push(*state); // skip
     let values = bot.evaluate_batch(&candidates, opp_states);
     let skip_value = *values.last().unwrap();
@@ -40,17 +99,11 @@ fn active_phase2_impl(
     has_marked: bool,
 ) -> Option<Mark> {
     let marks = state.generate_color_moves(dice);
-    let no_mark_state = if has_marked {
-        *state
-    } else {
-        let mut s = *state;
-        s.apply_strike();
-        s
-    };
     if marks.is_empty() {
         return None;
     }
-    let mut candidates: Vec<State> = marks
+
+    let mark_states: Vec<State> = marks
         .iter()
         .map(|&m| {
             let mut s = *state;
@@ -58,6 +111,35 @@ fn active_phase2_impl(
             s
         })
         .collect();
+
+    // In phase2, opp_states are already post-phase1. Their score is current.
+    let opp_best = opp_states
+        .iter()
+        .map(|s| s.count_points())
+        .max()
+        .unwrap_or(0);
+
+    if let Some(m) = apply_endgame_rules(&marks, &mark_states, opp_best) {
+        return Some(m);
+    }
+
+    let keep = remove_losing_endgame(&mark_states, opp_best);
+    let marks: Vec<Mark> = marks.iter().copied().zip(keep.iter()).filter(|(_, &k)| k).map(|(m, _)| m).collect();
+    let mark_states: Vec<State> = mark_states.into_iter().zip(keep.iter()).filter(|(_, &k)| k).map(|(s, _)| s).collect();
+
+    if marks.is_empty() {
+        return None;
+    }
+
+    let no_mark_state = if has_marked {
+        *state
+    } else {
+        let mut s = *state;
+        s.apply_strike();
+        s
+    };
+
+    let mut candidates = mark_states;
     candidates.push(no_mark_state);
     let values = bot.evaluate_batch(&candidates, opp_states);
     let no_mark_value = *values.last().unwrap();
@@ -73,6 +155,28 @@ fn active_phase2_impl(
     } else {
         None
     }
+}
+
+/// Best possible opponent score after phase1: each opponent picks their
+/// highest-scoring white_sum mark (or skips if no mark improves their score).
+fn opp_best_phase1_score(opp_states: &[State], white_sum: u8) -> isize {
+    opp_states
+        .iter()
+        .map(|opp| {
+            let base = opp.count_points();
+            opp.generate_white_moves(white_sum)
+                .iter()
+                .map(|&m| {
+                    let mut s = *opp;
+                    s.apply_mark(m);
+                    s.count_points()
+                })
+                .max()
+                .unwrap_or(base)
+                .max(base)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Filter plans based on Phase 1 locking risks. Only relevant when
@@ -117,32 +221,10 @@ fn filter_risky_plans(
         .collect();
 
     // LOCKED: rows already globally locked (before this turn).
-    let locked = {
-        let our = state.locked();
-        (0..4)
-            .filter(|&r| our[r] || opp_states.iter().any(|o| o.locked()[r]))
-            .count() as u8
-    };
+    // Locks are consistent across all players after propagation.
+    let locked = state.count_locked();
 
-    // Best possible opponent score after phase1: each opponent picks their
-    // highest-scoring white_sum mark (or skips if no mark improves their score).
-    let opp_best_score = opp_states
-        .iter()
-        .map(|opp| {
-            let base = opp.count_points();
-            opp.generate_white_moves(white_sum)
-                .iter()
-                .map(|&m| {
-                    let mut s = *opp;
-                    s.apply_mark(m);
-                    s.count_points()
-                })
-                .max()
-                .unwrap_or(base)
-                .max(base)
-        })
-        .max()
-        .unwrap_or(0);
+    let opp_best_score = opp_best_phase1_score(opp_states, white_sum);
 
     if locked + max_risky >= 2 {
         // Game can end in phase1 from opponent locks alone (+ already locked).
@@ -285,6 +367,31 @@ fn active_phase1_impl(
 
     if plans.is_empty() {
         return None;
+    }
+
+    // --- Meta-rules: game-ending checks ---
+    let opp_best = opp_best_phase1_score(opp_states, white_sum);
+
+    let mut best_winning_plan: Option<(usize, isize)> = None;
+    for (i, (_, _, post)) in plans.iter().enumerate() {
+        if would_end_game(post) && post.count_points() > opp_best {
+            let score = post.count_points();
+            if best_winning_plan.map_or(true, |(_, s)| score > s) {
+                best_winning_plan = Some((i, score));
+            }
+        }
+    }
+    if let Some((i, _)) = best_winning_plan {
+        return plans[i].0;
+    }
+
+    plans.retain(|(_, _, post)| {
+        !(would_end_game(post) && post.count_points() < opp_best)
+    });
+    if plans.is_empty() {
+        let mut s = *state;
+        s.apply_strike();
+        plans.push((None, None, s));
     }
 
     // RISKY/LOCKABLE filtering — only when white_sum hits a terminal number.
