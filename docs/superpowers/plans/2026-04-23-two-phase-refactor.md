@@ -4,7 +4,7 @@
 
 **Goal:** Correct the game loop to separate Phase 1 (all players may mark white sum) from Phase 2 (active player only may mark white+color), matching the physical Qwixx rules. This fixes a subtle behavioral bug: opponents' Phase 1 locks should deny the active player's Phase 2 options, and the active player should see updated opponent states before Phase 2.
 
-**Architecture:** Introduce a `Bot` trait (pure state evaluator) with a blanket `impl Strategy for Bot` that handles all two-phase move selection including the RISKY/LOCKABLE edge-case analysis. Strategies that aren't pure evaluators (Random, Interactive, MCTS, etc.) implement `Strategy` directly. The game loop collects all Phase 1 decisions simultaneously (each player sees pre-phase-1 states), applies them, propagates locks, checks for game-over, then runs Phase 2 for the active player only.
+**Architecture:** Introduce a `Bot` trait (pure state evaluator) with a blanket `impl Strategy for Bot` that handles all two-phase move selection including the RISKY/LOCKABLE edge-case analysis. GA and DQN implement `Bot`; other strategies (Random, Conservative, Opportunist, Interactive, MCTS, RecordingDqn) implement `Strategy` directly. The game loop collects all Phase 1 decisions simultaneously (each player sees pre-phase-1 states), applies them, propagates locks, checks for game-over, then runs Phase 2 for the active player only. Opponent states are passed in turn-taking order (starting from the next player after the recipient, wrapping around).
 
 **Tech Stack:** Rust, burn (DQN), rayon (parallel benchmarks/training)
 
@@ -212,8 +212,11 @@ pub trait Strategy: std::fmt::Debug {
 
     /// Phase 1 (passive player): decide whether to mark the white dice sum.
     /// Full dice are provided so strategies can reason about the active player's Phase 2 options.
+    /// `active_player` is the index (into opp_states) of the player who rolled.
+    /// `opp_states` is ordered by turn-taking: first element is next player after us, last is
+    /// the player who takes their turn right before us.
     /// Return `Some(mark)` to mark, `None` to skip (no penalty for passives).
-    fn passive_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark>;
+    fn passive_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], active_player: usize) -> Option<Mark>;
 
     fn is_interactive(&self) -> bool { false }
 }
@@ -279,7 +282,7 @@ impl<T: Bot + std::fmt::Debug> Strategy for T {
         active_phase2_impl(self, state, opp_states, dice, has_marked)
     }
 
-    fn passive_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+    fn passive_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], _active_player: usize) -> Option<Mark> {
         passive_phase1_impl(self, state, opp_states, dice)
     }
 }
@@ -299,23 +302,25 @@ fn passive_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice
         return None;
     }
 
-    // Evaluate mark candidates + skip
-    let skip_value = bot.evaluate(state, opp_states);
+    // Evaluate all candidates (mark options + skip) in one batch call
     let mut candidates: Vec<State> = marks.iter().map(|&m| {
         let mut s = *state;
         s.apply_mark(m);
         s
     }).collect();
-
+    candidates.push(*state); // skip = unchanged state
     let values = bot.evaluate_batch(&candidates, opp_states);
 
-    let best_mark_idx = values.iter()
+    let skip_value = *values.last().unwrap();
+    let mark_values = &values[..marks.len()];
+
+    let best_mark_idx = mark_values.iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
         .unwrap()
         .0;
 
-    if values[best_mark_idx] > skip_value {
+    if mark_values[best_mark_idx] > skip_value {
         Some(marks[best_mark_idx])
     } else {
         None
@@ -331,34 +336,38 @@ Generate color-mark candidates. If `has_marked`, include skip as no-penalty opti
 fn active_phase2_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Option<Mark> {
     let marks = state.generate_color_moves(dice);
 
-    // Evaluate the "no mark" baseline
+    // Build "no mark" state: unchanged if has_marked (skip is free), else strike
     let no_mark_state = if has_marked {
-        *state  // skip is free
+        *state
     } else {
         let mut s = *state;
         s.apply_strike();
-        s  // skip means strike
+        s
     };
-    let no_mark_value = bot.evaluate(&no_mark_state, opp_states);
 
     if marks.is_empty() {
         return None;
     }
 
-    let candidates: Vec<State> = marks.iter().map(|&m| {
+    // One batch: mark candidates + no-mark baseline
+    let mut candidates: Vec<State> = marks.iter().map(|&m| {
         let mut s = *state;
         s.apply_mark(m);
         s
     }).collect();
+    candidates.push(no_mark_state);
     let values = bot.evaluate_batch(&candidates, opp_states);
 
-    let best_idx = values.iter()
+    let no_mark_value = *values.last().unwrap();
+    let mark_values = &values[..marks.len()];
+
+    let best_idx = mark_values.iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
         .unwrap()
         .0;
 
-    if values[best_idx] > no_mark_value {
+    if mark_values[best_idx] > no_mark_value {
         Some(marks[best_idx])
     } else {
         None
@@ -411,26 +420,16 @@ fn generate_plans(state: &State, dice: [u8; 6]) -> Vec<(Plan, State)> {
     }
 
     // Plans: mark white in phase1 + mark color in phase2
+    // Generate color moves from the post-white state — this covers both:
+    //   (a) cross-row color marks (same as pre-white, unaffected by white mark)
+    //   (b) same-row color marks newly enabled by the white mark advancing the free pointer
     for &wm in &white_marks {
         let mut s_after_white = *state;
         s_after_white.apply_mark(wm);
-        for &cm in &color_marks {
-            // Color mark must still be valid after white mark
-            if s_after_white.can_mark(cm.row, cm.number) {
-                let mut s = s_after_white;
-                s.apply_mark(cm);
-                plans.push((Plan { phase1: Some(wm), phase2: Some(cm) }, s));
-            }
-        }
-        // Also check same-row color marks enabled by white mark
-        let post_color = s_after_white.generate_color_moves(dice);
-        for cm in post_color {
-            if cm.row == wm.row && !color_marks.contains(&cm) {
-                // This color mark was unlocked by the white mark on the same row
-                let mut s = s_after_white;
-                s.apply_mark(cm);
-                plans.push((Plan { phase1: Some(wm), phase2: Some(cm) }, s));
-            }
+        for cm in s_after_white.generate_color_moves(dice) {
+            let mut s = s_after_white;
+            s.apply_mark(cm);
+            plans.push((Plan { phase1: Some(wm), phase2: Some(cm) }, s));
         }
     }
 
@@ -519,9 +518,7 @@ fn filter_risky_plans(
 }
 ```
 
-**Important nuance from the user's design:** The `game_can_end` check is conservative — it counts the theoretical maximum new locks (all risky + all our lockable). In practice, fewer may lock. But removing phase2-dependent plans is the safe choice.
-
-A more refined version (matching the user's case tree) would check whether our lockable rows overlap with risky rows, whether we actually need to lock to trigger game-end, etc. For the initial implementation, the conservative version above is correct and simpler. It can be refined later.
+**NOTE — RISKY filtering is a first-pass placeholder.** The `game_can_end` check is deliberately over-conservative: it counts the theoretical maximum new locks (all risky + all our lockable). In practice, fewer may lock. This will be iterated on in a follow-up (along with meta-rules and move pruning). Do NOT write tests that assert specific RISKY filtering outcomes — only test the game-loop-level behaviors that are correct regardless of filtering refinements (e.g., "Phase 1 lock denies Phase 2", "game ends when 2+ rows locked").
 
 - [ ] **Step 6: Implement `active_phase1_impl` putting it all together**
 
@@ -640,8 +637,8 @@ impl Player {
         self.strategy.active_phase2(&self.state, opp_states, dice, has_marked)
     }
 
-    fn passive_phase1(&mut self, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
-        self.strategy.passive_phase1(&self.state, opp_states, dice)
+    fn passive_phase1(&mut self, opp_states: &[State], dice: [u8; 6], active_player: usize) -> Option<Mark> {
+        self.strategy.passive_phase1(&self.state, opp_states, dice, active_player)
     }
 
     fn apply_mark(&mut self, mark: Mark) {
@@ -668,19 +665,22 @@ pub fn play(&mut self) {
         // Snapshot pre-phase1 states — every player sees THIS view.
         let pre_phase1: Vec<State> = self.players.iter().map(|p| p.state).collect();
 
-        // Collect Phase 1 decisions (no state mutations yet)
+        // Collect Phase 1 decisions (no state mutations yet).
+        // opp_states are ordered by turn-taking: starting from the next
+        // player after `i`, wrapping around (so last element is the player
+        // who takes their turn right before `i`).
         let mut phase1_marks: Vec<Option<Mark>> = Vec::with_capacity(n);
         for i in 0..n {
-            let opp_states: Vec<State> = pre_phase1.iter()
-                .enumerate()
-                .filter(|(j, _)| *j != i)
-                .map(|(_, s)| *s)
+            let opp_states: Vec<State> = (1..n)
+                .map(|offset| pre_phase1[(i + offset) % n])
                 .collect();
 
             let mark = if i == active_player {
                 self.players[i].strategy.active_phase1(&pre_phase1[i], &opp_states, dice)
             } else {
-                self.players[i].strategy.passive_phase1(&pre_phase1[i], &opp_states, dice)
+                // active_player's index in the turn-ordered opp_states
+                let active_idx = ((active_player + n - i - 1) % n);
+                self.players[i].strategy.passive_phase1(&pre_phase1[i], &opp_states, dice, active_idx)
             };
             phase1_marks.push(mark);
         }
@@ -705,10 +705,9 @@ pub fn play(&mut self) {
         }
 
         // === PHASE 2: Active player only, with updated opponent states ===
-        let opp_states: Vec<State> = self.players.iter()
-            .enumerate()
-            .filter(|(i, _)| *i != active_player)
-            .map(|(_, p)| p.state)
+        // Turn-ordered: next player after active, wrapping around.
+        let opp_states: Vec<State> = (1..n)
+            .map(|offset| self.players[(active_player + offset) % n].state)
             .collect();
 
         let phase2_mark = self.players[active_player]
@@ -849,39 +848,7 @@ git commit -m "refactor: migrate GA DNA to Bot trait"
 ```rust
 impl Bot for DqnStrategy {
     fn evaluate(&self, our_state: &State, opp_states: &[State]) -> f32 {
-        if opp_states.is_empty() {
-            let ctx = OpponentContext::default();
-            let features = state_features(our_state, &ctx);
-            let (mean, _) = self.model.evaluate_state(&features, &self.device);
-            return mean;
-        }
-
-        // Find leader among opponents
-        let leader_idx = (0..opp_states.len())
-            .max_by_key(|&i| opp_states[i].count_points())
-            .unwrap();
-        let leader = &opp_states[leader_idx];
-        let non_leaders: Vec<State> = opp_states.iter()
-            .enumerate()
-            .filter(|(i, _)| *i != leader_idx)
-            .map(|(_, s)| *s)
-            .collect();
-
-        // Build our context (post-move perspective)
-        let our_ctx = build_opponent_context_for(
-            our_state.count_points(), leader, &non_leaders,
-        );
-        let our_features = state_features(our_state, &our_ctx);
-        let (us_mean, us_log_var) = self.model.evaluate_state(&our_features, &self.device);
-
-        // Build opp context (leader's perspective of us)
-        let opp_ctx = build_opponent_context_for(
-            leader.count_points(), our_state, &non_leaders,
-        );
-        let opp_features = state_features(leader, &opp_ctx);
-        let (opp_mean, opp_log_var) = self.model.evaluate_state(&opp_features, &self.device);
-
-        win_rank_score(us_mean, us_log_var, opp_mean, opp_log_var)
+        self.evaluate_batch(&[*our_state], opp_states)[0]
     }
 
     fn evaluate_batch(&self, candidates: &[State], opp_states: &[State]) -> Vec<f32> {
@@ -968,7 +935,7 @@ git commit -m "refactor: migrate DQN to Bot trait with evaluate_batch"
 **Files:**
 - Modify: `src/strategy/mod.rs`
 
-These strategies implement `Strategy` directly (not `Bot`), since they have custom move-filtering logic (blank caps) that doesn't map to a pure evaluator.
+All three implement `Strategy` directly. Conservative and Opportunist have blank-cap logic that depends on pre-move state and differs between active/passive phases, which doesn't map cleanly to a pure `Bot` evaluator.
 
 - [ ] **Step 1: Migrate Random**
 
@@ -991,19 +958,17 @@ impl Strategy for Random {
         if marks.is_empty() { return None; }
         let mut rng = rand::thread_rng();
         if has_marked {
-            // 50% chance to also mark color
             if rng.gen_bool(0.5) {
                 Some(marks[rng.gen_range(0..marks.len())])
             } else {
                 None
             }
         } else {
-            // Must mark or strike — try to mark
             Some(marks[rng.gen_range(0..marks.len())])
         }
     }
 
-    fn passive_phase1(&mut self, state: &State, _opp: &[State], dice: [u8; 6]) -> Option<Mark> {
+    fn passive_phase1(&mut self, state: &State, _opp: &[State], dice: [u8; 6], _active: usize) -> Option<Mark> {
         let marks = state.generate_white_moves(dice[0] + dice[1]);
         if marks.is_empty() { return None; }
         let mut rng = rand::thread_rng();
@@ -1016,15 +981,14 @@ impl Strategy for Random {
 }
 ```
 
-- [ ] **Step 2: Migrate Conservative**
+- [ ] **Step 2: Migrate Conservative (implements Strategy directly)**
 
-Remove `score_gap` field. Evaluate by blanks + score directly per phase.
+Remove `score_gap` field. Per-phase blank caps: `max_new_blanks` for active (default 3), 0 for passive.
 
 ```rust
 impl Strategy for Conservative {
     fn active_phase1(&mut self, state: &State, _opp: &[State], dice: [u8; 6]) -> Option<Mark> {
-        let white_sum = dice[0] + dice[1];
-        let marks = state.generate_white_moves(white_sum);
+        let marks = state.generate_white_moves(dice[0] + dice[1]);
         Self::best_mark(state, &marks, self.max_new_blanks)
     }
 
@@ -1033,9 +997,8 @@ impl Strategy for Conservative {
         Self::best_mark(state, &marks, self.max_new_blanks)
     }
 
-    fn passive_phase1(&mut self, state: &State, _opp: &[State], dice: [u8; 6]) -> Option<Mark> {
-        let white_sum = dice[0] + dice[1];
-        let marks = state.generate_white_moves(white_sum);
+    fn passive_phase1(&mut self, state: &State, _opp: &[State], dice: [u8; 6], _active: usize) -> Option<Mark> {
+        let marks = state.generate_white_moves(dice[0] + dice[1]);
         Self::best_mark(state, &marks, 0)
     }
 }
@@ -1060,9 +1023,9 @@ impl Conservative {
 }
 ```
 
-- [ ] **Step 3: Migrate Opportunist**
+- [ ] **Step 3: Migrate Opportunist (implements Strategy directly)**
 
-Similar to Conservative but evaluates by probability.
+Remove `score_gap` field. Per-phase blank caps: 2 for active, 1 for passive.
 
 ```rust
 impl Strategy for Opportunist {
@@ -1076,7 +1039,7 @@ impl Strategy for Opportunist {
         Self::best_mark(state, &marks, 2)
     }
 
-    fn passive_phase1(&mut self, state: &State, _opp: &[State], dice: [u8; 6]) -> Option<Mark> {
+    fn passive_phase1(&mut self, state: &State, _opp: &[State], dice: [u8; 6], _active: usize) -> Option<Mark> {
         let marks = state.generate_white_moves(dice[0] + dice[1]);
         Self::best_mark(state, &marks, 1)
     }
@@ -1105,7 +1068,7 @@ impl Opportunist {
 
 - [ ] **Step 4: Remove `observe_opponents` usages and `score_gap` fields**
 
-Remove `score_gap` from Conservative and Opportunist structs.
+Remove `score_gap` from both structs.
 
 - [ ] **Step 5: Verify compilation**
 
@@ -1181,7 +1144,7 @@ impl Strategy for MonteCarlo {
         if best_mark.1 > skip_value { Some(best_mark.0) } else { None }
     }
 
-    fn passive_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+    fn passive_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], _active: usize) -> Option<Mark> {
         let white_sum = dice[0] + dice[1];
         let marks = state.generate_white_moves(white_sum);
         if marks.is_empty() { return None; }
@@ -1290,7 +1253,7 @@ impl Strategy for Interactive {
         }
     }
 
-    fn passive_phase1(&mut self, state: &State, _opp: &[State], dice: [u8; 6]) -> Option<Mark> {
+    fn passive_phase1(&mut self, state: &State, _opp: &[State], dice: [u8; 6], _active: usize) -> Option<Mark> {
         let white_sum = dice[0] + dice[1];
         println!("\n  {BOLD}═══ OPPONENT'S TURN — mark white sum? ({white_sum}) ═══{RESET}\n");
         println!("{state}");
@@ -1599,5 +1562,6 @@ git commit -m "test: add two-phase game loop edge case tests"
 - **Compilation order**: Tasks 1-2 are additive (no breakage). Task 3 (blanket impl) requires Task 2. Task 4 (game loop) requires Task 2. Tasks 5-10 (migrations) require Tasks 2-4. Task 11 requires all migrations. Task 12 (web) can be done last.
 - **The code won't compile between Tasks 4 and the completion of all migrations** (Tasks 5-10), because `Game::play()` calls new `Strategy` methods that old impls don't have yet. Migrate all strategies before attempting `cargo check`.
 - **Meta-rules (smart lock/strike/pruning) are intentionally omitted.** They'll be re-added in a follow-up once the two-phase scaffolding is correct. This means benchmarks will regress compared to the current model. That's expected.
+- **RISKY/LOCKABLE filtering is a first pass.** The initial implementation is deliberately conservative (over-filters). Reminder after implementation: iterate on the RISKY case tree to match the refined analysis in `refactor-design.txt`, then re-add meta-rules and move pruning per phase.
 - **Web crate**: Task 12 is the minimal change to keep it compiling. No UI redesign.
 - **DQN retraining**: Not in scope. The model still works (Bot::evaluate uses the same neural net), but winrate may shift because (a) the game plays differently now and (b) meta-rules are removed.
