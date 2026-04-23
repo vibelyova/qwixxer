@@ -75,6 +75,165 @@ fn active_phase2_impl(
     }
 }
 
+/// Filter plans based on Phase 1 locking risks. Only relevant when
+/// white_sum == 2 or 12 (terminal numbers that can trigger locks).
+///
+/// Returns `Some(mark)` if a winning lock should be forced immediately.
+/// Otherwise mutates `plans` in place and returns `None`.
+fn filter_risky_plans(
+    plans: &mut Vec<(Option<Mark>, Option<Mark>, State)>,
+    state: &State,
+    opp_states: &[State],
+    white_sum: u8,
+) -> Option<Mark> {
+    if white_sum != 2 && white_sum != 12 {
+        return None;
+    }
+
+    // RISKY: rows where at least one opponent could lock by marking white_sum.
+    // can_mark on a terminal number already requires total >= 5, so the mark
+    // will always trigger a lock — no need for would_lock_row.
+    let risky: Vec<usize> = (0..4)
+        .filter(|&row| {
+            State::row_terminal(row) == white_sum
+                && opp_states.iter().any(|opp| opp.can_mark(row, white_sum))
+        })
+        .collect();
+
+    // MAX_RISKY: maximum rows opponents can collectively lock in phase1.
+    // Each opponent marks at most once, so this is min(opponents who can
+    // lock *something*, distinct risky rows).
+    let opponents_who_can_lock = opp_states
+        .iter()
+        .filter(|opp| risky.iter().any(|&row| opp.can_mark(row, white_sum)))
+        .count();
+    let max_risky = opponents_who_can_lock.min(risky.len()) as u8;
+
+    // LOCKABLE: rows WE can lock in phase1 by marking white_sum.
+    let lockable: Vec<usize> = (0..4)
+        .filter(|&row| {
+            State::row_terminal(row) == white_sum && state.can_mark(row, white_sum)
+        })
+        .collect();
+
+    // LOCKED: rows already globally locked (before this turn).
+    let locked = {
+        let our = state.locked();
+        (0..4)
+            .filter(|&r| our[r] || opp_states.iter().any(|o| o.locked()[r]))
+            .count() as u8
+    };
+
+    // Best possible opponent score after phase1: each opponent picks their
+    // highest-scoring white_sum mark (or skips if no mark improves their score).
+    let opp_best_score = opp_states
+        .iter()
+        .map(|opp| {
+            let base = opp.count_points();
+            opp.generate_white_moves(white_sum)
+                .iter()
+                .map(|&m| {
+                    let mut s = *opp;
+                    s.apply_mark(m);
+                    s.count_points()
+                })
+                .max()
+                .unwrap_or(base)
+                .max(base)
+        })
+        .max()
+        .unwrap_or(0);
+
+    if locked + max_risky >= 2 {
+        // Game can end in phase1 from opponent locks alone (+ already locked).
+        // Remove ALL plans that rely on phase2.
+        plans.retain(|(_, phase2, _)| phase2.is_none());
+    } else if max_risky == 1 {
+        // Implies LOCKED == 0 (otherwise locked + max_risky >= 2).
+        if lockable.is_empty() {
+            // We can't lock anything. Game cannot end in phase1.
+            // But the risky row(s) might get locked → deny phase2 on those rows.
+            plans.retain(|(_, phase2, _)| match phase2 {
+                Some(cm) => !risky.contains(&cm.row),
+                None => true,
+            });
+        } else {
+            // We CAN lock. Game ends if we lock a DIFFERENT row than the one
+            // the opponent locks. Since MAX_RISKY == 1 and LOCKED == 0, game
+            // ending requires our lock + opponent's lock on distinct rows = 2.
+            let game_can_end = if lockable.len() == 1 && risky.len() == 1 && lockable[0] == risky[0]
+            {
+                // Our only lockable IS their only risky row. Locking the same
+                // row → 1 total lock. Game safe either way.
+                false
+            } else {
+                true
+            };
+
+            if game_can_end {
+                // If we lock and the game ends, check if we win/tie.
+                // Compare against opponent's best possible post-phase1 score.
+                let winning_lock = lockable.iter().find(|&&row| {
+                    let mut s = *state;
+                    s.apply_mark(Mark { row, number: white_sum });
+                    s.count_points() >= opp_best_score
+                });
+                if let Some(&row) = winning_lock {
+                    return Some(Mark { row, number: white_sum });
+                }
+                // No winning lock — remove locking plans on non-risky rows
+                // (those guarantee 2 distinct locks → game ends as a loss).
+                // Keep locking plans on risky rows (might overlap with
+                // opponent's lock → only 1 lock → game safe).
+                plans.retain(|(phase1, _, _)| match phase1 {
+                    Some(m) => {
+                        if state.would_lock_row(*m) {
+                            risky.contains(&m.row)
+                        } else {
+                            true
+                        }
+                    }
+                    None => true,
+                });
+            }
+            // Whether or not game can end from us, the risky rows still
+            // threaten phase2 (opponent might lock one of them).
+            plans.retain(|(_, phase2, _)| match phase2 {
+                Some(cm) => !risky.contains(&cm.row),
+                None => true,
+            });
+        }
+    } else if locked >= 1 && max_risky == 0 {
+        // No opponent can lock anything, but rows are already locked.
+        // We can lock → locked + 1 >= 2 → game ends.
+        if !lockable.is_empty() {
+            let winning_lock = lockable.iter().find(|&&row| {
+                let mut s = *state;
+                s.apply_mark(Mark { row, number: white_sum });
+                s.count_points() >= opp_best_score
+            });
+            if let Some(&row) = winning_lock {
+                return Some(Mark { row, number: white_sum });
+            }
+            // No winning lock — remove all our locking plans.
+            plans.retain(|(phase1, _, _)| match phase1 {
+                Some(m) => !state.would_lock_row(*m),
+                None => true,
+            });
+        }
+    }
+    // else: LOCKED == 0 && MAX_RISKY == 0. Game cannot end. Proceed normally.
+
+    // Fallback: ensure we always have at least the strike plan.
+    if plans.is_empty() {
+        let mut s = *state;
+        s.apply_strike();
+        plans.push((None, None, s));
+    }
+
+    None
+}
+
 /// Generate all possible (phase1, phase2) plans, apply RISKY filtering,
 /// evaluate, and return the phase1 part of the best plan.
 fn active_phase1_impl(
@@ -128,63 +287,9 @@ fn active_phase1_impl(
         return None;
     }
 
-    // RISKY filtering (only when white_sum == 2 or white_sum == 12)
-    if white_sum == 2 || white_sum == 12 {
-        // Compute which rows opponents might lock
-        let mut at_risk_rows: Vec<usize> = Vec::new();
-        for opp in opp_states {
-            for row in 0..4 {
-                let terminal = State::row_terminal(row);
-                if terminal == white_sum && opp.can_mark(row, terminal) && opp.would_lock_row(Mark { row, number: terminal }) {
-                    if !at_risk_rows.contains(&row) {
-                        at_risk_rows.push(row);
-                    }
-                }
-            }
-        }
-
-        if !at_risk_rows.is_empty() {
-            // Count how many rows are currently globally locked
-            let mut global_locked = 0u8;
-            for row in 0..4 {
-                let locked_by_any = state.locked()[row]
-                    || opp_states.iter().any(|o| o.locked()[row]);
-                if locked_by_any {
-                    global_locked += 1;
-                }
-            }
-
-            // max_new_locks = number of at-risk rows
-            let max_new_locks = at_risk_rows.len() as u8;
-
-            if global_locked + max_new_locks >= 2 {
-                // Game can end in phase1: remove plans with phase2 dependency
-                let filtered: Vec<_> = plans
-                    .iter()
-                    .filter(|(_, phase2, _)| phase2.is_none())
-                    .cloned()
-                    .collect();
-                if !filtered.is_empty() {
-                    plans = filtered;
-                }
-                // If all plans removed, keep strike as fallback (already have it)
-            } else {
-                // Remove plans that use at-risk rows in phase2
-                let filtered: Vec<_> = plans
-                    .iter()
-                    .filter(|(_, phase2, _)| {
-                        match phase2 {
-                            Some(cm) => !at_risk_rows.contains(&cm.row),
-                            None => true,
-                        }
-                    })
-                    .cloned()
-                    .collect();
-                if !filtered.is_empty() {
-                    plans = filtered;
-                }
-            }
-        }
+    // RISKY/LOCKABLE filtering — only when white_sum hits a terminal number.
+    if let Some(forced) = filter_risky_plans(&mut plans, state, opp_states, white_sum) {
+        return Some(forced);
     }
 
     // Evaluate all plans
