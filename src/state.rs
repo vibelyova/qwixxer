@@ -321,6 +321,64 @@ impl State {
         let p = self.probability();
         1.0 - (1.0 - p).powi(n as i32)
     }
+
+    /// Returns true if `number` can be marked in `row`.
+    pub fn can_mark(&self, row: usize, number: u8) -> bool {
+        self.rows[row].can_mark(number)
+    }
+
+    /// Applies a single mark directly (equivalent to `apply_move(Move::Single(mark))`).
+    pub fn apply_mark(&mut self, mark: Mark) {
+        self.rows[mark.row].mark(mark.number);
+    }
+
+    /// Increments the strike counter (panics if already at 4).
+    pub fn apply_strike(&mut self) {
+        assert!(self.strikes < 4);
+        self.strikes += 1;
+    }
+
+    /// Returns all marks available using the white dice sum (one per eligible row).
+    pub fn generate_white_moves(&self, white_sum: u8) -> Vec<Mark> {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.can_mark(white_sum))
+            .map(|(i, _)| Mark { row: i, number: white_sum })
+            .collect()
+    }
+
+    /// Returns all marks available using white_die + color_die for each row.
+    /// Dice layout: `[W1, W2, R, Y, G, B]`. For each row `i` (0..4), checks
+    /// `dice[j] + dice[i+2]` for `j in {0, 1}`. Deduplicates by `(row, number)`.
+    pub fn generate_color_moves(&self, dice: [u8; 6]) -> Vec<Mark> {
+        let mut marks: Vec<Mark> = Vec::new();
+        for i in 0..4 {
+            for j in 0..2 {
+                let number = dice[j] + dice[i + 2];
+                if self.rows[i].can_mark(number) {
+                    let mark = Mark { row: i, number };
+                    if !marks.iter().any(|m| m.row == mark.row && m.number == mark.number) {
+                        marks.push(mark);
+                    }
+                }
+            }
+        }
+        marks
+    }
+
+    /// Returns true if applying `mark` would lock its row.
+    pub fn would_lock_row(&self, mark: Mark) -> bool {
+        let before = self.count_locked();
+        let mut copy = *self;
+        copy.apply_mark(mark);
+        copy.count_locked() > before
+    }
+
+    /// Returns the terminal number for a row: 12 for ascending rows (0, 1), 2 for descending rows (2, 3).
+    pub fn row_terminal(row: usize) -> u8 {
+        if row < 2 { 12 } else { 2 }
+    }
 }
 
 impl Row {
@@ -1016,6 +1074,51 @@ mod tests {
         let pruned = state.prune_dominated(&moves);
         // Neither should be pruned — both kept
         assert_eq!(pruned.len(), 2);
+    }
+
+    // ---- new helper methods ----
+
+    #[test]
+    fn can_mark_fresh_state() {
+        let s = State::default();
+        assert!(s.can_mark(0, 2));  // red, ascending, free=2
+        assert!(!s.can_mark(0, 12)); // need 5+ marks to mark terminal
+        assert!(s.can_mark(2, 12)); // green, descending, free=12
+    }
+
+    #[test]
+    fn apply_mark_updates_state() {
+        let mut s = State::default();
+        s.apply_mark(Mark { row: 0, number: 5 });
+        assert_eq!(s.row_totals()[0], 1);
+        assert_eq!(s.row_free_values()[0], Some(6));
+    }
+
+    #[test]
+    fn generate_white_moves_fresh() {
+        let s = State::default();
+        let moves = s.generate_white_moves(7);
+        assert_eq!(moves.len(), 4); // all 4 rows can mark 7
+    }
+
+    #[test]
+    fn generate_color_moves_basic() {
+        let s = State::default();
+        let dice = [3, 4, 2, 3, 5, 1]; // W1=3 W2=4 R=2 Y=3 G=5 B=1
+        let moves = s.generate_color_moves(dice);
+        // Row 0 (red,asc): 3+2=5 ✓, 4+2=6 ✓
+        // Row 1 (yel,asc): 3+3=6 ✓, 4+3=7 ✓
+        // Row 2 (grn,desc): 3+5=8 ✓, 4+5=9 ✓
+        // Row 3 (blu,desc): 3+1=4 ✓, 4+1=5 ✓
+        assert_eq!(moves.len(), 8);
+    }
+
+    #[test]
+    fn would_lock_row_detects_lock() {
+        let mut s = State::default();
+        for n in 2..=6 { s.apply_mark(Mark { row: 0, number: n }); }
+        assert!(s.would_lock_row(Mark { row: 0, number: 12 }));
+        assert!(!s.would_lock_row(Mark { row: 0, number: 7 }));
     }
 
     // ---- apply_meta_rules ----
