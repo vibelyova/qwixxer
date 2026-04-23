@@ -5,12 +5,12 @@
 
 use crate::bot::{self, DNA};
 use crate::dqn::{
-    build_opponent_context_for, rank_candidates_with_opp_context, state_features, DqnStrategy,
-    MyBackend, OpponentContext, QwixxModel, QwixxModelConfig, LOG_VAR_MAX, LOG_VAR_MIN,
-    NUM_FEATURES, TRAIN_SEED,
+    build_opponent_context_for, rank_candidates_with_opp_context,
+    state_features, DqnStrategy, MyBackend, OpponentContext, QwixxModel, QwixxModelConfig,
+    LOG_VAR_MAX, LOG_VAR_MIN, NUM_FEATURES, TRAIN_SEED,
 };
 use crate::mcts::MonteCarlo;
-use crate::state::{Move, State};
+use crate::state::{Mark, State};
 use crate::strategy::Strategy;
 use burn::{
     backend::Autodiff,
@@ -38,11 +38,6 @@ type MyAutodiffBackend = Autodiff<MyBackend>;
 /// O(1–10). A small α prevents σ's backbone gradients from dominating μ's.
 /// Tune if σ calibration isn't converging after a few iterations.
 const SIGMA_LOSS_WEIGHT: f32 = 1.0;
-
-/// Build opponent context from a 2-player game state.
-fn make_context(our_state: &State, opponent_state: &State) -> OpponentContext {
-    build_opponent_context_for(our_state.count_points(), opponent_state, &[])
-}
 
 // ---- Training step impls on the shared model ----
 
@@ -193,6 +188,7 @@ pub fn generate_training_data(num_games: usize, mc_sims: usize) -> Vec<TrainingS
     let samples: Vec<TrainingSample> = (0..num_games)
         .into_par_iter()
         .flat_map(|game_idx| {
+            use crate::state::Move;
             let mut ga = champion.clone();
             let mut rng = SmallRng::seed_from_u64(TRAIN_SEED.wrapping_add(game_idx as u64));
             let mut state = State::default();
@@ -225,7 +221,7 @@ pub fn generate_training_data(num_games: usize, mc_sims: usize) -> Vec<TrainingS
                     for &(mov, mc_value) in &evaluated {
                         let mut new_state = state;
                         new_state.apply_move(mov);
-                        let ctx = make_context(&new_state, &opponent_state);
+                        let ctx = build_opponent_context_for(new_state.count_points(), &opponent_state, &[]);
                         let features = state_features(&new_state, &ctx);
                         local_samples.push(TrainingSample {
                             features: features.to_vec(),
@@ -245,17 +241,23 @@ pub fn generate_training_data(num_games: usize, mc_sims: usize) -> Vec<TrainingS
                         .0;
                     state.apply_move(best_move);
                     let locked = state.locked();
-                    let opp_mov = ga.opponents_move(&opponent_state, on_white, locked);
-                    if let Some(mov) = opp_mov { opponent_state.apply_move(mov); }
+                    let opp_mov = ga.passive_phase1(&opponent_state, &[state], [on_white, 0, 0, 0, 0, 0], 0);
+                    if let Some(mark) = opp_mov { opponent_state.apply_mark(mark); }
                     opponent_state.lock(locked);
                     state.lock(opponent_state.locked());
                 } else {
                     // Opponent's active turn
-                    let opp_move = ga.your_move(&opponent_state, dice);
-                    opponent_state.apply_move(opp_move);
+                    let opp_phase1 = ga.active_phase1(&opponent_state, &[state], dice);
+                    if let Some(mark) = opp_phase1 { opponent_state.apply_mark(mark); }
+                    let opp_phase2 = ga.active_phase2(&opponent_state, &[state], dice, opp_phase1.is_some());
+                    match opp_phase2 {
+                        Some(mark) => { opponent_state.apply_mark(mark); }
+                        None if opp_phase1.is_none() => { opponent_state.apply_strike(); }
+                        None => {}
+                    }
                     let locked = opponent_state.locked();
-                    let our_mov = ga.opponents_move(&state, on_white, locked);
-                    if let Some(mov) = our_mov { state.apply_move(mov); }
+                    let our_mov = ga.passive_phase1(&state, &[opponent_state], [on_white, 0, 0, 0, 0, 0], 0);
+                    if let Some(mark) = our_mov { state.apply_mark(mark); }
                     state.lock(locked);
                     opponent_state.lock(state.locked());
                 }
@@ -349,36 +351,14 @@ fn batch_eval_features(
 /// DQN wrapper used during self-play training. Picks moves with ε-greedy
 /// exploration and records post-move features into a shared buffer that the
 /// training loop drains after `Game::play` returns.
-///
-/// Features are computed against `self.context` (the pre-move observation) —
-/// matching `DqnStrategy`'s convention so training/inference distributions align.
 struct RecordingDqn {
     model: QwixxModel<MyBackend>,
     device: burn::backend::ndarray::NdArrayDevice,
     epsilon: f32,
     rng: SmallRng,
-    context: OpponentContext,
-    /// State of the current leading opponent — see [`DqnStrategy::leader_state`].
-    leader_state: Option<State>,
-    /// Non-leader opponent states, for reconstructing the leader's context.
-    non_leader_states: Vec<State>,
     /// Shared with the training loop. Stays inside one rayon closure per game
     /// so Rc<RefCell<..>> is sufficient — no synchronization needed.
     recorded: std::rc::Rc<std::cell::RefCell<Vec<[f32; NUM_FEATURES]>>>,
-}
-
-impl RecordingDqn {
-    /// Rank candidate post-move states by win probability with per-candidate
-    /// opp context, matching `DqnStrategy::your_move`.
-    fn rank(&self, our_post_states: &[State]) -> Vec<f32> {
-        rank_candidates_with_opp_context(
-            &self.model,
-            &self.device,
-            self.leader_state.as_ref(),
-            &self.non_leader_states,
-            our_post_states,
-        )
-    }
 }
 
 impl std::fmt::Debug for RecordingDqn {
@@ -387,74 +367,198 @@ impl std::fmt::Debug for RecordingDqn {
     }
 }
 
-impl Strategy for RecordingDqn {
-    fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
-        use crate::state::MetaDecision;
-        let mov = match state.apply_meta_rules(dice, self.context.score_gap_to_leader) {
-            MetaDecision::Forced(m) => m,
-            MetaDecision::Choices(moves) => {
-                if self.rng.gen::<f32>() < self.epsilon {
-                    moves[self.rng.gen_range(0..moves.len())]
-                } else {
-                    let post_states: Vec<State> = moves
-                        .iter()
-                        .map(|&m| {
-                            let mut s = *state;
-                            s.apply_move(m);
-                            s
-                        })
-                        .collect();
-                    let ranks = self.rank(&post_states);
-                    let best = ranks
-                        .iter()
-                        .enumerate()
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                        .unwrap()
-                        .0;
-                    moves[best]
-                }
-            }
-        };
-        // Record features of the resulting state (post-our-move, pre-opponents-passive).
-        let mut post = *state;
-        post.apply_move(mov);
-        let features = state_features(&post, &self.context);
-        self.recorded.borrow_mut().push(features);
-        mov
+impl RecordingDqn {
+    /// Build opponent context from opp_states.
+    fn build_context(&self, our_state: &State, opp_states: &[State]) -> OpponentContext {
+        if opp_states.is_empty() {
+            return OpponentContext::default();
+        }
+        let leader_idx = (0..opp_states.len())
+            .max_by_key(|&i| opp_states[i].count_points())
+            .unwrap();
+        let leader = &opp_states[leader_idx];
+        let non_leaders: Vec<State> = opp_states
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != leader_idx)
+            .map(|(_, s)| *s)
+            .collect();
+        build_opponent_context_for(our_state.count_points(), leader, &non_leaders)
     }
 
-    fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
-        let moves = state.generate_opponent_moves(number);
+    /// Find leader and non-leaders from opp_states.
+    fn find_leader<'a>(&self, opp_states: &'a [State]) -> (Option<&'a State>, Vec<State>) {
+        if opp_states.is_empty() {
+            return (None, Vec::new());
+        }
+        let leader_idx = (0..opp_states.len())
+            .max_by_key(|&i| opp_states[i].count_points())
+            .unwrap();
+        let leader = &opp_states[leader_idx];
+        let non_leaders: Vec<State> = opp_states
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != leader_idx)
+            .map(|(_, s)| *s)
+            .collect();
+        (Some(leader), non_leaders)
+    }
 
-        if let Some(mov) = state.find_smart_lock(&moves, self.context.score_gap_to_leader) {
-            let mut post = *state;
-            post.apply_move(mov);
-            post.lock(locked);
-            let features = state_features(&post, &self.context);
-            self.recorded.borrow_mut().push(features);
-            return Some(mov);
+    /// Rank candidate post-move states by win probability with per-candidate
+    /// opp context, matching `DqnStrategy` Bot impl.
+    fn rank(&self, our_post_states: &[State], opp_states: &[State]) -> Vec<f32> {
+        let (leader, non_leaders) = self.find_leader(opp_states);
+        rank_candidates_with_opp_context(
+            &self.model,
+            &self.device,
+            leader,
+            &non_leaders,
+            our_post_states,
+        )
+    }
+
+    fn record_features(&self, state: &State, opp_states: &[State]) {
+        let ctx = self.build_context(state, opp_states);
+        let features = state_features(state, &ctx);
+        self.recorded.borrow_mut().push(features);
+    }
+}
+
+impl Strategy for RecordingDqn {
+    fn active_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+        let white_sum = dice[0] + dice[1];
+        let white_marks = state.generate_white_moves(white_sum);
+        let color_marks = state.generate_color_moves(dice);
+
+        // Generate all (phase1, phase2) plans like the blanket impl
+        let mut plans: Vec<(Option<Mark>, Option<Mark>, State)> = Vec::new();
+
+        // Strike: (None, None) -> apply_strike
+        {
+            let mut s = *state;
+            s.apply_strike();
+            plans.push((None, None, s));
         }
 
-        if moves.is_empty() {
+        // Color-only singles: (None, Some(cm)) -> apply cm
+        for &cm in &color_marks {
+            let mut s = *state;
+            s.apply_mark(cm);
+            plans.push((None, Some(cm), s));
+        }
+
+        // White-only singles: (Some(wm), None) -> apply wm
+        for &wm in &white_marks {
+            let mut s = *state;
+            s.apply_mark(wm);
+            plans.push((Some(wm), None, s));
+        }
+
+        // Doubles: (Some(wm), Some(cm))
+        for &wm in &white_marks {
+            let mut post_white = *state;
+            post_white.apply_mark(wm);
+            let post_color_marks = post_white.generate_color_moves(dice);
+            for &cm in &post_color_marks {
+                let mut s = post_white;
+                s.apply_mark(cm);
+                plans.push((Some(wm), Some(cm), s));
+            }
+        }
+
+        if plans.is_empty() {
             return None;
         }
 
-        let mut post_states: Vec<State> = moves
+        // Epsilon-greedy
+        let chosen_idx = if self.rng.gen::<f32>() < self.epsilon {
+            self.rng.gen_range(0..plans.len())
+        } else {
+            let post_states: Vec<State> = plans.iter().map(|(_, _, s)| *s).collect();
+            let ranks = self.rank(&post_states, opp_states);
+            ranks
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .unwrap()
+                .0
+        };
+
+        // Record features of the chosen plan's final state
+        let (phase1, _, ref final_state) = plans[chosen_idx];
+        self.record_features(final_state, opp_states);
+
+        phase1
+    }
+
+    fn active_phase2(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Option<Mark> {
+        let marks = state.generate_color_moves(dice);
+        let no_mark_state = if has_marked {
+            *state
+        } else {
+            let mut s = *state;
+            s.apply_strike();
+            s
+        };
+
+        if marks.is_empty() {
+            return None;
+        }
+
+        let mut candidates: Vec<State> = marks
             .iter()
             .map(|&m| {
                 let mut s = *state;
-                s.apply_move(m);
-                s.lock(locked);
+                s.apply_mark(m);
                 s
             })
             .collect();
-        let mut skip_state = *state;
-        skip_state.lock(locked);
-        post_states.push(skip_state);
+        candidates.push(no_mark_state);
 
-        let ranks = self.rank(&post_states);
+        // Epsilon-greedy
+        let chosen_idx = if self.rng.gen::<f32>() < self.epsilon {
+            self.rng.gen_range(0..candidates.len())
+        } else {
+            let ranks = self.rank(&candidates, opp_states);
+            ranks
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .unwrap()
+                .0
+        };
+
+        // Record features of chosen candidate
+        self.record_features(&candidates[chosen_idx], opp_states);
+
+        if chosen_idx < marks.len() {
+            Some(marks[chosen_idx])
+        } else {
+            None
+        }
+    }
+
+    fn passive_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], _active_player: usize) -> Option<Mark> {
+        let white_sum = dice[0] + dice[1];
+        let marks = state.generate_white_moves(white_sum);
+        if marks.is_empty() {
+            return None;
+        }
+
+        let mut candidates: Vec<State> = marks
+            .iter()
+            .map(|&m| {
+                let mut s = *state;
+                s.apply_mark(m);
+                s
+            })
+            .collect();
+        candidates.push(*state); // skip
+
+        let ranks = self.rank(&candidates, opp_states);
         let skip_rank = *ranks.last().unwrap();
-        let (best_idx, best_rank) = ranks[..moves.len()]
+        let mark_ranks = &ranks[..marks.len()];
+        let (best_idx, best_rank) = mark_ranks
             .iter()
             .copied()
             .enumerate()
@@ -462,35 +566,12 @@ impl Strategy for RecordingDqn {
             .unwrap();
 
         if best_rank > skip_rank {
-            // Only record when we actually mark — matches prior behavior.
-            let features = state_features(&post_states[best_idx], &self.context);
-            self.recorded.borrow_mut().push(features);
-            Some(moves[best_idx])
+            // Record when we mark
+            self.record_features(&candidates[best_idx], opp_states);
+            Some(marks[best_idx])
         } else {
             None
         }
-    }
-
-    fn observe_opponents(&mut self, our_score: isize, opponents: &[State]) {
-        if opponents.is_empty() {
-            self.context = OpponentContext::default();
-            self.leader_state = None;
-            self.non_leader_states.clear();
-            return;
-        }
-        let leader_idx = (0..opponents.len())
-            .max_by_key(|&i| opponents[i].count_points())
-            .unwrap();
-        let leader = opponents[leader_idx];
-        let non_leader: Vec<State> = opponents
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != leader_idx)
-            .map(|(_, s)| *s)
-            .collect();
-        self.context = build_opponent_context_for(our_score, &leader, &non_leader);
-        self.leader_state = Some(leader);
-        self.non_leader_states = non_leader;
     }
 }
 
@@ -513,9 +594,6 @@ fn play_training_game(
         device: device.clone(),
         epsilon,
         rng: SmallRng::seed_from_u64(seed),
-        context: OpponentContext::default(),
-        leader_state: None,
-        non_leader_states: Vec::new(),
         recorded: std::rc::Rc::clone(&recorded),
     };
 
@@ -580,14 +658,10 @@ fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 
         .map_init(
             || DqnStrategy::load(artifact_dir),
             |template, i| {
-                // Cheap: model tensors are Arc-backed; fresh cache + default context per game.
+                // Cheap: model tensors are Arc-backed; fresh per game.
                 let dqn = DqnStrategy {
                     model: template.model.clone(),
                     device: template.device.clone(),
-                    context: OpponentContext::default(),
-                    leader_state: None,
-                    non_leader_states: Vec::new(),
-                    cache: std::collections::HashMap::new(),
                 };
                 let rotation = i % 2;
                 let players: Vec<Player> = if rotation == 0 {
@@ -678,16 +752,11 @@ pub fn self_play_train(
             .enumerate()
             .map(|(game_idx, (config, thread_model))| {
                 let seed = TRAIN_SEED.wrapping_add((iteration * games_per_iteration + game_idx) as u64);
-                // Deterministic DQN self-play opponents — DqnStrategy shares the same
-                // batched-eval path as inference. Cheap clones: tensors are Arc-backed.
+                // Deterministic DQN self-play opponents
                 let dqn_self = || -> Box<dyn Strategy> {
                     Box::new(DqnStrategy {
                         model: thread_model.clone(),
                         device: device.clone(),
-                        context: OpponentContext::default(),
-                        leader_state: None,
-                        non_leader_states: Vec::new(),
-                        cache: std::collections::HashMap::new(),
                     })
                 };
                 let opps: Vec<Box<dyn Strategy>> = match config {

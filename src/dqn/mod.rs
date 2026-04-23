@@ -18,8 +18,8 @@
 #[cfg(feature = "dqn")]
 pub mod train;
 
-use crate::state::{Move, State};
-use crate::strategy::Strategy;
+use crate::state::State;
+use crate::strategy::Bot;
 use burn::{
     backend::ndarray::NdArray,
     nn::{Linear, LinearConfig, Relu},
@@ -367,18 +367,8 @@ impl<B: Backend> QwixxModel<B> {
 // ---- Strategy using trained model ----
 
 pub struct DqnStrategy {
-    model: QwixxModel<MyBackend>,
-    device: burn::backend::ndarray::NdArrayDevice,
-    context: OpponentContext,
-    /// State of the current leading opponent (max score). Captured by
-    /// `observe_opponents`; used in ranking to evaluate V on the leader's
-    /// actual state so we have both μ_opp and σ²_opp.
-    leader_state: Option<State>,
-    /// States of non-leader opponents, needed to build the leader's own
-    /// `OpponentContext` (their gap, strikes, locks, etc.) on demand.
-    non_leader_states: Vec<State>,
-    /// Cache stores `(mean, log_var)` pairs keyed by feature bits.
-    cache: std::collections::HashMap<[u32; NUM_FEATURES], (f32, f32)>,
+    pub model: QwixxModel<MyBackend>,
+    pub device: burn::backend::ndarray::NdArrayDevice,
 }
 
 impl std::fmt::Debug for DqnStrategy {
@@ -395,14 +385,7 @@ impl DqnStrategy {
             .init::<MyBackend>(&device)
             .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
             .expect("Failed to load model");
-        DqnStrategy {
-            model,
-            device,
-            context: OpponentContext::default(),
-            leader_state: None,
-            non_leader_states: Vec::new(),
-            cache: std::collections::HashMap::new(),
-        }
+        DqnStrategy { model, device }
     }
 
     /// Construct a strategy around an already-loaded model. Used by diagnostic
@@ -412,14 +395,7 @@ impl DqnStrategy {
         model: QwixxModel<MyBackend>,
         device: burn::backend::ndarray::NdArrayDevice,
     ) -> Self {
-        DqnStrategy {
-            model,
-            device,
-            context: OpponentContext::default(),
-            leader_state: None,
-            non_leader_states: Vec::new(),
-            cache: std::collections::HashMap::new(),
-        }
+        DqnStrategy { model, device }
     }
 
     /// Load model from embedded bytes (works in WASM and native).
@@ -433,14 +409,7 @@ impl DqnStrategy {
         let model = QwixxModelConfig::new()
             .init::<MyBackend>(&device)
             .load_record(record);
-        DqnStrategy {
-            model,
-            device,
-            context: OpponentContext::default(),
-            leader_state: None,
-            non_leader_states: Vec::new(),
-            cache: std::collections::HashMap::new(),
-        }
+        DqnStrategy { model, device }
     }
 
     /// Evaluate a state with a custom opponent context (for state explorer).
@@ -449,135 +418,51 @@ impl DqnStrategy {
         let features = state_features(state, ctx);
         self.model.evaluate_state(&features, &self.device)
     }
-
-    fn features_key(features: &[f32; NUM_FEATURES]) -> [u32; NUM_FEATURES] {
-        let mut key = [0u32; NUM_FEATURES];
-        for i in 0..NUM_FEATURES {
-            key[i] = features[i].to_bits();
-        }
-        key
-    }
-
-    #[allow(dead_code)]
-    fn evaluate(&mut self, state: &State) -> (f32, f32) {
-        let features = state_features(state, &self.context);
-        let key = Self::features_key(&features);
-        if let Some(&cached) = self.cache.get(&key) {
-            return cached;
-        }
-        let value = self.model.evaluate_state(&features, &self.device);
-        self.cache.insert(key, value);
-        value
-    }
-
 }
 
-impl Strategy for DqnStrategy {
-    fn your_move(&mut self, state: &State, dice: [u8; 6]) -> Move {
-        use crate::state::MetaDecision;
-        let moves = match state.apply_meta_rules(dice, self.context.score_gap_to_leader) {
-            MetaDecision::Forced(mov) => return mov,
-            MetaDecision::Choices(moves) => moves,
-        };
-
-        let our_post_states: Vec<State> = moves
-            .iter()
-            .map(|&mov| {
-                let mut s = *state;
-                s.apply_move(mov);
-                s
-            })
-            .collect();
-
-        // Per-candidate opp-context re-inference: opp's view of the game depends
-        // on OUR post-move state (score_gap, max_opp_strikes), so each candidate
-        // gets its own opp evaluation, batched with ours in one forward pass.
-        let ranks = rank_candidates_with_opp_context(
-            &self.model,
-            &self.device,
-            self.leader_state.as_ref(),
-            &self.non_leader_states,
-            &our_post_states,
-        );
-        moves
-            .into_iter()
-            .enumerate()
-            .max_by(|(i, _), (j, _)| ranks[*i].partial_cmp(&ranks[*j]).unwrap())
-            .unwrap()
-            .1
+impl Bot for DqnStrategy {
+    fn evaluate(&self, our_state: &State, opp_states: &[State]) -> f32 {
+        self.evaluate_batch(&[*our_state], opp_states)[0]
     }
 
-    fn opponents_move(&mut self, state: &State, number: u8, locked: [bool; 4]) -> Option<Move> {
-        let moves = state.generate_opponent_moves(number);
-
-        if let Some(mov) = state.find_smart_lock(&moves, self.context.score_gap_to_leader) {
-            return Some(mov);
+    fn evaluate_batch(&self, candidates: &[State], opp_states: &[State]) -> Vec<f32> {
+        if opp_states.is_empty() {
+            let ctx = OpponentContext::default();
+            let feats: Vec<[f32; NUM_FEATURES]> = candidates
+                .iter()
+                .map(|s| state_features(s, &ctx))
+                .collect();
+            return batch_forward_features(&self.model, &self.device, &feats)
+                .into_iter()
+                .map(|(mean, _)| mean)
+                .collect();
         }
-
-        if moves.is_empty() {
-            return None;
-        }
-
-        // Evaluate all mark candidates + the skip state. Opp context is re-
-        // inferred per candidate because our post-mark score changes their gap.
-        let mut eval_states: Vec<State> = moves
-            .iter()
-            .map(|&mov| {
-                let mut s = *state;
-                s.apply_move(mov);
-                s.lock(locked);
-                s
-            })
-            .collect();
-        let mut skip_state = *state;
-        skip_state.lock(locked);
-        eval_states.push(skip_state);
-
-        let ranks = rank_candidates_with_opp_context(
-            &self.model,
-            &self.device,
-            self.leader_state.as_ref(),
-            &self.non_leader_states,
-            &eval_states,
-        );
-        let skip_rank = *ranks.last().unwrap();
-        let (best_idx, best_rank) = ranks[..moves.len()]
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        let leader_idx = (0..opp_states.len())
+            .max_by_key(|&i| opp_states[i].count_points())
             .unwrap();
-
-        if best_rank > skip_rank {
-            Some(moves[best_idx])
-        } else {
-            None
-        }
-    }
-
-    fn observe_opponents(&mut self, our_score: isize, opponents: &[State]) {
-        if opponents.is_empty() {
-            self.context = OpponentContext::default();
-            self.leader_state = None;
-            self.non_leader_states.clear();
-            // Preserve the gap semantics from before (no opp → 0 gap).
-            self.context.score_gap_to_leader = 0;
-            return;
-        }
-
-        let leader_idx = (0..opponents.len())
-            .max_by_key(|&i| opponents[i].count_points())
-            .unwrap();
-        let leader = opponents[leader_idx];
-        let non_leader: Vec<State> = opponents
+        let leader = &opp_states[leader_idx];
+        let non_leaders: Vec<State> = opp_states
             .iter()
             .enumerate()
             .filter(|(i, _)| *i != leader_idx)
             .map(|(_, s)| *s)
             .collect();
-
-        self.context = build_opponent_context_for(our_score, &leader, &non_leader);
-        self.leader_state = Some(leader);
-        self.non_leader_states = non_leader;
+        let mut features_list = Vec::with_capacity(candidates.len() * 2);
+        for cand in candidates {
+            let our_ctx =
+                build_opponent_context_for(cand.count_points(), leader, &non_leaders);
+            features_list.push(state_features(cand, &our_ctx));
+            let opp_ctx =
+                build_opponent_context_for(leader.count_points(), cand, &non_leaders);
+            features_list.push(state_features(leader, &opp_ctx));
+        }
+        let values = batch_forward_features(&self.model, &self.device, &features_list);
+        (0..candidates.len())
+            .map(|i| {
+                let (mean, log_var) = values[2 * i];
+                let (opp_mean, opp_log_var) = values[2 * i + 1];
+                win_rank_score(mean, log_var, opp_mean, opp_log_var)
+            })
+            .collect()
     }
 }
