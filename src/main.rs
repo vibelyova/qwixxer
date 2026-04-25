@@ -91,9 +91,6 @@ enum Commands {
     },
     /// Evolve the GA champion via genetic algorithm
     Evolve,
-    /// Train DQN (MC-supervised)
-    #[cfg(feature = "dqn")]
-    DqnTrain,
     /// DQN self-play reinforcement learning
     #[cfg(feature = "dqn")]
     DqnSelfplay {
@@ -371,12 +368,6 @@ fn run_train() {
 }
 
 #[cfg(feature = "dqn")]
-fn run_dqn_train() {
-    let samples = dqn::train::generate_training_data(1500, 500);
-    dqn::train::train(samples, "dqn_model");
-}
-
-#[cfg(feature = "dqn")]
 fn run_dqn_selfplay(iterations: usize, bench_games: usize, checkpoints: bool) {
     dqn::train::self_play_train("dqn_model", iterations, 20000, 10, bench_games, checkpoints);
 }
@@ -390,7 +381,6 @@ fn main() {
         Some(Commands::Solo { num_games }) => run_solo(num_games),
         Some(Commands::Evolve) => run_train(),
         #[cfg(feature = "dqn")]
-        Some(Commands::DqnTrain) => run_dqn_train(),
         #[cfg(feature = "dqn")]
         Some(Commands::DqnSelfplay { iterations, bench, checkpoints }) => run_dqn_selfplay(iterations, bench, checkpoints),
         None => {
