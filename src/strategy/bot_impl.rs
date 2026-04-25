@@ -66,9 +66,9 @@ fn passive_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice
         return None;
     }
 
-    if let Some(m) = find_safe_lock(state, &marks) {
-        return Some(m);
-    }
+    // if let Some(m) = find_safe_lock(state, &marks) {
+    //     return Some(m);
+    // }
 
     let mark_states: Vec<State> = marks
         .iter()
@@ -126,9 +126,9 @@ fn active_phase2_impl(
         return None;
     }
 
-    if let Some(m) = find_safe_lock(state, &marks) {
-        return Some(m);
-    }
+    // if let Some(m) = find_safe_lock(state, &marks) {
+    //     return Some(m);
+    // }
 
     let mark_states: Vec<State> = marks
         .iter()
@@ -467,19 +467,18 @@ fn active_phase1_impl(
         return Some(forced);
     }
 
-    // Force a non-game-ending lock if any surviving plan's phase1 mark locks.
-    // Check on post-phase1 state only (not full plan end-state).
-    for (phase1, _, _) in &plans {
-        if let Some(m) = phase1 {
-            if state.would_lock_row(*m) && {
-                let mut s = *state;
-                s.apply_mark(*m);
-                !would_end_game(&s)
-            } {
-                return Some(*m);
-            }
-        }
-    }
+    // // Force a non-game-ending lock if any surviving plan's phase1 mark locks.
+    // for (phase1, _, _) in &plans {
+    //     if let Some(m) = phase1 {
+    //         if state.would_lock_row(*m) && {
+    //             let mut s = *state;
+    //             s.apply_mark(*m);
+    //             !would_end_game(&s)
+    //         } {
+    //             return Some(*m);
+    //         }
+    //     }
+    // }
 
     // Prune plans whose end-state is strictly dominated by another plan's.
     {
