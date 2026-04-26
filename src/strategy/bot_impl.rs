@@ -121,6 +121,13 @@ fn active_phase2_impl(
     dice: [u8; 6],
     has_marked: bool,
 ) -> Option<Mark> {
+    let opp_best = opp_states.iter().map(|s| s.count_points()).max().unwrap_or(0);
+
+    // Smart strike: 3 strikes + not marked in phase1 + ahead after strike → take it.
+    if !has_marked && state.strikes == 3 && state.count_points() - 5 > opp_best {
+        return None;
+    }
+
     let marks = state.generate_color_moves(dice);
     if marks.is_empty() {
         return None;
@@ -157,6 +164,12 @@ fn active_phase2_impl(
         return None;
     }
 
+    // Don't-strike-into-loss: if !has_marked and striking would end the game
+    // as a loss, we MUST mark something. Exclude the no-mark/strike option.
+    let must_mark = !has_marked
+        && state.strikes == 3
+        && state.count_points() - 5 < opp_best;
+
     let no_mark_state = if has_marked {
         *state
     } else {
@@ -164,6 +177,15 @@ fn active_phase2_impl(
         s.apply_strike();
         s
     };
+
+    if must_mark {
+        // Any mark is better than a losing strike. Pick the best mark.
+        let values = bot.evaluate_batch(&mark_states, opp_states);
+        let best_idx = values.iter().enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap().0;
+        return Some(marks[best_idx]);
+    }
 
     // Prune dominated: build full candidate list (marks + no-mark), prune,
     // then split back. No-mark is always at the end.
@@ -393,6 +415,15 @@ fn active_phase1_impl(
     dice: [u8; 6],
 ) -> Option<Mark> {
     let white_sum = dice[0] + dice[1];
+
+    // Smart strike: 3 strikes + ahead → skip both phases to force a winning 4th strike.
+    if state.strikes == 3 {
+        let opp_best = opp_best_phase1_score(opp_states, white_sum);
+        if state.count_points() - 5 > opp_best {
+            return None; // phase2 will also return None → game loop applies strike
+        }
+    }
+
     let white_marks = state.generate_white_moves(white_sum);
     let color_marks = state.generate_color_moves(dice);
 
@@ -401,7 +432,11 @@ fn active_phase1_impl(
     let mut plans: Vec<(Option<Mark>, Option<Mark>, State)> = Vec::new();
 
     // 1. Strike: (None, None) -> apply_strike
-    {
+    // Don't-strike-into-loss: omit if 3 strikes and behind.
+    if state.strikes < 3 || {
+        let opp_best = opp_best_phase1_score(opp_states, white_sum);
+        state.count_points() - 5 >= opp_best
+    } {
         let mut s = *state;
         s.apply_strike();
         plans.push((None, None, s));
