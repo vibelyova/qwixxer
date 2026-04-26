@@ -57,11 +57,6 @@ fn pick_best_mark(
     baseline: State,
     opp_best: isize,
 ) -> Option<Mark> {
-    // Winning baseline (e.g. 4th strike when ahead) → take it
-    if baseline.would_end_game() && baseline.count_points() > opp_best {
-        return None;
-    }
-
     if marks.is_empty() {
         return None;
     }
@@ -79,11 +74,25 @@ fn pick_best_mark(
         })
         .collect();
 
-    // Force winning game-ending mark
-    for (i, post) in mark_states.iter().enumerate() {
-        if post.would_end_game() && post.count_points() > opp_best {
-            return Some(marks[i]);
+    // Force highest-scoring winning game-end (mark or baseline).
+    // Marks first — a winning lock beats a winning strike (avoids -5 penalty).
+    let best_winning_mark = mark_states
+        .iter()
+        .enumerate()
+        .filter(|(_, post)| post.would_end_game() && post.count_points() > opp_best)
+        .max_by_key(|(_, post)| post.count_points());
+    let baseline_wins = baseline.would_end_game() && baseline.count_points() > opp_best;
+    match (best_winning_mark, baseline_wins) {
+        (Some((i, post)), true) => {
+            if post.count_points() >= baseline.count_points() {
+                return Some(marks[i]);
+            } else {
+                return None;
+            }
         }
+        (Some((i, _)), false) => return Some(marks[i]),
+        (None, true) => return None,
+        (None, false) => {}
     }
 
     // Build candidates: marks + baseline. Filter out losing game-ends.
@@ -234,7 +243,7 @@ fn filter_risky_plans(
                 let winning_lock = lockable.iter().find(|&&row| {
                     let mut s = *state;
                     s.apply_mark(Mark { row, number: white_sum });
-                    s.count_points() >= opp_best_score
+                    s.count_points() > opp_best_score
                 });
                 if let Some(&row) = winning_lock {
                     return Some(Mark { row, number: white_sum });
