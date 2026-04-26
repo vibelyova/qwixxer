@@ -379,6 +379,10 @@ impl State {
     pub fn row_terminal(row: usize) -> u8 {
         if row < 2 { 12 } else { 2 }
     }
+
+    pub fn would_end_game(&self) -> bool {
+        self.count_locked() >= 2 || self.strikes == 4
+    }
 }
 
 impl Row {
