@@ -415,15 +415,6 @@ fn active_phase1_impl(
     dice: [u8; 6],
 ) -> Option<Mark> {
     let white_sum = dice[0] + dice[1];
-
-    // Smart strike: 3 strikes + ahead → skip both phases to force a winning 4th strike.
-    if state.strikes == 3 {
-        let opp_best = opp_best_phase1_score(opp_states, white_sum);
-        if state.count_points() - 5 > opp_best {
-            return None; // phase2 will also return None → game loop applies strike
-        }
-    }
-
     let white_marks = state.generate_white_moves(white_sum);
     let color_marks = state.generate_color_moves(dice);
 
@@ -432,11 +423,7 @@ fn active_phase1_impl(
     let mut plans: Vec<(Option<Mark>, Option<Mark>, State)> = Vec::new();
 
     // 1. Strike: (None, None) -> apply_strike
-    // Don't-strike-into-loss: omit if 3 strikes and behind.
-    if state.strikes < 3 || {
-        let opp_best = opp_best_phase1_score(opp_states, white_sum);
-        state.count_points() - 5 >= opp_best
-    } {
+    {
         let mut s = *state;
         s.apply_strike();
         plans.push((None, None, s));
