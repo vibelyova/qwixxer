@@ -143,14 +143,14 @@ fn pick_best_mark(
 
 // ---------------------------------------------------------------------------
 
-fn passive_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+pub(crate) fn passive_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
     let white_sum = dice[0] + dice[1];
     let marks = state.generate_white_moves(white_sum);
     let opp_best = opp_best_phase1_score(opp_states, white_sum);
     pick_best_mark(bot, state, opp_states, &marks, *state, opp_best)
 }
 
-fn active_phase2_impl(
+pub(crate) fn active_phase2_impl(
     bot: &impl Bot,
     state: &State,
     opp_states: &[State],
@@ -194,7 +194,7 @@ fn simulate_opp_phase1(bot: &impl Bot, state: &State, opp_states: &[State], dice
         .collect()
 }
 
-fn active_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+pub(crate) fn active_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
     let white_sum = dice[0] + dice[1];
 
     // Simulate opponents' likely phase1 marks to get predicted post-phase1

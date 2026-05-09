@@ -5,9 +5,8 @@
 
 use crate::bot::{self, DNA};
 use crate::dqn::{
-    batch_forward_features, build_opponent_context_for, rank_candidates_with_opp_context, state_features,
-    DqnStrategy, MyBackend, OpponentContext, QwixxModel, QwixxModelConfig, LOG_VAR_MAX, LOG_VAR_MIN, NUM_FEATURES,
-    TRAIN_SEED,
+    batch_forward_features, build_opponent_context_for, state_features, DqnStrategy, MyBackend, OpponentContext,
+    QwixxModel, QwixxModelConfig, LOG_VAR_MAX, LOG_VAR_MIN, NUM_FEATURES, TRAIN_SEED,
 };
 use crate::state::{Mark, State};
 use crate::strategy::Strategy;
@@ -200,51 +199,25 @@ impl std::fmt::Debug for RecordingDqn {
 }
 
 impl RecordingDqn {
-    /// Build opponent context from opp_states.
-    fn build_context(&self, our_state: &State, opp_states: &[State]) -> OpponentContext {
-        if opp_states.is_empty() {
-            return OpponentContext::default();
-        }
-        let leader_idx = (0..opp_states.len())
-            .max_by_key(|&i| opp_states[i].count_points())
-            .unwrap();
-        let leader = &opp_states[leader_idx];
-        let non_leaders: Vec<State> = opp_states
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != leader_idx)
-            .map(|(_, s)| *s)
-            .collect();
-        build_opponent_context_for(our_state.count_points(), leader, &non_leaders)
-    }
-
-    /// Find leader and non-leaders from opp_states.
-    fn find_leader<'a>(&self, opp_states: &'a [State]) -> (Option<&'a State>, Vec<State>) {
-        if opp_states.is_empty() {
-            return (None, Vec::new());
-        }
-        let leader_idx = (0..opp_states.len())
-            .max_by_key(|&i| opp_states[i].count_points())
-            .unwrap();
-        let leader = &opp_states[leader_idx];
-        let non_leaders: Vec<State> = opp_states
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != leader_idx)
-            .map(|(_, s)| *s)
-            .collect();
-        (Some(leader), non_leaders)
-    }
-
-    /// Rank candidate post-move states by win probability with per-candidate
-    /// opp context, matching `DqnStrategy` Bot impl.
-    fn rank(&self, our_post_states: &[State], opp_states: &[State]) -> Vec<f32> {
-        let (leader, non_leaders) = self.find_leader(opp_states);
-        rank_candidates_with_opp_context(&self.model, &self.device, leader, &non_leaders, our_post_states)
+    fn bot(&self) -> DqnStrategy {
+        DqnStrategy::from_model(self.model.clone(), self.device.clone())
     }
 
     fn record_features(&self, state: &State, opp_states: &[State]) {
-        let ctx = self.build_context(state, opp_states);
+        let ctx = if opp_states.is_empty() {
+            OpponentContext::default()
+        } else {
+            let leader_idx = (0..opp_states.len())
+                .max_by_key(|&i| opp_states[i].count_points())
+                .unwrap();
+            let non_leaders: Vec<State> = opp_states
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != leader_idx)
+                .map(|(_, s)| *s)
+                .collect();
+            build_opponent_context_for(state.count_points(), &opp_states[leader_idx], &non_leaders)
+        };
         let features = state_features(state, &ctx);
         self.recorded.borrow_mut().push(features);
     }
@@ -252,66 +225,22 @@ impl RecordingDqn {
 
 impl Strategy for RecordingDqn {
     fn active_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
-        let white_sum = dice[0] + dice[1];
-        let white_marks = state.generate_white_moves(white_sum);
-        let color_marks = state.generate_color_moves(dice);
-
-        // Generate all (phase1, phase2) plans like the blanket impl
-        let mut plans: Vec<(Option<Mark>, Option<Mark>, State)> = Vec::new();
-
-        // Strike: (None, None) -> apply_strike
-        {
-            let mut s = *state;
-            s.apply_strike();
-            plans.push((None, None, s));
-        }
-
-        // Color-only singles: (None, Some(cm)) -> apply cm
-        for &cm in &color_marks {
-            let mut s = *state;
-            s.apply_mark(cm);
-            plans.push((None, Some(cm), s));
-        }
-
-        // White-only singles: (Some(wm), None) -> apply wm
-        for &wm in &white_marks {
-            let mut s = *state;
-            s.apply_mark(wm);
-            plans.push((Some(wm), None, s));
-        }
-
-        // Doubles: (Some(wm), Some(cm))
-        for &wm in &white_marks {
-            let mut post_white = *state;
-            post_white.apply_mark(wm);
-            let post_color_marks = post_white.generate_color_moves(dice);
-            for &cm in &post_color_marks {
-                let mut s = post_white;
-                s.apply_mark(cm);
-                plans.push((Some(wm), Some(cm), s));
+        if self.rng.gen::<f32>() < self.epsilon {
+            let white_sum = dice[0] + dice[1];
+            let white_marks = state.generate_white_moves(white_sum);
+            if white_marks.is_empty() {
+                return None;
             }
-        }
-
-        if plans.is_empty() {
-            return None;
-        }
-
-        // Epsilon-greedy
-        let chosen_idx = if self.rng.gen::<f32>() < self.epsilon {
-            self.rng.gen_range(0..plans.len())
+            let idx = self.rng.gen_range(0..=white_marks.len());
+            if idx < white_marks.len() {
+                Some(white_marks[idx])
+            } else {
+                None
+            }
         } else {
-            let post_states: Vec<State> = plans.iter().map(|(_, _, s)| *s).collect();
-            let ranks = self.rank(&post_states, opp_states);
-            ranks
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .unwrap()
-                .0
-        };
-
-        let (phase1, _, _) = plans[chosen_idx];
-        phase1
+            let bot = self.bot();
+            crate::strategy::active_phase1_impl(&bot, state, opp_states, dice)
+        }
     }
 
     fn active_phase2(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Option<Mark> {
@@ -329,37 +258,28 @@ impl Strategy for RecordingDqn {
             return None;
         }
 
-        let mut candidates: Vec<State> = marks
-            .iter()
-            .map(|&m| {
+        let mark = if self.rng.gen::<f32>() < self.epsilon {
+            let idx = self.rng.gen_range(0..=marks.len());
+            if idx < marks.len() {
+                Some(marks[idx])
+            } else {
+                None
+            }
+        } else {
+            let bot = self.bot();
+            crate::strategy::active_phase2_impl(&bot, state, opp_states, dice, has_marked)
+        };
+
+        let chosen_state = match mark {
+            Some(m) => {
                 let mut s = *state;
                 s.apply_mark(m);
                 s
-            })
-            .collect();
-        candidates.push(no_mark_state);
-
-        // Epsilon-greedy
-        let chosen_idx = if self.rng.gen::<f32>() < self.epsilon {
-            self.rng.gen_range(0..candidates.len())
-        } else {
-            let ranks = self.rank(&candidates, opp_states);
-            ranks
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .unwrap()
-                .0
+            }
+            None => no_mark_state,
         };
-
-        // Record features of chosen candidate
-        self.record_features(&candidates[chosen_idx], opp_states);
-
-        if chosen_idx < marks.len() {
-            Some(marks[chosen_idx])
-        } else {
-            None
-        }
+        self.record_features(&chosen_state, opp_states);
+        mark
     }
 
     fn passive_phase1(
@@ -375,33 +295,15 @@ impl Strategy for RecordingDqn {
             return None;
         }
 
-        let mut candidates: Vec<State> = marks
-            .iter()
-            .map(|&m| {
-                let mut s = *state;
-                s.apply_mark(m);
-                s
-            })
-            .collect();
-        candidates.push(*state); // skip
+        let bot = self.bot();
+        let mark = crate::strategy::passive_phase1_impl(&bot, state, opp_states, dice);
 
-        let ranks = self.rank(&candidates, opp_states);
-        let skip_rank = *ranks.last().unwrap();
-        let mark_ranks = &ranks[..marks.len()];
-        let (best_idx, best_rank) = mark_ranks
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .unwrap();
-
-        if best_rank > skip_rank {
-            // Record when we mark
-            self.record_features(&candidates[best_idx], opp_states);
-            Some(marks[best_idx])
-        } else {
-            None
+        if let Some(m) = mark {
+            let mut s = *state;
+            s.apply_mark(m);
+            self.record_features(&s, opp_states);
         }
+        mark
     }
 }
 
