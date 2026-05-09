@@ -147,6 +147,9 @@ enum Commands {
         /// Save per-iteration checkpoints as iter-N.mpk
         #[arg(short, long)]
         checkpoints: bool,
+        /// Starting iteration offset (for epsilon schedule when resuming)
+        #[arg(short, long, default_value = "0")]
+        start_iteration: usize,
     },
 }
 
@@ -422,8 +425,8 @@ fn run_train() {
 }
 
 #[cfg(feature = "dqn")]
-fn run_dqn_selfplay(iterations: usize, bench_games: usize, checkpoints: bool) {
-    dqn::train::self_play_train("dqn_model", iterations, 20000, 10, bench_games, checkpoints);
+fn run_dqn_selfplay(iterations: usize, bench_games: usize, checkpoints: bool, start_iteration: usize) {
+    dqn::train::self_play_train("dqn_model", iterations, 20000, 10, bench_games, checkpoints, start_iteration);
 }
 
 fn main() {
@@ -440,7 +443,8 @@ fn main() {
             iterations,
             bench,
             checkpoints,
-        }) => run_dqn_selfplay(iterations, bench, checkpoints),
+            start_iteration,
+        }) => run_dqn_selfplay(iterations, bench, checkpoints, start_iteration),
         None => {
             // Default: play against MCTS
             run_play(vec![BotType::Mcts], false);

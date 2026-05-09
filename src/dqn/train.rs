@@ -299,65 +299,25 @@ impl Strategy for RecordingDqn {
     }
 }
 
-/// Play a training game using the shared `Game::play` loop with a `RecordingDqn`
-/// as player 0. Returns (TD(λ) training samples, final score for player 0).
-fn play_training_game(
+/// Compute TD(λ) training samples from a recorded feature trajectory.
+fn td_samples(
     model: &QwixxModel<MyBackend>,
     device: &burn::backend::ndarray::NdArrayDevice,
-    opponents: Vec<Box<dyn Strategy>>,
-    epsilon: f32,
-    seed: u64,
-) -> (Vec<TrainingSample>, f32) {
-    use crate::game::{Game, Player};
-
-    let recorded: std::rc::Rc<std::cell::RefCell<Vec<[f32; NUM_FEATURES]>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-
-    let recording = RecordingDqn {
-        bot: DqnStrategy::from_model(model.clone(), device.clone()),
-        epsilon,
-        rng: SmallRng::seed_from_u64(seed),
-        recorded: std::rc::Rc::clone(&recorded),
-    };
-
-    let mut players: Vec<Player> = Vec::with_capacity(1 + opponents.len());
-    players.push(Player::new(
-        Box::new(recording),
-        Box::new(SmallRng::seed_from_u64(seed.wrapping_add(1))),
-    ));
-    for (i, opp) in opponents.into_iter().enumerate() {
-        players.push(Player::new(
-            opp,
-            Box::new(SmallRng::seed_from_u64(seed.wrapping_add(2 + i as u64))),
-        ));
-    }
-
-    let mut game = Game::new(players);
-    game.play();
-
-    let final_score = game.players[0].state.count_points() as f32;
-
-    // Drain the recorded buffer (still shared with the RecordingDqn inside player 0).
-    let recorded_features: Vec<[f32; NUM_FEATURES]> = std::mem::take(&mut *recorded.borrow_mut());
-
-    let lambda = 0.8f32;
-    let n = recorded_features.len();
+    features: Vec<[f32; NUM_FEATURES]>,
+    final_score: f32,
+) -> Vec<TrainingSample> {
+    let n = features.len();
     if n == 0 {
-        return (Vec::new(), final_score);
+        return Vec::new();
     }
-
-    // Batched forward pass for TD(λ) bootstrap values. We bootstrap the
-    // *mean* prediction only; the variance head isn't in the bootstrap target.
-    let values = batch_forward_features(model, device, &recorded_features);
-
-    // G_t = (1-λ)·V(s_{t+1}) + λ·G_{t+1}, with G_{n-1} = final_score.
+    let lambda = 0.8f32;
+    let values = batch_forward_features(model, device, &features);
     let mut targets = vec![0.0f32; n];
     targets[n - 1] = final_score;
     for t in (0..n - 1).rev() {
         targets[t] = (1.0 - lambda) * values[t + 1].0 + lambda * targets[t + 1];
     }
-
-    let samples = recorded_features
+    features
         .into_iter()
         .zip(targets)
         .map(|(features, target)| TrainingSample {
@@ -365,8 +325,79 @@ fn play_training_game(
             value: target,
             final_score,
         })
-        .collect();
-    (samples, final_score)
+        .collect()
+}
+
+/// Play a training game with all DQN players recording experiences.
+/// `num_dqn_opps` DQN opponents (greedy, epsilon=0) + remaining filled with GA.
+/// Returns (TD(λ) samples from ALL DQN players, final score for player 0).
+fn play_training_game(
+    model: &QwixxModel<MyBackend>,
+    device: &burn::backend::ndarray::NdArrayDevice,
+    num_opponents: usize,
+    num_dqn_opps: usize,
+    champion: &DNA,
+    epsilon: f32,
+    seed: u64,
+) -> (Vec<TrainingSample>, f32) {
+    use crate::game::{Game, Player};
+
+    let mut buffers: Vec<std::rc::Rc<std::cell::RefCell<Vec<[f32; NUM_FEATURES]>>>> = Vec::new();
+    let mut recording_player_indices: Vec<usize> = Vec::new();
+
+    // Player 0: RecordingDqn with exploration
+    let buf0 = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    buffers.push(std::rc::Rc::clone(&buf0));
+    recording_player_indices.push(0);
+    let mut players: Vec<Player> = vec![Player::new(
+        Box::new(RecordingDqn {
+            bot: DqnStrategy::from_model(model.clone(), device.clone()),
+            epsilon,
+            rng: SmallRng::seed_from_u64(seed),
+            recorded: buf0,
+        }),
+        Box::new(SmallRng::seed_from_u64(seed.wrapping_add(1))),
+    )];
+
+    // Opponents
+    for i in 0..num_opponents {
+        let opp_seed = seed.wrapping_add(2 + i as u64);
+        if i < num_dqn_opps {
+            let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            buffers.push(std::rc::Rc::clone(&buf));
+            recording_player_indices.push(i + 1);
+            players.push(Player::new(
+                Box::new(RecordingDqn {
+                    bot: DqnStrategy::from_model(model.clone(), device.clone()),
+                    epsilon: 0.0,
+                    rng: SmallRng::seed_from_u64(opp_seed.wrapping_add(100)),
+                    recorded: buf,
+                }),
+                Box::new(SmallRng::seed_from_u64(opp_seed)),
+            ));
+        } else {
+            players.push(Player::new(
+                Box::new(champion.clone()),
+                Box::new(SmallRng::seed_from_u64(opp_seed)),
+            ));
+        }
+    }
+
+    let mut game = Game::new(players);
+    game.play();
+
+    let p0_score = game.players[0].state.count_points() as f32;
+
+    // Collect TD samples from all recording players
+    let mut all_samples = Vec::new();
+    for (buf_idx, buf) in buffers.iter().enumerate() {
+        let player_idx = recording_player_indices[buf_idx];
+        let player_score = game.players[player_idx].state.count_points() as f32;
+        let features = std::mem::take(&mut *buf.borrow_mut());
+        all_samples.extend(td_samples(model, device, features, player_score));
+    }
+
+    (all_samples, p0_score)
 }
 
 // ---- Self-play benchmark + training loop ----
@@ -414,6 +445,7 @@ pub fn self_play_train(
     epochs_per_iteration: usize,
     bench_games: usize,
     checkpoints: bool,
+    start_iteration: usize,
 ) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
     MyBackend::seed(&device, TRAIN_SEED);
@@ -421,8 +453,9 @@ pub fn self_play_train(
     let mut replay_buffer: std::collections::VecDeque<Vec<TrainingSample>> = std::collections::VecDeque::new();
 
     let scores_log_path = format!("{artifact_dir}/training_scores.csv");
-    // Write header
-    std::fs::write(&scores_log_path, "iteration,avg_score,winrate\n").ok();
+    if start_iteration == 0 {
+        std::fs::write(&scores_log_path, "iteration,avg_score,winrate\n").ok();
+    }
 
     let genes = Arc::new(bot::default_genes());
     let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
@@ -440,18 +473,24 @@ pub fn self_play_train(
         });
 
     for iteration in 0..num_iterations {
-        let epsilon = (0.2 * (0.95f32).powi(iteration as i32)).max(0.07);
+        let global_iter = start_iteration + iteration;
+        let epsilon = (0.2 * (0.95f32).powi(global_iter as i32)).max(0.07);
         println!(
-            "\n=== Iteration {}/{num_iterations} (epsilon={epsilon:.3}) ===",
-            iteration + 1
+            "\n=== Iteration {} (epsilon={epsilon:.3}) ===",
+            global_iter + 1
         );
 
-        let games_each = games_per_iteration / 6;
+        let games_each = games_per_iteration / 3;
 
-        // 6 configs: 1v1 GA, 1v1 self, 3p vs 2 GA, 4p vs 3 GA, 3p vs GA + self, 4p vs 2 GA + self
-        let game_configs: Vec<u8> = (0..6)
-            .flat_map(|config| std::iter::repeat(config).take(games_each))
-            .collect();
+        // 3 configs, pure self-play: 1v1, 3p, 4p (all DQN opponents, all recording)
+        let game_configs: Vec<(usize, usize)> = [
+            (1, 1), // 1v1: 1 opp, 1 DQN
+            (2, 2), // 3p: 2 opps, 2 DQN
+            (3, 3), // 4p: 3 opps, 3 DQN
+        ]
+        .iter()
+        .flat_map(|&cfg| std::iter::repeat(cfg).take(games_each))
+        .collect();
 
         let models: Vec<QwixxModel<MyBackend>> = (0..game_configs.len()).map(|_| model.clone()).collect();
 
@@ -459,31 +498,9 @@ pub fn self_play_train(
             .into_par_iter()
             .zip(models.into_par_iter())
             .enumerate()
-            .map(|(game_idx, (config, thread_model))| {
+            .map(|(game_idx, ((num_opps, num_dqn), thread_model))| {
                 let seed = TRAIN_SEED.wrapping_add((iteration * games_per_iteration + game_idx) as u64);
-                let thread_model_arc = Arc::new(thread_model);
-                let dqn_self = || -> Box<dyn Strategy> {
-                    Box::new(DqnStrategy::from_shared(thread_model_arc.clone(), device.clone()))
-                };
-                let opps: Vec<Box<dyn Strategy>> = match config {
-                    // 1v1: vs GA champion
-                    0 => vec![Box::new(champion.clone())],
-                    // 1v1: vs self
-                    1 => vec![dqn_self()],
-                    // 3-player: vs 2 GA champions
-                    2 => vec![Box::new(champion.clone()), Box::new(champion.clone())],
-                    // 4-player: vs 3 GA champions
-                    3 => vec![
-                        Box::new(champion.clone()),
-                        Box::new(champion.clone()),
-                        Box::new(champion.clone()),
-                    ],
-                    // 3-player: vs GA + self
-                    4 => vec![Box::new(champion.clone()), dqn_self()],
-                    // 4-player: vs 2 GA + self
-                    _ => vec![Box::new(champion.clone()), Box::new(champion.clone()), dqn_self()],
-                };
-                play_training_game(&thread_model_arc, &device, opps, epsilon, seed)
+                play_training_game(&thread_model, &device, num_opps, num_dqn, &champion, epsilon, seed)
             })
             .collect();
 
@@ -514,9 +531,9 @@ pub fn self_play_train(
         // Optional: persist a per-iteration checkpoint.
         if checkpoints {
             let src = format!("{artifact_dir}/model.mpk");
-            let dst = format!("{artifact_dir}/iter-{}.mpk", iteration + 1);
+            let dst = format!("{artifact_dir}/iter-{}.mpk", global_iter + 1);
             if let Err(e) = std::fs::copy(&src, &dst) {
-                eprintln!("  Failed to save iter-{} checkpoint: {e}", iteration + 1);
+                eprintln!("  Failed to save iter-{} checkpoint: {e}", global_iter + 1);
             }
         }
 
@@ -528,34 +545,32 @@ pub fn self_play_train(
         let winrate_opt = if bench_games > 0 {
             let winrate = benchmark_vs_ga(artifact_dir, &champion, bench_games);
             println!(
-                "  Iteration {:>3}/{}: avg score {:.1}, winrate {:.1}%, elapsed {}m{}s",
-                iteration + 1,
-                num_iterations,
+                "  Iteration {:>3}: avg score {:.1}, winrate {:.1}%, elapsed {}m{}s",
+                global_iter + 1,
                 avg_score,
                 winrate * 100.0,
                 mins,
                 secs,
             );
             if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
-                writeln!(f, "{},{avg_score:.2},{:.2}", iteration + 1, winrate * 100.0).ok();
+                writeln!(f, "{},{avg_score:.2},{:.2}", global_iter + 1, winrate * 100.0).ok();
             }
             Some(winrate)
         } else {
             println!(
-                "  Iteration {:>3}/{}: avg score {:.1}, elapsed {}m{}s",
-                iteration + 1,
-                num_iterations,
+                "  Iteration {:>3}: avg score {:.1}, elapsed {}m{}s",
+                global_iter + 1,
                 avg_score,
                 mins,
                 secs,
             );
             if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
-                writeln!(f, "{},{avg_score:.2}", iteration + 1).ok();
+                writeln!(f, "{},{avg_score:.2}", global_iter + 1).ok();
             }
             None
         };
 
-        iteration_stats.push((iteration + 1, avg_score, winrate_opt));
+        iteration_stats.push((global_iter + 1, avg_score, winrate_opt));
     }
 
     println!("\nSelf-play training complete. Model saved to {artifact_dir}/model");
