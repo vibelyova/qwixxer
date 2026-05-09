@@ -85,11 +85,7 @@ pub fn lockable_rows(state: &State) -> u8 {
 /// whose first opponent is `first_opp` plus any `extra_opps`. Used by
 /// `observe_opponents` (viewing opponents from the DqnStrategy's perspective)
 /// and by `leader_prediction` (viewing opponents from the leader's perspective).
-pub fn build_opponent_context_for(
-    our_score: isize,
-    first_opp: &State,
-    extra_opps: &[State],
-) -> OpponentContext {
+pub fn build_opponent_context_for(our_score: isize, first_opp: &State, extra_opps: &[State]) -> OpponentContext {
     let num_opponents = 1 + extra_opps.len() as u8;
     let mut max_opp_strikes = first_opp.strikes;
     let mut max_opp_score = first_opp.count_points();
@@ -130,8 +126,7 @@ pub fn batch_forward_features(
     }
     let n = features_list.len();
     let flat: Vec<f32> = features_list.iter().flat_map(|f| f.iter().copied()).collect();
-    let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), device)
-        .reshape([n, NUM_FEATURES]);
+    let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), device).reshape([n, NUM_FEATURES]);
     let output = model.forward(input);
     let values = output.into_data().to_vec::<f32>().unwrap();
     (0..n).map(|i| (values[2 * i], values[2 * i + 1])).collect()
@@ -171,20 +166,12 @@ pub fn rank_candidates_with_opp_context(
         // Our context reflects post-move score (only field that actually
         // moves per candidate — other fields depend on opponents' states
         // which don't change during our move).
-        let our_ctx = build_opponent_context_for(
-            post_our.count_points(),
-            leader,
-            non_leader_states,
-        );
+        let our_ctx = build_opponent_context_for(post_our.count_points(), leader, non_leader_states);
         features_list.push(state_features(post_our, &our_ctx));
 
         // Leader's context reflects us having moved (our score, strikes,
         // locks, progress, lockable-row count all feed into their view).
-        let opp_ctx = build_opponent_context_for(
-            leader.count_points(),
-            post_our,
-            non_leader_states,
-        );
+        let opp_ctx = build_opponent_context_for(leader.count_points(), post_our, non_leader_states);
         features_list.push(state_features(leader, &opp_ctx));
     }
     let values = batch_forward_features(model, device, &features_list);
@@ -299,12 +286,7 @@ pub fn state_features(state: &State, ctx: &OpponentContext) -> [f32; NUM_FEATURE
 ///
 /// Requires evaluating V on the leading opponent's actual state — the caller
 /// supplies `(opp_mean, opp_log_var)` from that evaluation.
-pub fn win_rank_score(
-    us_mean: f32,
-    us_log_var: f32,
-    opp_mean: f32,
-    opp_log_var: f32,
-) -> f32 {
+pub fn win_rank_score(us_mean: f32, us_log_var: f32, opp_mean: f32, opp_log_var: f32) -> f32 {
     let us_lv = us_log_var.clamp(LOG_VAR_MIN, LOG_VAR_MAX);
     let opp_lv = opp_log_var.clamp(LOG_VAR_MIN, LOG_VAR_MAX);
     let total_var = us_lv.exp() + opp_lv.exp();
@@ -333,8 +315,12 @@ pub struct QwixxModelConfig {
 impl QwixxModelConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> QwixxModel<B> {
         QwixxModel {
-            layer1: LinearConfig::new(NUM_FEATURES, self.hidden1).with_bias(true).init(device),
-            layer2: LinearConfig::new(self.hidden1, self.hidden2).with_bias(true).init(device),
+            layer1: LinearConfig::new(NUM_FEATURES, self.hidden1)
+                .with_bias(true)
+                .init(device),
+            layer2: LinearConfig::new(self.hidden1, self.hidden2)
+                .with_bias(true)
+                .init(device),
             output_mean: LinearConfig::new(self.hidden2, 1).with_bias(true).init(device),
             output_log_var: LinearConfig::new(self.hidden2, 1).with_bias(true).init(device),
             activation: Relu::new(),
@@ -356,8 +342,7 @@ impl<B: Backend> QwixxModel<B> {
 
     /// Evaluate a single state, returning `(mean, log_var)`.
     pub fn evaluate_state(&self, features: &[f32; NUM_FEATURES], device: &B::Device) -> (f32, f32) {
-        let input = Tensor::<B, 1>::from_floats(features.as_slice(), device)
-            .reshape([1, NUM_FEATURES]);
+        let input = Tensor::<B, 1>::from_floats(features.as_slice(), device).reshape([1, NUM_FEATURES]);
         let output = self.forward(input);
         let v = output.into_data().to_vec::<f32>().unwrap();
         (v[0], v[1])
@@ -391,10 +376,7 @@ impl DqnStrategy {
     /// Construct a strategy around an already-loaded model. Used by diagnostic
     /// binaries that want to spin up many fresh strategies sharing the same
     /// model (tensors are Arc-backed, so cloning is cheap).
-    pub fn from_model(
-        model: QwixxModel<MyBackend>,
-        device: burn::backend::ndarray::NdArrayDevice,
-    ) -> Self {
+    pub fn from_model(model: QwixxModel<MyBackend>, device: burn::backend::ndarray::NdArrayDevice) -> Self {
         DqnStrategy { model, device }
     }
 
@@ -406,9 +388,7 @@ impl DqnStrategy {
         let record: <QwixxModel<MyBackend> as Module<MyBackend>>::Record = recorder
             .load(model_bytes.to_vec(), &device)
             .expect("Failed to load model from bytes");
-        let model = QwixxModelConfig::new()
-            .init::<MyBackend>(&device)
-            .load_record(record);
+        let model = QwixxModelConfig::new().init::<MyBackend>(&device).load_record(record);
         DqnStrategy { model, device }
     }
 
@@ -428,10 +408,7 @@ impl Bot for DqnStrategy {
     fn evaluate_batch(&self, candidates: &[State], opp_states: &[State]) -> Vec<f32> {
         if opp_states.is_empty() {
             let ctx = OpponentContext::default();
-            let feats: Vec<[f32; NUM_FEATURES]> = candidates
-                .iter()
-                .map(|s| state_features(s, &ctx))
-                .collect();
+            let feats: Vec<[f32; NUM_FEATURES]> = candidates.iter().map(|s| state_features(s, &ctx)).collect();
             return batch_forward_features(&self.model, &self.device, &feats)
                 .into_iter()
                 .map(|(mean, _)| mean)
@@ -449,11 +426,9 @@ impl Bot for DqnStrategy {
             .collect();
         let mut features_list = Vec::with_capacity(candidates.len() * 2);
         for cand in candidates {
-            let our_ctx =
-                build_opponent_context_for(cand.count_points(), leader, &non_leaders);
+            let our_ctx = build_opponent_context_for(cand.count_points(), leader, &non_leaders);
             features_list.push(state_features(cand, &our_ctx));
-            let opp_ctx =
-                build_opponent_context_for(leader.count_points(), cand, &non_leaders);
+            let opp_ctx = build_opponent_context_for(leader.count_points(), cand, &non_leaders);
             features_list.push(state_features(leader, &opp_ctx));
         }
         let values = batch_forward_features(&self.model, &self.device, &features_list);

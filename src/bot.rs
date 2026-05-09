@@ -11,12 +11,7 @@ use rand::{prelude::*, rngs::SmallRng, Rng};
 
 pub type GeneFn = fn(&State) -> f64;
 
-pub const GENE_NAMES: [&str; 4] = [
-    "weighted_prob",
-    "strikes",
-    "concentration",
-    "blanks",
-];
+pub const GENE_NAMES: [&str; 4] = ["weighted_prob", "strikes", "concentration", "blanks"];
 
 pub fn default_genes() -> Vec<GeneFn> {
     vec![
@@ -36,13 +31,7 @@ pub fn default_genes() -> Vec<GeneFn> {
         // strikes
         |state| state.strikes as f64,
         // concentration: sum of row totals squared
-        |state| {
-            state
-                .row_totals()
-                .iter()
-                .map(|&t| (t as f64) * (t as f64))
-                .sum()
-        },
+        |state| state.row_totals().iter().map(|&t| (t as f64) * (t as f64)).sum(),
         // blanks: skipped positions
         |state| state.blanks() as f64,
     ]
@@ -120,13 +109,7 @@ impl DNA {
         let content = std::fs::read_to_string(path)?;
         let weights: Vec<f64> = content
             .lines()
-            .map(|line| {
-                line.split_whitespace()
-                    .last()
-                    .unwrap()
-                    .parse()
-                    .unwrap()
-            })
+            .map(|line| line.split_whitespace().last().unwrap().parse().unwrap())
             .collect();
         assert_eq!(weights.len(), genes.len(), "Weight count mismatch");
         Ok(DNA { weights, genes })
@@ -217,11 +200,7 @@ impl Population {
             let mut game = Game::new(players);
             game.play();
 
-            let points: Vec<isize> = game
-                .players
-                .into_iter()
-                .map(|p| p.state.count_points())
-                .collect();
+            let points: Vec<isize> = game.players.into_iter().map(|p| p.state.count_points()).collect();
             let max_points = *points.iter().max().unwrap();
 
             for (j, &di) in group.iter().enumerate() {
@@ -242,33 +221,28 @@ impl Population {
         const NUMBER_OF_SIMULATIONS: usize = 20_000;
 
         // Pre-generate seeds
-        let seeds: Vec<u64> = (0..NUMBER_OF_SIMULATIONS)
-            .map(|_| self.rng.gen())
-            .collect();
+        let seeds: Vec<u64> = (0..NUMBER_OF_SIMULATIONS).map(|_| self.rng.gen()).collect();
 
         // Run simulations (parallel when available)
         let dna = &self.dna;
 
         #[cfg(feature = "parallel")]
-        let global_rank = seeds
-            .par_iter()
-            .map(|&seed| Self::rank_generation(dna, seed))
-            .reduce(
-                || vec![0.0f32; dna.len()],
-                |mut acc, rank| {
-                    acc.iter_mut().zip(rank.iter()).for_each(|(a, b)| *a += b);
-                    acc
-                },
-            );
-
-        #[cfg(not(feature = "parallel"))]
-        let global_rank = seeds
-            .iter()
-            .map(|&seed| Self::rank_generation(dna, seed))
-            .fold(vec![0.0f32; dna.len()], |mut acc, rank| {
+        let global_rank = seeds.par_iter().map(|&seed| Self::rank_generation(dna, seed)).reduce(
+            || vec![0.0f32; dna.len()],
+            |mut acc, rank| {
                 acc.iter_mut().zip(rank.iter()).for_each(|(a, b)| *a += b);
                 acc
-            });
+            },
+        );
+
+        #[cfg(not(feature = "parallel"))]
+        let global_rank = seeds.iter().map(|&seed| Self::rank_generation(dna, seed)).fold(
+            vec![0.0f32; dna.len()],
+            |mut acc, rank| {
+                acc.iter_mut().zip(rank.iter()).for_each(|(a, b)| *a += b);
+                acc
+            },
+        );
 
         let dist = WeightedIndex::new(&global_rank).expect("All weights are zero");
 

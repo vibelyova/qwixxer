@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use qwixxer::*;
 use game::Player;
+use qwixxer::*;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use std::sync::Arc;
@@ -32,14 +32,14 @@ fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
     let genes = Arc::new(bot::default_genes());
     match bot {
         BotType::Ga => {
-            let champion = bot::DNA::load_weights("champion.txt", genes)
-                .expect("No champion.txt found. Run `train ga` first.");
+            let champion =
+                bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt found. Run `train ga` first.");
             Box::new(champion)
         }
         BotType::Dqn => Box::new(dqn::DqnStrategy::load("dqn_model")),
         BotType::Mcts => {
-            let champion = bot::DNA::load_weights("champion.txt", genes)
-                .expect("No champion.txt found. Run `train ga` first.");
+            let champion =
+                bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt found. Run `train ga` first.");
             Box::new(mcts::MonteCarlo::with_ga(200, champion))
         }
         BotType::Opportunist => Box::<strategy::Opportunist>::default(),
@@ -214,7 +214,12 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
     }
 
     // Aggregate stats per strategy (when multiple bots share a strategy)
-    let unique_strategies: Vec<String> = bots.iter().map(|b| b.to_string()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let unique_strategies: Vec<String> = bots
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     if unique_strategies.len() < num_players {
         println!("\n  By strategy:");
 
@@ -382,7 +387,11 @@ fn main() {
         Some(Commands::Evolve) => run_train(),
         #[cfg(feature = "dqn")]
         #[cfg(feature = "dqn")]
-        Some(Commands::DqnSelfplay { iterations, bench, checkpoints }) => run_dqn_selfplay(iterations, bench, checkpoints),
+        Some(Commands::DqnSelfplay {
+            iterations,
+            bench,
+            checkpoints,
+        }) => run_dqn_selfplay(iterations, bench, checkpoints),
         None => {
             // Default: play against MCTS
             run_play(vec![BotType::Mcts], false);

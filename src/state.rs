@@ -1,6 +1,6 @@
 use itertools::Itertools;
-use std::fmt;
 use std::cmp::Ordering;
+use std::fmt;
 
 #[derive(Debug, Clone, Copy)]
 pub struct State {
@@ -38,10 +38,10 @@ impl Default for State {
 /// Only for the purpose of state domination - do not use for regular comparison
 impl PartialEq for State {
     fn eq(&self, other: &Self) -> bool {
-        let asc = self.rows[0] == other.rows[0] && self.rows[1] == other.rows[1] ||
-            self.rows[0] == other.rows[1] && self.rows[1] == other.rows[0];
-        let desc = self.rows[2] == other.rows[2] && self.rows[3] == other.rows[3] ||
-            self.rows[2] == other.rows[3] && self.rows[3] == other.rows[2];
+        let asc = self.rows[0] == other.rows[0] && self.rows[1] == other.rows[1]
+            || self.rows[0] == other.rows[1] && self.rows[1] == other.rows[0];
+        let desc = self.rows[2] == other.rows[2] && self.rows[3] == other.rows[3]
+            || self.rows[2] == other.rows[3] && self.rows[3] == other.rows[2];
         asc && desc && self.strikes == other.strikes
     }
 }
@@ -135,17 +135,17 @@ impl State {
                 }
             } else {
                 // No marks: default free pointer
-                if ascending { Some(2) } else { Some(12) }
+                if ascending {
+                    Some(2)
+                } else {
+                    Some(12)
+                }
             };
 
             // If locked, add 1 to total for the lock bonus (the lock symbol)
             let total = if is_locked { total + 1 } else { total };
 
-            rows[i] = Row {
-                ascending,
-                total,
-                free,
-            };
+            rows[i] = Row { ascending, total, free };
         }
         State { strikes, rows }
     }
@@ -192,8 +192,7 @@ impl State {
                 let mut state_after = self.clone();
                 state_after.apply_move(white_mov);
 
-                on_color(i, state_after.rows[i])
-                    .for_each(|color_mov| double_moves.push((white_mov, color_mov)));
+                on_color(i, state_after.rows[i]).for_each(|color_mov| double_moves.push((white_mov, color_mov)));
             }
             on_color(i, row).for_each(|color_mov| color_moves.push(color_mov));
         }
@@ -279,7 +278,10 @@ impl State {
             .iter()
             .enumerate()
             .filter(|(_, row)| row.can_mark(white_sum))
-            .map(|(i, _)| Mark { row: i, number: white_sum })
+            .map(|(i, _)| Mark {
+                row: i,
+                number: white_sum,
+            })
             .collect()
     }
 
@@ -312,7 +314,11 @@ impl State {
 
     /// Returns the terminal number for a row: 12 for ascending rows (0, 1), 2 for descending rows (2, 3).
     pub fn row_terminal(row: usize) -> u8 {
-        if row < 2 { 12 } else { 2 }
+        if row < 2 {
+            12
+        } else {
+            2
+        }
     }
 
     pub fn would_end_game(&self) -> bool {
@@ -322,7 +328,7 @@ impl State {
 
 fn partial_cmp_two(a: Option<Ordering>, b: Option<Ordering>) -> Option<Ordering> {
     if a.is_none() || b.is_none() {
-        return None
+        return None;
     }
 
     match (a.unwrap(), b.unwrap()) {
@@ -335,7 +341,7 @@ fn partial_cmp_two(a: Option<Ordering>, b: Option<Ordering>) -> Option<Ordering>
         (Ordering::Equal, Ordering::Less) => Some(Ordering::Less),
 
         (Ordering::Equal, Ordering::Equal) => Some(Ordering::Equal),
-        _ => None
+        _ => None,
     }
 }
 
@@ -392,15 +398,22 @@ impl PartialOrd for Row {
             Some(self.total.cmp(&other.total))
         } else {
             // normalize free pointer: for descending rows, reverse it
-            let self_free = if self.ascending { self.free.unwrap() - 2 } else { 12 - self.free.unwrap() };
-            let other_free = if other.ascending { other.free.unwrap() - 2 } else { 12 - other.free.unwrap() };
+            let self_free = if self.ascending {
+                self.free.unwrap() - 2
+            } else {
+                12 - self.free.unwrap()
+            };
+            let other_free = if other.ascending {
+                other.free.unwrap() - 2
+            } else {
+                12 - other.free.unwrap()
+            };
             let totals = self.total.cmp(&other.total);
             let pointers = self_free.cmp(&other_free).reverse(); // earlier is better, hence reverse
             partial_cmp_two(Some(totals), Some(pointers))
         }
     }
 }
-
 
 fn partial_cmp_row_pair(this: (&Row, &Row), other: (&Row, &Row)) -> Option<Ordering> {
     let (a, b) = this;
@@ -460,7 +473,9 @@ impl State {
             .filter(|&mov| {
                 let mut s = *self;
                 s.apply_move(mov);
-                if s.count_locked() <= current_locked { return false; }
+                if s.count_locked() <= current_locked {
+                    return false;
+                }
                 if s.count_locked() >= 2 {
                     return s.count_points() > opp_score;
                 }
@@ -610,7 +625,11 @@ mod tests {
 
     #[test]
     fn ascending_row_marks_in_order() {
-        let mut row = Row { ascending: true, total: 0, free: Some(2) };
+        let mut row = Row {
+            ascending: true,
+            total: 0,
+            free: Some(2),
+        };
         assert!(row.can_mark(2));
         assert!(row.can_mark(7));
         assert!(row.can_mark(12) == false); // need 5 marks first
@@ -623,7 +642,11 @@ mod tests {
 
     #[test]
     fn descending_row_marks_in_order() {
-        let mut row = Row { ascending: false, total: 0, free: Some(12) };
+        let mut row = Row {
+            ascending: false,
+            total: 0,
+            free: Some(12),
+        };
         assert!(row.can_mark(12));
         assert!(row.can_mark(5));
         assert!(!row.can_mark(2)); // need 5 marks first
@@ -636,7 +659,11 @@ mod tests {
 
     #[test]
     fn cannot_mark_out_of_range() {
-        let row = Row { ascending: true, total: 0, free: Some(2) };
+        let row = Row {
+            ascending: true,
+            total: 0,
+            free: Some(2),
+        };
         assert!(!row.can_mark(0));
         assert!(!row.can_mark(1));
         assert!(!row.can_mark(13));
@@ -644,13 +671,21 @@ mod tests {
 
     #[test]
     fn cannot_mark_locked_row() {
-        let row = Row { ascending: true, total: 6, free: None };
+        let row = Row {
+            ascending: true,
+            total: 6,
+            free: None,
+        };
         assert!(!row.can_mark(7));
     }
 
     #[test]
     fn locking_ascending_row() {
-        let mut row = Row { ascending: true, total: 5, free: Some(11) };
+        let mut row = Row {
+            ascending: true,
+            total: 5,
+            free: Some(11),
+        };
         assert!(row.can_mark(12));
         row.mark(12);
         assert_eq!(row.free, None); // locked
@@ -659,7 +694,11 @@ mod tests {
 
     #[test]
     fn locking_descending_row() {
-        let mut row = Row { ascending: false, total: 5, free: Some(3) };
+        let mut row = Row {
+            ascending: false,
+            total: 5,
+            free: Some(3),
+        };
         assert!(row.can_mark(2));
         row.mark(2);
         assert_eq!(row.free, None);
@@ -668,10 +707,18 @@ mod tests {
 
     #[test]
     fn cannot_lock_with_fewer_than_5_marks() {
-        let row = Row { ascending: true, total: 4, free: Some(11) };
+        let row = Row {
+            ascending: true,
+            total: 4,
+            free: Some(11),
+        };
         assert!(!row.can_mark(12));
 
-        let row = Row { ascending: false, total: 4, free: Some(3) };
+        let row = Row {
+            ascending: false,
+            total: 4,
+            free: Some(3),
+        };
         assert!(!row.can_mark(2));
     }
 
@@ -771,12 +818,15 @@ mod tests {
         state.apply_move((0usize, 5u8));
         // 4 is no longer markable in red, but still in yellow
         let moves = state.generate_opponent_moves(4);
-        let rows: Vec<usize> = moves.iter().map(|m| match m {
-            Move::Single(mark) => mark.row,
-            _ => panic!("expected single"),
-        }).collect();
+        let rows: Vec<usize> = moves
+            .iter()
+            .map(|m| match m {
+                Move::Single(mark) => mark.row,
+                _ => panic!("expected single"),
+            })
+            .collect();
         assert!(!rows.contains(&0)); // red excluded
-        assert!(rows.contains(&1));  // yellow still open
+        assert!(rows.contains(&1)); // yellow still open
     }
 
     #[test]
@@ -784,10 +834,13 @@ mod tests {
         let mut state = State::default();
         state.lock([true, false, false, false]);
         let moves = state.generate_opponent_moves(7);
-        let rows: Vec<usize> = moves.iter().map(|m| match m {
-            Move::Single(mark) => mark.row,
-            _ => panic!("expected single"),
-        }).collect();
+        let rows: Vec<usize> = moves
+            .iter()
+            .map(|m| match m {
+                Move::Single(mark) => mark.row,
+                _ => panic!("expected single"),
+            })
+            .collect();
         assert!(!rows.contains(&0));
         assert_eq!(moves.len(), 3);
     }
@@ -851,7 +904,11 @@ mod tests {
     fn make_state(rows: [(bool, u8, Option<u8>); 4], strikes: u8) -> State {
         let mut r = [Row::default(); 4];
         for (i, (asc, total, free)) in rows.iter().enumerate() {
-            r[i] = Row { ascending: *asc, total: *total, free: *free };
+            r[i] = Row {
+                ascending: *asc,
+                total: *total,
+                free: *free,
+            };
         }
         State { strikes, rows: r }
     }
@@ -870,7 +927,12 @@ mod tests {
     fn find_smart_lock_returns_first_lock() {
         // Red has 5 marks, free=11, can mark 12 to lock (first lock of game)
         let state = make_state(
-            [(true, 5, Some(11)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 0, Some(12))],
+            [
+                (true, 5, Some(11)),
+                (true, 0, Some(2)),
+                (false, 0, Some(12)),
+                (false, 0, Some(12)),
+            ],
             0,
         );
         let moves = vec![single(0, 12), single(1, 5)];
@@ -882,7 +944,12 @@ mod tests {
     fn find_smart_lock_forces_winning_game_ending_lock() {
         // Already 1 row locked. Another lock ends the game. We're winning.
         let state = make_state(
-            [(true, 5, Some(11)), (true, 7, None), (false, 0, Some(12)), (false, 0, Some(12))],
+            [
+                (true, 5, Some(11)),
+                (true, 7, None),
+                (false, 0, Some(12)),
+                (false, 0, Some(12)),
+            ],
             0,
         );
         // points = 15 + 28 + 0 + 0 = 43. After lock Red (total becomes 7): 28 + 28 = 56.
@@ -895,7 +962,12 @@ mod tests {
     #[test]
     fn find_smart_lock_blocks_losing_game_ending_lock() {
         let state = make_state(
-            [(true, 5, Some(11)), (true, 7, None), (false, 0, Some(12)), (false, 0, Some(12))],
+            [
+                (true, 5, Some(11)),
+                (true, 7, None),
+                (false, 0, Some(12)),
+                (false, 0, Some(12)),
+            ],
             0,
         );
         // points = 43. After lock: 56. If opp_score = 100, we'd lose.
@@ -912,7 +984,12 @@ mod tests {
         // Blue (total=8) locking 2: total becomes 10 → 55 points on that row.
         // Blue lock scores higher, should be picked.
         let state = make_state(
-            [(true, 5, Some(11)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 8, Some(3))],
+            [
+                (true, 5, Some(11)),
+                (true, 0, Some(2)),
+                (false, 0, Some(12)),
+                (false, 8, Some(3)),
+            ],
             0,
         );
         let moves = vec![single(0, 12), single(3, 2)];
@@ -934,11 +1011,18 @@ mod tests {
         // Same state but Red marked at 5 (free=6) vs 7 (free=8).
         // free=6 is earlier → dominates.
         let base = make_state(
-            [(true, 0, Some(5)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 0, Some(12))],
+            [
+                (true, 0, Some(5)),
+                (true, 0, Some(2)),
+                (false, 0, Some(12)),
+                (false, 0, Some(12)),
+            ],
             0,
         );
-        let mut a = base; a.apply_mark(Mark { row: 0, number: 5 }); // free→6
-        let mut b = base; b.apply_mark(Mark { row: 0, number: 7 }); // free→8
+        let mut a = base;
+        a.apply_mark(Mark { row: 0, number: 5 }); // free→6
+        let mut b = base;
+        b.apply_mark(Mark { row: 0, number: 7 }); // free→8
         assert!(post_state_dominates(&a, &b));
         assert!(!post_state_dominates(&b, &a));
     }
@@ -947,11 +1031,21 @@ mod tests {
     fn dominance_higher_total_same_progress_wins() {
         // Red total=5 free=6 vs Red total=3 free=6. Same free, higher total dominates.
         let a = make_state(
-            [(true, 5, Some(6)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 0, Some(12))],
+            [
+                (true, 5, Some(6)),
+                (true, 0, Some(2)),
+                (false, 0, Some(12)),
+                (false, 0, Some(12)),
+            ],
             0,
         );
         let b = make_state(
-            [(true, 3, Some(6)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 0, Some(12))],
+            [
+                (true, 3, Some(6)),
+                (true, 0, Some(2)),
+                (false, 0, Some(12)),
+                (false, 0, Some(12)),
+            ],
             0,
         );
         assert!(post_state_dominates(&a, &b));
@@ -963,11 +1057,21 @@ mod tests {
         // Red locked (total=8) vs Red unlocked (total=6, free=12).
         // Locked has more marks but no future options — incomparable.
         let a = make_state(
-            [(true, 8, None), (true, 0, Some(2)), (false, 0, Some(12)), (false, 0, Some(12))],
+            [
+                (true, 8, None),
+                (true, 0, Some(2)),
+                (false, 0, Some(12)),
+                (false, 0, Some(12)),
+            ],
             0,
         );
         let b = make_state(
-            [(true, 6, Some(12)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 0, Some(12))],
+            [
+                (true, 6, Some(12)),
+                (true, 0, Some(2)),
+                (false, 0, Some(12)),
+                (false, 0, Some(12)),
+            ],
             0,
         );
         assert!(!post_state_dominates(&a, &b));
@@ -979,11 +1083,21 @@ mod tests {
         // Red=good Yellow=bad vs Red=bad Yellow=good.
         // Same-direction rows are interchangeable, so these are equal.
         let a = make_state(
-            [(true, 3, Some(6)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 0, Some(12))],
+            [
+                (true, 3, Some(6)),
+                (true, 0, Some(2)),
+                (false, 0, Some(12)),
+                (false, 0, Some(12)),
+            ],
             0,
         );
         let b = make_state(
-            [(true, 0, Some(2)), (true, 3, Some(6)), (false, 0, Some(12)), (false, 0, Some(12))],
+            [
+                (true, 0, Some(2)),
+                (true, 3, Some(6)),
+                (false, 0, Some(12)),
+                (false, 0, Some(12)),
+            ],
             0,
         );
         assert!(!post_state_dominates(&a, &b)); // equal, not strictly greater
@@ -996,8 +1110,10 @@ mod tests {
         // Marking Red 5 vs marking Green 9 — different directions.
         // Neither dominates (one improved ascending, other improved descending).
         let base = State::default();
-        let mut a = base; a.apply_mark(Mark { row: 0, number: 5 });
-        let mut b = base; b.apply_mark(Mark { row: 2, number: 9 });
+        let mut a = base;
+        a.apply_mark(Mark { row: 0, number: 5 });
+        let mut b = base;
+        b.apply_mark(Mark { row: 2, number: 9 });
         assert!(!post_state_dominates(&a, &b));
         assert!(!post_state_dominates(&b, &a));
     }
@@ -1005,11 +1121,21 @@ mod tests {
     #[test]
     fn dominance_fewer_strikes_wins() {
         let a = make_state(
-            [(true, 0, Some(2)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 0, Some(12))],
+            [
+                (true, 0, Some(2)),
+                (true, 0, Some(2)),
+                (false, 0, Some(12)),
+                (false, 0, Some(12)),
+            ],
             0,
         );
         let b = make_state(
-            [(true, 0, Some(2)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 0, Some(12))],
+            [
+                (true, 0, Some(2)),
+                (true, 0, Some(2)),
+                (false, 0, Some(12)),
+                (false, 0, Some(12)),
+            ],
             1,
         );
         assert!(post_state_dominates(&a, &b));
@@ -1025,11 +1151,21 @@ mod tests {
         // A still > B' because via assignment Red↔Yellow, Yellow↔Red:
         // A.Yellow(0,2) vs B'.Red(0,2) = Equal, A.Red(5,6) vs B'.Yellow(3,6) = Greater
         let a = make_state(
-            [(true, 5, Some(6)), (true, 0, Some(2)), (false, 0, Some(12)), (false, 0, Some(12))],
+            [
+                (true, 5, Some(6)),
+                (true, 0, Some(2)),
+                (false, 0, Some(12)),
+                (false, 0, Some(12)),
+            ],
             0,
         );
         let b_swapped = make_state(
-            [(true, 0, Some(2)), (true, 3, Some(6)), (false, 0, Some(12)), (false, 0, Some(12))],
+            [
+                (true, 0, Some(2)),
+                (true, 3, Some(6)),
+                (false, 0, Some(12)),
+                (false, 0, Some(12)),
+            ],
             0,
         );
         assert!(post_state_dominates(&a, &b_swapped));
@@ -1040,7 +1176,7 @@ mod tests {
     #[test]
     fn can_mark_fresh_state() {
         let s = State::default();
-        assert!(s.can_mark(0, 2));  // red, ascending, free=2
+        assert!(s.can_mark(0, 2)); // red, ascending, free=2
         assert!(!s.can_mark(0, 12)); // need 5+ marks to mark terminal
         assert!(s.can_mark(2, 12)); // green, descending, free=12
     }
@@ -1075,9 +1211,10 @@ mod tests {
     #[test]
     fn would_lock_row_detects_lock() {
         let mut s = State::default();
-        for n in 2..=6 { s.apply_mark(Mark { row: 0, number: n }); }
+        for n in 2..=6 {
+            s.apply_mark(Mark { row: 0, number: n });
+        }
         assert!(s.would_lock_row(Mark { row: 0, number: 12 }));
         assert!(!s.would_lock_row(Mark { row: 0, number: 7 }));
     }
-
 }

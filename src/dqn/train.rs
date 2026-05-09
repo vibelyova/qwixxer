@@ -5,9 +5,8 @@
 
 use crate::bot::{self, DNA};
 use crate::dqn::{
-    build_opponent_context_for, rank_candidates_with_opp_context,
-    state_features, DqnStrategy, MyBackend, OpponentContext, QwixxModel, QwixxModelConfig,
-    LOG_VAR_MAX, LOG_VAR_MIN, NUM_FEATURES, TRAIN_SEED,
+    build_opponent_context_for, rank_candidates_with_opp_context, state_features, DqnStrategy, MyBackend,
+    OpponentContext, QwixxModel, QwixxModelConfig, LOG_VAR_MAX, LOG_VAR_MIN, NUM_FEATURES, TRAIN_SEED,
 };
 use crate::state::{Mark, State};
 use crate::strategy::Strategy;
@@ -15,16 +14,13 @@ use burn::{
     backend::Autodiff,
     data::{
         dataloader::{batcher::Batcher, DataLoaderBuilder},
-        dataset::{Dataset, InMemDataset},
+        dataset::InMemDataset,
     },
     optim::AdamConfig,
     prelude::*,
     record::CompactRecorder,
     tensor::backend::AutodiffBackend,
-    train::{
-        metric::LossMetric, InferenceStep, Learner, RegressionOutput, SupervisedTraining,
-        TrainOutput, TrainStep,
-    },
+    train::{metric::LossMetric, InferenceStep, Learner, RegressionOutput, SupervisedTraining, TrainOutput, TrainStep},
 };
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use rayon::prelude::*;
@@ -75,7 +71,11 @@ impl<B: Backend> QwixxModel<B> {
 
         let loss = mu_loss + sigma_loss.mul_scalar(SIGMA_LOSS_WEIGHT);
 
-        RegressionOutput { loss, output: mean, targets }
+        RegressionOutput {
+            loss,
+            output: mean,
+            targets,
+        }
     }
 }
 
@@ -165,12 +165,15 @@ impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
         let targets: Vec<f32> = items.iter().map(|s| s.value).collect();
         let final_scores: Vec<f32> = items.iter().map(|s| s.final_score).collect();
 
-        let inputs = Tensor::<B, 1>::from_floats(inputs.as_slice(), device)
-            .reshape([batch_size, NUM_FEATURES]);
+        let inputs = Tensor::<B, 1>::from_floats(inputs.as_slice(), device).reshape([batch_size, NUM_FEATURES]);
         let targets = Tensor::<B, 1>::from_floats(targets.as_slice(), device);
         let final_scores = Tensor::<B, 1>::from_floats(final_scores.as_slice(), device);
 
-        QwixxBatch { inputs, targets, final_scores }
+        QwixxBatch {
+            inputs,
+            targets,
+            final_scores,
+        }
     }
 }
 
@@ -188,8 +191,7 @@ fn batch_eval_features(
     }
     let n = features_list.len();
     let flat: Vec<f32> = features_list.iter().flat_map(|f| f.iter().copied()).collect();
-    let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), device)
-        .reshape([n, NUM_FEATURES]);
+    let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), device).reshape([n, NUM_FEATURES]);
     let output = model.forward(input);
     let values = output.into_data().to_vec::<f32>().unwrap();
     (0..n).map(|i| (values[2 * i], values[2 * i + 1])).collect()
@@ -255,13 +257,7 @@ impl RecordingDqn {
     /// opp context, matching `DqnStrategy` Bot impl.
     fn rank(&self, our_post_states: &[State], opp_states: &[State]) -> Vec<f32> {
         let (leader, non_leaders) = self.find_leader(opp_states);
-        rank_candidates_with_opp_context(
-            &self.model,
-            &self.device,
-            leader,
-            &non_leaders,
-            our_post_states,
-        )
+        rank_candidates_with_opp_context(&self.model, &self.device, leader, &non_leaders, our_post_states)
     }
 
     fn record_features(&self, state: &State, opp_states: &[State]) {
@@ -383,7 +379,13 @@ impl Strategy for RecordingDqn {
         }
     }
 
-    fn passive_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], _active_player: usize) -> Option<Mark> {
+    fn passive_phase1(
+        &mut self,
+        state: &State,
+        opp_states: &[State],
+        dice: [u8; 6],
+        _active_player: usize,
+    ) -> Option<Mark> {
         let white_sum = dice[0] + dice[1];
         let marks = state.generate_white_moves(white_sum);
         if marks.is_empty() {
@@ -460,8 +462,7 @@ fn play_training_game(
     let final_score = game.players[0].state.count_points() as f32;
 
     // Drain the recorded buffer (still shared with the RecordingDqn inside player 0).
-    let recorded_features: Vec<[f32; NUM_FEATURES]> =
-        std::mem::take(&mut *recorded.borrow_mut());
+    let recorded_features: Vec<[f32; NUM_FEATURES]> = std::mem::take(&mut *recorded.borrow_mut());
 
     let lambda = 0.8f32;
     let n = recorded_features.len();
@@ -524,7 +525,11 @@ fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 
                 game.play();
                 let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
                 let dqn_idx = rotation;
-                if scores[dqn_idx] > scores[1 - dqn_idx] { 1u32 } else { 0u32 }
+                if scores[dqn_idx] > scores[1 - dqn_idx] {
+                    1u32
+                } else {
+                    0u32
+                }
             },
         )
         .sum();
@@ -542,8 +547,7 @@ pub fn self_play_train(
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
     MyBackend::seed(&device, TRAIN_SEED);
     let buffer_iterations = 3;
-    let mut replay_buffer: std::collections::VecDeque<Vec<TrainingSample>> =
-        std::collections::VecDeque::new();
+    let mut replay_buffer: std::collections::VecDeque<Vec<TrainingSample>> = std::collections::VecDeque::new();
 
     let scores_log_path = format!("{artifact_dir}/training_scores.csv");
     // Write header
@@ -587,9 +591,7 @@ pub fn self_play_train(
             .collect();
 
         // Pre-clone models — one per game. Cloning is cheap (NdArray tensors are Arc-backed).
-        let models: Vec<QwixxModel<MyBackend>> = (0..game_configs.len())
-            .map(|_| model.clone())
-            .collect();
+        let models: Vec<QwixxModel<MyBackend>> = (0..game_configs.len()).map(|_| model.clone()).collect();
 
         let game_results: Vec<(Vec<TrainingSample>, f32)> = game_configs
             .into_par_iter()
@@ -620,18 +622,13 @@ pub fn self_play_train(
                     // 3-player: vs GA + self
                     4 => vec![Box::new(champion.clone()), dqn_self()],
                     // 4-player: vs 2 GA + self
-                    _ => vec![
-                        Box::new(champion.clone()),
-                        Box::new(champion.clone()),
-                        dqn_self(),
-                    ],
+                    _ => vec![Box::new(champion.clone()), Box::new(champion.clone()), dqn_self()],
                 };
                 play_training_game(&thread_model, &device, opps, epsilon, seed)
             })
             .collect();
 
-        let new_samples: Vec<TrainingSample> =
-            game_results.iter().flat_map(|(s, _)| s.iter().cloned()).collect();
+        let new_samples: Vec<TrainingSample> = game_results.iter().flat_map(|(s, _)| s.iter().cloned()).collect();
         let game_scores: Vec<f32> = game_results.iter().map(|(_, score)| *score).collect();
         let avg_score = if game_scores.is_empty() {
             0.0
@@ -673,7 +670,12 @@ pub fn self_play_train(
             let winrate = benchmark_vs_ga(artifact_dir, &champion, bench_games);
             println!(
                 "  Iteration {:>3}/{}: avg score {:.1}, winrate {:.1}%, elapsed {}m{}s",
-                iteration + 1, num_iterations, avg_score, winrate * 100.0, mins, secs,
+                iteration + 1,
+                num_iterations,
+                avg_score,
+                winrate * 100.0,
+                mins,
+                secs,
             );
             if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
                 writeln!(f, "{},{avg_score:.2},{:.2}", iteration + 1, winrate * 100.0).ok();
@@ -682,7 +684,11 @@ pub fn self_play_train(
         } else {
             println!(
                 "  Iteration {:>3}/{}: avg score {:.1}, elapsed {}m{}s",
-                iteration + 1, num_iterations, avg_score, mins, secs,
+                iteration + 1,
+                num_iterations,
+                avg_score,
+                mins,
+                secs,
             );
             if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
                 writeln!(f, "{},{avg_score:.2}", iteration + 1).ok();
@@ -701,9 +707,7 @@ pub fn self_play_train(
             .iter()
             .filter_map(|&(i, s, w)| w.map(|w| (i, s, w)))
             .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
-        let best_score = iteration_stats
-            .iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let best_score = iteration_stats.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         if let Some((i, s, w)) = best_wr {
             println!("  Best winrate:    iter {i:>3}: {:.1}% (avg score {s:.1})", w * 100.0);
         }
@@ -728,8 +732,12 @@ fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epoch
         .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
         .unwrap_or_else(|_| QwixxModelConfig::new().init::<MyAutodiffBackend>(&device));
 
-    let batcher_train = QwixxBatcher::<MyAutodiffBackend> { _phantom: std::marker::PhantomData };
-    let batcher_valid = QwixxBatcher::<MyBackend> { _phantom: std::marker::PhantomData };
+    let batcher_train = QwixxBatcher::<MyAutodiffBackend> {
+        _phantom: std::marker::PhantomData,
+    };
+    let batcher_valid = QwixxBatcher::<MyBackend> {
+        _phantom: std::marker::PhantomData,
+    };
 
     let dataloader_train = DataLoaderBuilder::new(batcher_train)
         .batch_size(1024)

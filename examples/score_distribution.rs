@@ -9,13 +9,13 @@
 //! Run:    cargo run --release --example score_distribution
 //! Output: /tmp/score_distribution.csv  (one column: final_score)
 
+use burn::module::Module;
+use burn::record::CompactRecorder;
 use qwixxer::bot::{self, DNA};
-use qwixxer::dqn::{MyBackend, QwixxModel, QwixxModelConfig, DqnStrategy};
+use qwixxer::dqn::{DqnStrategy, MyBackend, QwixxModel, QwixxModelConfig};
 use qwixxer::game::{Game, Player};
 use qwixxer::state::{Mark, State};
 use qwixxer::strategy::Strategy;
-use burn::module::Module;
-use burn::record::CompactRecorder;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use rayon::prelude::*;
@@ -61,7 +61,13 @@ impl Strategy for Snapshotter {
         self.inner.active_phase2(state, opp_states, dice, has_marked)
     }
 
-    fn passive_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], active_player: usize) -> Option<Mark> {
+    fn passive_phase1(
+        &mut self,
+        state: &State,
+        opp_states: &[State],
+        dice: [u8; 6],
+        active_player: usize,
+    ) -> Option<Mark> {
         self.inner.passive_phase1(state, opp_states, dice, active_player)
     }
 }
@@ -87,10 +93,7 @@ fn main() {
     };
     let players = vec![
         Player::new(Box::new(snap), Box::new(SmallRng::seed_from_u64(42))),
-        Player::new(
-            Box::new(champion.clone()),
-            Box::new(SmallRng::seed_from_u64(43)),
-        ),
+        Player::new(Box::new(champion.clone()), Box::new(SmallRng::seed_from_u64(43))),
     ];
     let mut game = Game::new(players);
     game.play();
@@ -104,9 +107,7 @@ fn main() {
         our_start.count_points(),
         opp_start.count_points()
     );
-    eprintln!(
-        "Running {N_ROLLOUTS} rollouts from this state (DQN as player 0 vs GA)..."
-    );
+    eprintln!("Running {N_ROLLOUTS} rollouts from this state (DQN as player 0 vs GA)...");
 
     // Parallel rollouts: clone model+champion+device per worker (Tensor !Sync).
     let workers: Vec<_> = (0..N_ROLLOUTS)
@@ -150,14 +151,7 @@ fn main() {
     // Quick stats.
     let n = scores.len() as f64;
     let mean = scores.iter().sum::<isize>() as f64 / n;
-    let var = scores
-        .iter()
-        .map(|&s| (s as f64 - mean).powi(2))
-        .sum::<f64>()
-        / (n - 1.0);
+    let var = scores.iter().map(|&s| (s as f64 - mean).powi(2)).sum::<f64>() / (n - 1.0);
     let std = var.sqrt();
-    eprintln!(
-        "wrote {output_path} — mean={mean:.2}, std={std:.2}, n={}",
-        scores.len()
-    );
+    eprintln!("wrote {output_path} — mean={mean:.2}, std={std:.2}, n={}", scores.len());
 }

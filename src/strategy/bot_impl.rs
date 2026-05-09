@@ -1,5 +1,5 @@
-use crate::state::{post_state_dominates, Mark, State};
 use super::Bot;
+use crate::state::{post_state_dominates, Mark, State};
 
 fn opp_best_phase1_score(opp_states: &[State], white_sum: u8) -> isize {
     opp_states
@@ -83,8 +83,9 @@ fn pick_best_mark(
         .map(|(i, &s)| (Some(marks[i]), s))
         .chain(std::iter::once((None, baseline)))
         .filter(|(_, post)| post.would_end_game() && post.count_points() > opp_best)
-        .max_by_key(|(_, post)| post.count_points()) {
-            return mark;
+        .max_by_key(|(_, post)| post.count_points())
+    {
+        return mark;
     }
 
     // Build candidates: marks + baseline. Filter out losing game-ends.
@@ -142,12 +143,7 @@ fn pick_best_mark(
 
 // ---------------------------------------------------------------------------
 
-fn passive_phase1_impl(
-    bot: &impl Bot,
-    state: &State,
-    opp_states: &[State],
-    dice: [u8; 6],
-) -> Option<Mark> {
+fn passive_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
     let white_sum = dice[0] + dice[1];
     let marks = state.generate_white_moves(white_sum);
     let opp_best = opp_best_phase1_score(opp_states, white_sum);
@@ -161,11 +157,7 @@ fn active_phase2_impl(
     dice: [u8; 6],
     has_marked: bool,
 ) -> Option<Mark> {
-    let opp_best = opp_states
-        .iter()
-        .map(|s| s.count_points())
-        .max()
-        .unwrap_or(0);
+    let opp_best = opp_states.iter().map(|s| s.count_points()).max().unwrap_or(0);
     let marks = state.generate_color_moves(dice);
     let baseline = if has_marked {
         *state
@@ -179,118 +171,39 @@ fn active_phase2_impl(
 
 // ---------------------------------------------------------------------------
 
-/// Filter plans based on Phase 1 locking risks. Only relevant when
-/// white_sum == 2 or 12 (terminal numbers that can trigger locks).
-///
-/// Returns `Some(mark)` if a winning lock should be forced immediately.
-/// Otherwise mutates `plans` in place and returns `None`.
-fn filter_risky_plans(
-    plans: &mut Vec<(Option<Mark>, Option<Mark>, State)>,
-    state: &State,
-    opp_states: &[State],
-    white_sum: u8,
-) -> Option<Mark> {
-    if white_sum != 2 && white_sum != 12 {
-        return None;
-    }
-
-    // RISKY: rows where at least one opponent could lock by marking white_sum.
-    let risky: Vec<usize> = (0..4)
-        .filter(|&row| {
-            State::row_terminal(row) == white_sum
-                && opp_states.iter().any(|opp| opp.can_mark(row, white_sum))
-        })
-        .collect();
-
-    // MAX_RISKY: max rows opponents can collectively lock.
-    let opponents_who_can_lock = opp_states
+/// Simulate each opponent's likely phase1 decision by running the full
+/// passive_phase1 pipeline (safe lock, endgame rules, evaluate) from
+/// their perspective.
+fn simulate_opp_phase1(bot: &impl Bot, state: &State, opp_states: &[State], dice: [u8; 6]) -> Vec<State> {
+    opp_states
         .iter()
-        .filter(|opp| risky.iter().any(|&row| opp.can_mark(row, white_sum)))
-        .count();
-    let max_risky = opponents_who_can_lock.min(risky.len()) as u8;
-
-    // LOCKABLE: rows WE can lock in phase1 by marking white_sum.
-    let lockable: Vec<usize> = (0..4)
-        .filter(|&row| {
-            State::row_terminal(row) == white_sum && state.can_mark(row, white_sum)
-        })
-        .collect();
-
-    let locked = state.count_locked();
-    let opp_best_score = opp_best_phase1_score(opp_states, white_sum);
-
-    if locked + max_risky >= 2 {
-        plans.retain(|(_, phase2, _)| phase2.is_none());
-    } else if max_risky == 1 {
-        if lockable.is_empty() {
-            plans.retain(|(_, phase2, _)| match phase2 {
-                Some(cm) => !risky.contains(&cm.row),
-                None => true,
-            });
-        } else {
-            let game_can_end =
-                !(lockable.len() == 1 && risky.len() == 1 && lockable[0] == risky[0]);
-
-            if game_can_end {
-                let winning_lock = lockable.iter().find(|&&row| {
-                    let mut s = *state;
-                    s.apply_mark(Mark { row, number: white_sum });
-                    s.count_points() > opp_best_score
-                });
-                if let Some(&row) = winning_lock {
-                    return Some(Mark { row, number: white_sum });
+        .enumerate()
+        .map(|(i, opp)| {
+            let their_opps: Vec<State> = std::iter::once(*state)
+                .chain(opp_states.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, s)| *s))
+                .collect();
+            match passive_phase1_impl(bot, opp, &their_opps, dice) {
+                Some(m) => {
+                    let mut s = *opp;
+                    s.apply_mark(m);
+                    s
                 }
-                plans.retain(|(phase1, _, _)| match phase1 {
-                    Some(m) => {
-                        if state.would_lock_row(*m) {
-                            risky.contains(&m.row)
-                        } else {
-                            true
-                        }
-                    }
-                    None => true,
-                });
+                None => *opp,
             }
-            plans.retain(|(_, phase2, _)| match phase2 {
-                Some(cm) => !risky.contains(&cm.row),
-                None => true,
-            });
-        }
-    } else if locked >= 1 && max_risky == 0 {
-        if !lockable.is_empty() {
-            let winning_lock = lockable.iter().find(|&&row| {
-                let mut s = *state;
-                s.apply_mark(Mark { row, number: white_sum });
-                s.count_points() >= opp_best_score
-            });
-            if let Some(&row) = winning_lock {
-                return Some(Mark { row, number: white_sum });
-            }
-            plans.retain(|(phase1, _, _)| match phase1 {
-                Some(m) => !state.would_lock_row(*m),
-                None => true,
-            });
-        }
-    }
-
-    if plans.is_empty() {
-        let mut s = *state;
-        s.apply_strike();
-        plans.push((None, None, s));
-    }
-
-    None
+        })
+        .collect()
 }
 
-// ---------------------------------------------------------------------------
-
-fn active_phase1_impl(
-    bot: &impl Bot,
-    state: &State,
-    opp_states: &[State],
-    dice: [u8; 6],
-) -> Option<Mark> {
+fn active_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
     let white_sum = dice[0] + dice[1];
+
+    // Simulate opponents' likely phase1 marks to get predicted post-phase1
+    // opponent states. This replaces the RISKY filter: instead of conservatively
+    // removing plans that might be invalidated, we predict what opponents will
+    // do and plan around it.
+    let sim_opp = simulate_opp_phase1(bot, state, opp_states, dice);
+    let opp_best = sim_opp.iter().map(|s| s.count_points()).max().unwrap_or(0);
+
     let white_marks = state.generate_white_moves(white_sum);
     let color_marks = state.generate_color_moves(dice);
 
@@ -329,9 +242,6 @@ fn active_phase1_impl(
         return None;
     }
 
-    // Endgame meta-rules on plans
-    let opp_best = opp_best_phase1_score(opp_states, white_sum);
-
     // Force best winning game-end
     let winning = plans
         .iter()
@@ -348,11 +258,6 @@ fn active_phase1_impl(
         let mut s = *state;
         s.apply_strike();
         plans.push((None, None, s));
-    }
-
-    // RISKY/LOCKABLE filtering
-    if let Some(forced) = filter_risky_plans(&mut plans, state, opp_states, white_sum) {
-        return Some(forced);
     }
 
     // Force safe lock
@@ -372,9 +277,10 @@ fn active_phase1_impl(
     {
         let keep: Vec<bool> = (0..plans.len())
             .map(|i| {
-                !plans.iter().enumerate().any(|(j, (_, _, s))| {
-                    j != i && post_state_dominates(s, &plans[i].2)
-                })
+                !plans
+                    .iter()
+                    .enumerate()
+                    .any(|(j, (_, _, s))| j != i && post_state_dominates(s, &plans[i].2))
             })
             .collect();
         let mut idx = 0;
@@ -385,9 +291,9 @@ fn active_phase1_impl(
         });
     }
 
-    // Evaluate
+    // Evaluate plans against simulated post-opponent states
     let post_states: Vec<State> = plans.iter().map(|(_, _, s)| *s).collect();
-    let values = bot.evaluate_batch(&post_states, opp_states);
+    let values = bot.evaluate_batch(&post_states, &sim_opp);
     let best_idx = values
         .iter()
         .enumerate()
@@ -400,22 +306,11 @@ fn active_phase1_impl(
 // ---------------------------------------------------------------------------
 
 impl<T: Bot + std::fmt::Debug> super::Strategy for T {
-    fn active_phase1(
-        &mut self,
-        state: &State,
-        opp_states: &[State],
-        dice: [u8; 6],
-    ) -> Option<Mark> {
+    fn active_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
         active_phase1_impl(self, state, opp_states, dice)
     }
 
-    fn active_phase2(
-        &mut self,
-        state: &State,
-        opp_states: &[State],
-        dice: [u8; 6],
-        has_marked: bool,
-    ) -> Option<Mark> {
+    fn active_phase2(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Option<Mark> {
         active_phase2_impl(self, state, opp_states, dice, has_marked)
     }
 

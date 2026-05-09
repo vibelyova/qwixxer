@@ -10,7 +10,13 @@ const RESET: &str = "\x1b[0m";
 pub trait Strategy: std::fmt::Debug {
     fn active_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark>;
     fn active_phase2(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Option<Mark>;
-    fn passive_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], active_player: usize) -> Option<Mark>;
+    fn passive_phase1(
+        &mut self,
+        state: &State,
+        opp_states: &[State],
+        dice: [u8; 6],
+        active_player: usize,
+    ) -> Option<Mark>;
     fn is_interactive(&self) -> bool {
         false
     }
@@ -112,7 +118,13 @@ impl Strategy for Interactive {
         Self::pick_mark(&marks, has_marked)
     }
 
-    fn passive_phase1(&mut self, state: &State, _opp_states: &[State], dice: [u8; 6], _active_player: usize) -> Option<Mark> {
+    fn passive_phase1(
+        &mut self,
+        state: &State,
+        _opp_states: &[State],
+        dice: [u8; 6],
+        _active_player: usize,
+    ) -> Option<Mark> {
         let white_sum = dice[0] + dice[1];
         println!("\n  {BOLD}=== OPPONENT'S TURN (White Dice) ==={RESET}\n");
         println!("{state}");
@@ -181,11 +193,21 @@ impl Strategy for Conservative {
 
     fn active_phase2(&mut self, state: &State, _opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Option<Mark> {
         let marks = state.generate_color_moves(dice);
-        let cap = if has_marked { self.max_new_blanks } else { self.max_new_blanks };
+        let cap = if has_marked {
+            self.max_new_blanks
+        } else {
+            self.max_new_blanks
+        };
         Self::best_mark(state, &marks, cap)
     }
 
-    fn passive_phase1(&mut self, state: &State, _opp_states: &[State], dice: [u8; 6], _active_player: usize) -> Option<Mark> {
+    fn passive_phase1(
+        &mut self,
+        state: &State,
+        _opp_states: &[State],
+        dice: [u8; 6],
+        _active_player: usize,
+    ) -> Option<Mark> {
         let white_sum = dice[0] + dice[1];
         let marks = state.generate_white_moves(white_sum);
         Self::best_mark(state, &marks, 0)
@@ -228,12 +250,24 @@ impl Strategy for Opportunist {
         Self::best_mark(state, &marks, 2)
     }
 
-    fn active_phase2(&mut self, state: &State, _opp_states: &[State], dice: [u8; 6], _has_marked: bool) -> Option<Mark> {
+    fn active_phase2(
+        &mut self,
+        state: &State,
+        _opp_states: &[State],
+        dice: [u8; 6],
+        _has_marked: bool,
+    ) -> Option<Mark> {
         let marks = state.generate_color_moves(dice);
         Self::best_mark(state, &marks, 2)
     }
 
-    fn passive_phase1(&mut self, state: &State, _opp_states: &[State], dice: [u8; 6], _active_player: usize) -> Option<Mark> {
+    fn passive_phase1(
+        &mut self,
+        state: &State,
+        _opp_states: &[State],
+        dice: [u8; 6],
+        _active_player: usize,
+    ) -> Option<Mark> {
         let white_sum = dice[0] + dice[1];
         let marks = state.generate_white_moves(white_sum);
         Self::best_mark(state, &marks, 1)
@@ -281,7 +315,13 @@ impl Strategy for Random {
         }
     }
 
-    fn passive_phase1(&mut self, state: &State, _opp_states: &[State], dice: [u8; 6], _active_player: usize) -> Option<Mark> {
+    fn passive_phase1(
+        &mut self,
+        state: &State,
+        _opp_states: &[State],
+        dice: [u8; 6],
+        _active_player: usize,
+    ) -> Option<Mark> {
         let white_sum = dice[0] + dice[1];
         let marks = state.generate_white_moves(white_sum);
         if !marks.is_empty() {

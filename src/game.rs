@@ -50,16 +50,8 @@ impl Player {
         }
     }
 
-    pub fn new_with_state(
-        strategy: Box<dyn Strategy>,
-        dice: Box<dyn DiceSource>,
-        state: State,
-    ) -> Self {
-        Self {
-            strategy,
-            state,
-            dice,
-        }
+    pub fn new_with_state(strategy: Box<dyn Strategy>, dice: Box<dyn DiceSource>, state: State) -> Self {
+        Self { strategy, state, dice }
     }
 
     pub fn is_interactive(&self) -> bool {
@@ -79,7 +71,8 @@ impl Player {
     }
 
     fn passive_phase1(&mut self, opp_states: &[State], dice: [u8; 6], active_player: usize) -> Option<Mark> {
-        self.strategy.passive_phase1(&self.state, opp_states, dice, active_player)
+        self.strategy
+            .passive_phase1(&self.state, opp_states, dice, active_player)
     }
 
     fn apply_mark(&mut self, mark: Mark) {
@@ -136,10 +129,7 @@ impl Game {
             let verbose_active = self.verbose && !self.players[active_player].is_interactive();
 
             if verbose_active {
-                println!(
-                    "\n  \x1b[2m-- Player {} active turn --\x1b[0m",
-                    active_player + 1
-                );
+                println!("\n  \x1b[2m-- Player {} active turn --\x1b[0m", active_player + 1);
                 println!("  \x1b[2m{}\x1b[0m", crate::state::format_dice(dice));
             }
 
@@ -150,9 +140,7 @@ impl Game {
             let mut phase1_marks: Vec<Option<Mark>> = Vec::with_capacity(n);
             for i in 0..n {
                 // Build opp_states: turn-ordered from player i's perspective
-                let opp_states: Vec<State> = (1..n)
-                    .map(|off| pre_phase1[(i + off) % n])
-                    .collect();
+                let opp_states: Vec<State> = (1..n).map(|off| pre_phase1[(i + off) % n]).collect();
 
                 let mark = if i == active_player {
                     self.players[i].active_phase1(&opp_states, dice)
@@ -182,16 +170,10 @@ impl Game {
                         has_active_marked = true;
                     }
                     if self.verbose && !self.players[i].is_interactive() {
-                        println!(
-                            "  \x1b[2mPlayer {} Phase 1: marked {m}\x1b[0m",
-                            i + 1
-                        );
+                        println!("  \x1b[2mPlayer {} Phase 1: marked {m}\x1b[0m", i + 1);
                     }
                 } else if self.verbose && !self.players[i].is_interactive() {
-                    println!(
-                        "  \x1b[2mPlayer {} Phase 1: skipped\x1b[0m",
-                        i + 1
-                    );
+                    println!("  \x1b[2mPlayer {} Phase 1: skipped\x1b[0m", i + 1);
                 }
             }
 
@@ -217,26 +199,17 @@ impl Game {
                     self.players[active_player].apply_mark(m);
                     has_active_marked = true;
                     if verbose_active {
-                        println!(
-                            "  \x1b[2mPlayer {} Phase 2: marked {m}\x1b[0m",
-                            active_player + 1
-                        );
+                        println!("  \x1b[2mPlayer {} Phase 2: marked {m}\x1b[0m", active_player + 1);
                     }
                 }
                 None => {
                     if !has_active_marked {
                         self.players[active_player].apply_strike();
                         if verbose_active {
-                            println!(
-                                "  \x1b[2mPlayer {} Phase 2: strike\x1b[0m",
-                                active_player + 1
-                            );
+                            println!("  \x1b[2mPlayer {} Phase 2: strike\x1b[0m", active_player + 1);
                         }
                     } else if verbose_active {
-                        println!(
-                            "  \x1b[2mPlayer {} Phase 2: skipped\x1b[0m",
-                            active_player + 1
-                        );
+                        println!("  \x1b[2mPlayer {} Phase 2: skipped\x1b[0m", active_player + 1);
                     }
                 }
             }

@@ -5,16 +5,16 @@
 //! Run:   cargo run --release --example sigma_probe
 //! Output: /tmp/sigma_probe.csv
 
+use burn::module::Module;
+use burn::record::CompactRecorder;
 use qwixxer::bot::{self, DNA};
 use qwixxer::dqn::{
-    build_opponent_context_for, state_features, win_rank_score, MyBackend, OpponentContext,
-    QwixxModel, QwixxModelConfig,
+    build_opponent_context_for, state_features, win_rank_score, MyBackend, OpponentContext, QwixxModel,
+    QwixxModelConfig,
 };
 use qwixxer::game::{Game, Player};
 use qwixxer::state::{Mark, State};
 use qwixxer::strategy::Strategy;
-use burn::module::Module;
-use burn::record::CompactRecorder;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use std::cell::RefCell;
@@ -61,15 +61,16 @@ impl ProbeDqn {
         (context, Some(leader), non_leader)
     }
 
-    fn leader_prediction(&self, our_state: &State, leader_state: Option<State>, non_leader_states: &[State]) -> (f32, f32) {
+    fn leader_prediction(
+        &self,
+        our_state: &State,
+        leader_state: Option<State>,
+        non_leader_states: &[State],
+    ) -> (f32, f32) {
         let Some(leader) = leader_state else {
             return (0.0, 0.0);
         };
-        let leader_ctx = build_opponent_context_for(
-            leader.count_points(),
-            our_state,
-            non_leader_states,
-        );
+        let leader_ctx = build_opponent_context_for(leader.count_points(), our_state, non_leader_states);
         let features = state_features(&leader, &leader_ctx);
         self.model.evaluate_state(&features, &self.device)
     }
@@ -147,11 +148,7 @@ impl Strategy for ProbeDqn {
         let skip_rank = win_rank_score(skip_mean, skip_log_var, opp_mean, opp_log_var);
         per.push((marks.len(), None, skip_mean, skip_log_var, skip_rank));
 
-        let chosen_idx = per
-            .iter()
-            .max_by(|a, b| a.4.partial_cmp(&b.4).unwrap())
-            .unwrap()
-            .0;
+        let chosen_idx = per.iter().max_by(|a, b| a.4.partial_cmp(&b.4).unwrap()).unwrap().0;
 
         for (i, _m, mean, log_var, rank) in &per {
             self.log_candidate(
@@ -213,11 +210,7 @@ impl Strategy for ProbeDqn {
         let skip_rank = win_rank_score(skip_mean, skip_log_var, opp_mean, opp_log_var);
         per.push((marks.len(), None, skip_mean, skip_log_var, skip_rank));
 
-        let chosen_idx = per
-            .iter()
-            .max_by(|a, b| a.4.partial_cmp(&b.4).unwrap())
-            .unwrap()
-            .0;
+        let chosen_idx = per.iter().max_by(|a, b| a.4.partial_cmp(&b.4).unwrap()).unwrap().0;
 
         for (i, _m, mean, log_var, rank) in &per {
             self.log_candidate(
@@ -239,7 +232,13 @@ impl Strategy for ProbeDqn {
         per[chosen_idx].1
     }
 
-    fn passive_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], _active_player: usize) -> Option<Mark> {
+    fn passive_phase1(
+        &mut self,
+        state: &State,
+        opp_states: &[State],
+        dice: [u8; 6],
+        _active_player: usize,
+    ) -> Option<Mark> {
         let our_score = state.count_points();
         let (context, leader_state, non_leader_states) = Self::build_context(our_score, opp_states);
         let opp_score = our_score - context.score_gap_to_leader;
@@ -271,11 +270,7 @@ impl Strategy for ProbeDqn {
         let skip_rank = win_rank_score(skip_mean, skip_log_var, opp_mean, opp_log_var);
         per.push((marks.len(), None, skip_mean, skip_log_var, skip_rank));
 
-        let chosen_idx = per
-            .iter()
-            .max_by(|a, b| a.4.partial_cmp(&b.4).unwrap())
-            .unwrap()
-            .0;
+        let chosen_idx = per.iter().max_by(|a, b| a.4.partial_cmp(&b.4).unwrap()).unwrap().0;
 
         for (i, _m, mean, log_var, rank) in &per {
             self.log_candidate(

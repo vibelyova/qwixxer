@@ -29,9 +29,10 @@ impl MonteCarlo {
 
     /// Convenience: create MC with GA champion as rollout policy.
     pub fn with_ga(simulations: usize, champion: crate::bot::DNA) -> Self {
-        Self::new(simulations, Arc::new(move || {
-            Box::new(champion.clone()) as Box<dyn Strategy>
-        }))
+        Self::new(
+            simulations,
+            Arc::new(move || Box::new(champion.clone()) as Box<dyn Strategy>),
+        )
     }
 
     /// Evaluate a post-move state by running rollout simulations from it.
@@ -134,7 +135,13 @@ impl Strategy for MonteCarlo {
         best_mark
     }
 
-    fn passive_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], _active_player: usize) -> Option<Mark> {
+    fn passive_phase1(
+        &mut self,
+        state: &State,
+        opp_states: &[State],
+        dice: [u8; 6],
+        _active_player: usize,
+    ) -> Option<Mark> {
         let white_sum = dice[0] + dice[1];
         let marks = state.generate_white_moves(white_sum);
         if marks.is_empty() {
