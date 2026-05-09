@@ -1,5 +1,35 @@
 use super::Bot;
-use crate::state::{post_state_dominates, Mark, State};
+use crate::state::{Mark, State};
+use std::cmp::Ordering;
+
+fn prune_dominated<T>(items: &mut Vec<T>, state_of: impl Fn(&T) -> &State) {
+    let n = items.len();
+    let mut dominated = vec![false; n];
+    for i in 0..n {
+        if dominated[i] {
+            continue;
+        }
+        for j in (i + 1)..n {
+            if dominated[j] {
+                continue;
+            }
+            match state_of(&items[i]).partial_cmp(state_of(&items[j])) {
+                Some(Ordering::Greater) => dominated[j] = true,
+                Some(Ordering::Less) => {
+                    dominated[i] = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut idx = 0;
+    items.retain(|_| {
+        let keep = !dominated[idx];
+        idx += 1;
+        keep
+    });
+}
 
 fn opp_best_phase1_score(opp_states: &[State], white_sum: u8) -> isize {
     opp_states
@@ -106,21 +136,7 @@ fn pick_best_mark(
         return cands[0].0;
     }
 
-    // Post-state dominance pruning
-    let keep: Vec<bool> = (0..cands.len())
-        .map(|i| {
-            !cands
-                .iter()
-                .enumerate()
-                .any(|(j, (_, s))| j != i && post_state_dominates(s, &cands[i].1))
-        })
-        .collect();
-    cands = cands
-        .into_iter()
-        .zip(keep)
-        .filter(|(_, k)| *k)
-        .map(|(c, _)| c)
-        .collect();
+    prune_dominated(&mut cands, |(_, s)| s);
 
     if cands.is_empty() {
         return None;
@@ -273,23 +289,7 @@ pub(crate) fn active_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[St
         }
     }
 
-    // Post-state dominance pruning
-    {
-        let keep: Vec<bool> = (0..plans.len())
-            .map(|i| {
-                !plans
-                    .iter()
-                    .enumerate()
-                    .any(|(j, (_, _, s))| j != i && post_state_dominates(s, &plans[i].2))
-            })
-            .collect();
-        let mut idx = 0;
-        plans.retain(|_| {
-            let k = keep[idx];
-            idx += 1;
-            k
-        });
-    }
+    prune_dominated(&mut plans, |(_, _, s)| s);
 
     // Evaluate plans against simulated post-opponent states
     let post_states: Vec<State> = plans.iter().map(|(_, _, s)| *s).collect();
