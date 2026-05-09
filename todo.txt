@@ -37,3 +37,12 @@
 
 - analyze and try to fix non-symmetrical or anti-symmetrical decisions / states
 - fix the misinterpretation of the rules
+
+
+----------
+
+
+
+- fix pruning
+- remove training vs GA
+- simulate opponents in phase1 active
