@@ -20,6 +20,7 @@ pub mod train;
 
 use crate::state::State;
 use crate::strategy::Bot;
+use std::sync::Arc;
 use burn::{
     backend::ndarray::NdArray,
     nn::{Linear, LinearConfig, Relu},
@@ -352,7 +353,7 @@ impl<B: Backend> QwixxModel<B> {
 // ---- Strategy using trained model ----
 
 pub struct DqnStrategy {
-    pub model: QwixxModel<MyBackend>,
+    pub model: Arc<QwixxModel<MyBackend>>,
     pub device: burn::backend::ndarray::NdArrayDevice,
 }
 
@@ -370,13 +371,16 @@ impl DqnStrategy {
             .init::<MyBackend>(&device)
             .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
             .expect("Failed to load model");
-        DqnStrategy { model, device }
+        DqnStrategy { model: Arc::new(model), device }
     }
 
-    /// Construct a strategy around an already-loaded model. Used by diagnostic
-    /// binaries that want to spin up many fresh strategies sharing the same
-    /// model (tensors are Arc-backed, so cloning is cheap).
+    /// Construct a strategy around an already-loaded model.
     pub fn from_model(model: QwixxModel<MyBackend>, device: burn::backend::ndarray::NdArrayDevice) -> Self {
+        DqnStrategy { model: Arc::new(model), device }
+    }
+
+    /// Construct a strategy sharing an existing Arc'd model (cheap clone).
+    pub fn from_shared(model: Arc<QwixxModel<MyBackend>>, device: burn::backend::ndarray::NdArrayDevice) -> Self {
         DqnStrategy { model, device }
     }
 
@@ -389,7 +393,7 @@ impl DqnStrategy {
             .load(model_bytes.to_vec(), &device)
             .expect("Failed to load model from bytes");
         let model = QwixxModelConfig::new().init::<MyBackend>(&device).load_record(record);
-        DqnStrategy { model, device }
+        DqnStrategy { model: Arc::new(model), device }
     }
 
     /// Evaluate a state with a custom opponent context (for state explorer).

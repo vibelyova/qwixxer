@@ -48,6 +48,50 @@ fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
     }
 }
 
+struct StrategyTemplates {
+    dqn: Option<dqn::DqnStrategy>,
+    champion: Option<bot::DNA>,
+}
+
+impl StrategyTemplates {
+    fn new(bots: &[BotType]) -> Self {
+        let needs_dqn = bots.iter().any(|b| matches!(b, BotType::Dqn));
+        let needs_champion = bots.iter().any(|b| matches!(b, BotType::Ga | BotType::Mcts));
+        let genes = Arc::new(bot::default_genes());
+        StrategyTemplates {
+            dqn: if needs_dqn {
+                Some(dqn::DqnStrategy::load("dqn_model"))
+            } else {
+                None
+            },
+            champion: if needs_champion {
+                Some(
+                    bot::DNA::load_weights("champion.txt", genes)
+                        .expect("No champion.txt found. Run `evolve` first."),
+                )
+            } else {
+                None
+            },
+        }
+    }
+
+    fn create(&self, bot: &BotType) -> Box<dyn strategy::Strategy> {
+        match bot {
+            BotType::Ga => Box::new(self.champion.as_ref().unwrap().clone()),
+            BotType::Dqn => {
+                let t = self.dqn.as_ref().unwrap();
+                Box::new(dqn::DqnStrategy::from_shared(t.model.clone(), t.device.clone()))
+            }
+            BotType::Mcts => {
+                Box::new(mcts::MonteCarlo::with_ga(200, self.champion.as_ref().unwrap().clone()))
+            }
+            BotType::Opportunist => Box::<strategy::Opportunist>::default(),
+            BotType::Conservative => Box::<strategy::Conservative>::default(),
+            BotType::Random => Box::new(strategy::Random),
+        }
+    }
+}
+
 #[allow(dead_code)]
 fn bot_name(bot: &BotType, index: usize, total: usize) -> String {
     if total > 1 {
@@ -138,42 +182,47 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
     );
 
     #[cfg(feature = "parallel")]
+    #[cfg(feature = "parallel")]
     use rayon::prelude::*;
 
-    // Run games in parallel when available
+    let bench_game = |templates: &StrategyTemplates, i: usize| {
+        let rotation = i % num_players;
+        let players: Vec<Player> = (0..num_players)
+            .map(|j| {
+                let bot_idx = (j + num_players - rotation) % num_players;
+                Player::new(templates.create(&bots[bot_idx]), Box::new(SmallRng::from_entropy()))
+            })
+            .collect();
+
+        let mut game = game::Game::new(players);
+        game.play();
+
+        let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+        let max = *scores.iter().max().unwrap();
+        let num_winners = scores.iter().filter(|&&s| s == max).count();
+
+        let per_bot: Vec<(usize, isize)> = (0..num_players)
+            .map(|j| {
+                let bot_idx = (j + num_players - rotation) % num_players;
+                (bot_idx, scores[j])
+            })
+            .collect();
+
+        let is_tie = num_winners > 1;
+        (per_bot, is_tie)
+    };
+
     #[cfg(feature = "parallel")]
-    let iter = (0..num_games).into_par_iter();
-    #[cfg(not(feature = "parallel"))]
-    let iter = 0..num_games;
-
-    let results: Vec<(Vec<(usize, isize)>, bool)> = iter
-        .map(|i| {
-            let rotation = i % num_players;
-            let players: Vec<Player> = (0..num_players)
-                .map(|j| {
-                    let bot_idx = (j + num_players - rotation) % num_players;
-                    Player::new(make_strategy(&bots[bot_idx]), Box::new(SmallRng::from_entropy()))
-                })
-                .collect();
-
-            let mut game = game::Game::new(players);
-            game.play();
-
-            let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
-            let max = *scores.iter().max().unwrap();
-            let num_winners = scores.iter().filter(|&&s| s == max).count();
-
-            let per_bot: Vec<(usize, isize)> = (0..num_players)
-                .map(|j| {
-                    let bot_idx = (j + num_players - rotation) % num_players;
-                    (bot_idx, scores[j])
-                })
-                .collect();
-
-            let is_tie = num_winners > 1;
-            (per_bot, is_tie)
-        })
+    let results: Vec<(Vec<(usize, isize)>, bool)> = (0..num_games)
+        .into_par_iter()
+        .map_init(|| StrategyTemplates::new(&bots), |t, i| bench_game(t, i))
         .collect();
+
+    #[cfg(not(feature = "parallel"))]
+    let results: Vec<(Vec<(usize, isize)>, bool)> = {
+        let templates = StrategyTemplates::new(&bots);
+        (0..num_games).map(|i| bench_game(&templates, i)).collect()
+    };
 
     // Aggregate
     let mut wins = vec![0u32; num_players];

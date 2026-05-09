@@ -183,8 +183,7 @@ impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
 /// exploration and records post-move features into a shared buffer that the
 /// training loop drains after `Game::play` returns.
 struct RecordingDqn {
-    model: QwixxModel<MyBackend>,
-    device: burn::backend::ndarray::NdArrayDevice,
+    bot: DqnStrategy,
     epsilon: f32,
     rng: SmallRng,
     /// Shared with the training loop. Stays inside one rayon closure per game
@@ -199,10 +198,6 @@ impl std::fmt::Debug for RecordingDqn {
 }
 
 impl RecordingDqn {
-    fn bot(&self) -> DqnStrategy {
-        DqnStrategy::from_model(self.model.clone(), self.device.clone())
-    }
-
     fn record_features(&self, state: &State, opp_states: &[State]) {
         let ctx = if opp_states.is_empty() {
             OpponentContext::default()
@@ -238,8 +233,7 @@ impl Strategy for RecordingDqn {
                 None
             }
         } else {
-            let bot = self.bot();
-            crate::strategy::active_phase1_impl(&bot, state, opp_states, dice)
+            crate::strategy::active_phase1_impl(&self.bot, state, opp_states, dice)
         }
     }
 
@@ -266,8 +260,7 @@ impl Strategy for RecordingDqn {
                 None
             }
         } else {
-            let bot = self.bot();
-            crate::strategy::active_phase2_impl(&bot, state, opp_states, dice, has_marked)
+            crate::strategy::active_phase2_impl(&self.bot, state, opp_states, dice, has_marked)
         };
 
         let chosen_state = match mark {
@@ -295,8 +288,7 @@ impl Strategy for RecordingDqn {
             return None;
         }
 
-        let bot = self.bot();
-        let mark = crate::strategy::passive_phase1_impl(&bot, state, opp_states, dice);
+        let mark = crate::strategy::passive_phase1_impl(&self.bot, state, opp_states, dice);
 
         if let Some(m) = mark {
             let mut s = *state;
@@ -322,8 +314,7 @@ fn play_training_game(
         std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
 
     let recording = RecordingDqn {
-        model: model.clone(),
-        device: device.clone(),
+        bot: DqnStrategy::from_model(model.clone(), device.clone()),
         epsilon,
         rng: SmallRng::seed_from_u64(seed),
         recorded: std::rc::Rc::clone(&recorded),
@@ -388,11 +379,7 @@ fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 
         .map_init(
             || DqnStrategy::load(artifact_dir),
             |template, i| {
-                // Cheap: model tensors are Arc-backed; fresh per game.
-                let dqn = DqnStrategy {
-                    model: template.model.clone(),
-                    device: template.device.clone(),
-                };
+                let dqn = DqnStrategy::from_shared(template.model.clone(), template.device.clone());
                 let rotation = i % 2;
                 let players: Vec<Player> = if rotation == 0 {
                     vec![
@@ -466,7 +453,6 @@ pub fn self_play_train(
             .flat_map(|config| std::iter::repeat(config).take(games_each))
             .collect();
 
-        // Pre-clone models — one per game. Cloning is cheap (NdArray tensors are Arc-backed).
         let models: Vec<QwixxModel<MyBackend>> = (0..game_configs.len()).map(|_| model.clone()).collect();
 
         let game_results: Vec<(Vec<TrainingSample>, f32)> = game_configs
@@ -475,12 +461,9 @@ pub fn self_play_train(
             .enumerate()
             .map(|(game_idx, (config, thread_model))| {
                 let seed = TRAIN_SEED.wrapping_add((iteration * games_per_iteration + game_idx) as u64);
-                // Deterministic DQN self-play opponents
+                let thread_model_arc = Arc::new(thread_model);
                 let dqn_self = || -> Box<dyn Strategy> {
-                    Box::new(DqnStrategy {
-                        model: thread_model.clone(),
-                        device: device.clone(),
-                    })
+                    Box::new(DqnStrategy::from_shared(thread_model_arc.clone(), device.clone()))
                 };
                 let opps: Vec<Box<dyn Strategy>> = match config {
                     // 1v1: vs GA champion
@@ -500,7 +483,7 @@ pub fn self_play_train(
                     // 4-player: vs 2 GA + self
                     _ => vec![Box::new(champion.clone()), Box::new(champion.clone()), dqn_self()],
                 };
-                play_training_game(&thread_model, &device, opps, epsilon, seed)
+                play_training_game(&thread_model_arc, &device, opps, epsilon, seed)
             })
             .collect();
 
