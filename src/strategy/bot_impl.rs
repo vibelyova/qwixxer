@@ -64,6 +64,7 @@ fn pick_best_mark(
     if let Some(m) = find_safe_lock(state, marks) {
         return Some(m);
     }
+    // TODO: smart strike
 
     let mark_states: Vec<State> = marks
         .iter()
@@ -76,23 +77,14 @@ fn pick_best_mark(
 
     // Force highest-scoring winning game-end (mark or baseline).
     // Marks first — a winning lock beats a winning strike (avoids -5 penalty).
-    let best_winning_mark = mark_states
+    if let Some((mark, _)) = mark_states
         .iter()
         .enumerate()
+        .map(|(i, &s)| (Some(marks[i]), s))
+        .chain(std::iter::once((None, baseline)))
         .filter(|(_, post)| post.would_end_game() && post.count_points() > opp_best)
-        .max_by_key(|(_, post)| post.count_points());
-    let baseline_wins = baseline.would_end_game() && baseline.count_points() > opp_best;
-    match (best_winning_mark, baseline_wins) {
-        (Some((i, post)), true) => {
-            if post.count_points() >= baseline.count_points() {
-                return Some(marks[i]);
-            } else {
-                return None;
-            }
-        }
-        (Some((i, _)), false) => return Some(marks[i]),
-        (None, true) => return None,
-        (None, false) => {}
+        .max_by_key(|(_, post)| post.count_points()) {
+            return mark;
     }
 
     // Build candidates: marks + baseline. Filter out losing game-ends.
