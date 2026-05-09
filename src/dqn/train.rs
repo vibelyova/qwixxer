@@ -5,8 +5,9 @@
 
 use crate::bot::{self, DNA};
 use crate::dqn::{
-    build_opponent_context_for, rank_candidates_with_opp_context, state_features, DqnStrategy, MyBackend,
-    OpponentContext, QwixxModel, QwixxModelConfig, LOG_VAR_MAX, LOG_VAR_MIN, NUM_FEATURES, TRAIN_SEED,
+    batch_forward_features, build_opponent_context_for, rank_candidates_with_opp_context, state_features,
+    DqnStrategy, MyBackend, OpponentContext, QwixxModel, QwixxModelConfig, LOG_VAR_MAX, LOG_VAR_MIN, NUM_FEATURES,
+    TRAIN_SEED,
 };
 use crate::state::{Mark, State};
 use crate::strategy::Strategy;
@@ -100,9 +101,9 @@ impl<B: Backend> InferenceStep for QwixxModel<B> {
 
 // ---- Training samples / batcher ----
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TrainingSample {
-    pub features: Vec<f32>,
+    pub features: [f32; NUM_FEATURES],
     /// TD(λ) target G_t used for μ regression. Smoothed, sample-efficient.
     pub value: f32,
     /// Actual final score of the trajectory this sample was recorded on. Used
@@ -139,7 +140,7 @@ impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
         let inputs: Vec<f32> = items
             .iter()
             .flat_map(|s| {
-                let mut f = s.features.clone();
+                let mut f = s.features;
                 // Swap red(0)↔yellow(1) within ascending pair
                 if rng.gen::<bool>() {
                     for &base in &[0, 4, 8, 12] {
@@ -178,24 +179,6 @@ impl<B: Backend> Batcher<B, TrainingSample, QwixxBatch<B>> for QwixxBatcher<B> {
 }
 
 // ---- Self-play RL training ----
-
-/// Batched forward pass: evaluates all provided feature vectors in one model
-/// call. Returns `(mean, log_var)` per input (empty input → empty output).
-fn batch_eval_features(
-    model: &QwixxModel<MyBackend>,
-    device: &burn::backend::ndarray::NdArrayDevice,
-    features_list: &[[f32; NUM_FEATURES]],
-) -> Vec<(f32, f32)> {
-    if features_list.is_empty() {
-        return Vec::new();
-    }
-    let n = features_list.len();
-    let flat: Vec<f32> = features_list.iter().flat_map(|f| f.iter().copied()).collect();
-    let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), device).reshape([n, NUM_FEATURES]);
-    let output = model.forward(input);
-    let values = output.into_data().to_vec::<f32>().unwrap();
-    (0..n).map(|i| (values[2 * i], values[2 * i + 1])).collect()
-}
 
 /// DQN wrapper used during self-play training. Picks moves with ε-greedy
 /// exploration and records post-move features into a shared buffer that the
@@ -472,7 +455,7 @@ fn play_training_game(
 
     // Batched forward pass for TD(λ) bootstrap values. We bootstrap the
     // *mean* prediction only; the variance head isn't in the bootstrap target.
-    let values = batch_eval_features(model, device, &recorded_features);
+    let values = batch_forward_features(model, device, &recorded_features);
 
     // G_t = (1-λ)·V(s_{t+1}) + λ·G_{t+1}, with G_{n-1} = final_score.
     let mut targets = vec![0.0f32; n];
@@ -485,7 +468,7 @@ fn play_training_game(
         .into_iter()
         .zip(targets)
         .map(|(features, target)| TrainingSample {
-            features: features.to_vec(),
+            features,
             value: target,
             final_score,
         })
@@ -498,7 +481,6 @@ fn play_training_game(
 fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 {
     use crate::game::{Game, Player};
 
-    // Load model once per rayon thread via map_init — shared parse, one clone per game
     let wins: u32 = (0..num_games)
         .into_par_iter()
         .map_init(
@@ -560,28 +542,20 @@ pub fn self_play_train(
     // Per-iteration stats for end-of-training summary (iter, avg_score, winrate).
     let mut iteration_stats: Vec<(usize, f32, Option<f64>)> = Vec::new();
 
+    let mut model: QwixxModel<MyBackend> = QwixxModelConfig::new()
+        .init::<MyBackend>(&device)
+        .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+        .unwrap_or_else(|_| {
+            println!("  No pretrained model, starting fresh");
+            QwixxModelConfig::new().init::<MyBackend>(&device)
+        });
+
     for iteration in 0..num_iterations {
         let epsilon = (0.2 * (0.95f32).powi(iteration as i32)).max(0.07);
         println!(
             "\n=== Iteration {}/{num_iterations} (epsilon={epsilon:.3}) ===",
             iteration + 1
         );
-
-        // Load current model for inference
-        let model: QwixxModel<MyBackend> = if iteration == 0 {
-            QwixxModelConfig::new()
-                .init::<MyBackend>(&device)
-                .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
-                .unwrap_or_else(|_| {
-                    println!("  No pretrained model, starting fresh");
-                    QwixxModelConfig::new().init::<MyBackend>(&device)
-                })
-        } else {
-            QwixxModelConfig::new()
-                .init::<MyBackend>(&device)
-                .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
-                .expect("Failed to load model")
-        };
 
         let games_each = games_per_iteration / 6;
 
@@ -628,8 +602,8 @@ pub fn self_play_train(
             })
             .collect();
 
-        let new_samples: Vec<TrainingSample> = game_results.iter().flat_map(|(s, _)| s.iter().cloned()).collect();
         let game_scores: Vec<f32> = game_results.iter().map(|(_, score)| *score).collect();
+        let new_samples: Vec<TrainingSample> = game_results.into_iter().flat_map(|(s, _)| s).collect();
         let avg_score = if game_scores.is_empty() {
             0.0
         } else {
@@ -642,7 +616,7 @@ pub fn self_play_train(
             replay_buffer.pop_front();
         }
 
-        let all_samples: Vec<TrainingSample> = replay_buffer.iter().flatten().cloned().collect();
+        let all_samples: Vec<TrainingSample> = replay_buffer.iter().flatten().copied().collect();
         println!(
             "  Generated {} new samples (avg score: {avg_score:.1}), replay buffer: {} total",
             replay_buffer.back().unwrap().len(),
@@ -650,7 +624,7 @@ pub fn self_play_train(
         );
 
         // Train on replay buffer
-        train_with_epochs(all_samples, artifact_dir, epochs_per_iteration, 4e-4);
+        model = train_with_epochs(all_samples, artifact_dir, epochs_per_iteration, 4e-4);
 
         // Optional: persist a per-iteration checkpoint.
         if checkpoints {
@@ -719,7 +693,7 @@ pub fn self_play_train(
 }
 
 /// Train with a specific number of epochs, loading from existing model if present.
-fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epochs: usize, lr: f64) {
+fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epochs: usize, lr: f64) -> QwixxModel<MyBackend> {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
 
     let split = (samples.len() * 9) / 10;
@@ -768,4 +742,9 @@ fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epoch
         .expect("Failed to save model");
 
     std::fs::remove_dir_all(&ckpt_dir).ok();
+
+    QwixxModelConfig::new()
+        .init::<MyBackend>(&device)
+        .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+        .expect("Failed to reload model for inference")
 }
