@@ -1,5 +1,6 @@
 pub mod bot;
 pub mod dqn;
+pub mod external;
 pub mod game;
 pub mod mcts;
 pub mod state;

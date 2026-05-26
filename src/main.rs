@@ -3,6 +3,7 @@ use game::Player;
 use qwixxer::*;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
+use std::fmt;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -28,23 +29,52 @@ impl std::fmt::Display for BotType {
     }
 }
 
-fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
-    let genes = Arc::new(bot::default_genes());
-    match bot {
-        BotType::Ga => {
-            let champion =
-                bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt found. Run `train ga` first.");
-            Box::new(champion)
+#[derive(Debug, Clone)]
+enum BotSpec {
+    BuiltIn(BotType),
+    External(String),
+}
+
+impl fmt::Display for BotSpec {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            BotSpec::BuiltIn(bt) => bt.fmt(f),
+            BotSpec::External(cmd) => {
+                let name = cmd.split('/').last().unwrap_or(cmd);
+                write!(f, "ext:{name}")
+            }
         }
-        BotType::Dqn => Box::new(dqn::DqnStrategy::load("dqn_model")),
-        BotType::Mcts => {
-            let champion =
-                bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt found. Run `train ga` first.");
-            Box::new(mcts::MonteCarlo::with_ga(200, champion))
+    }
+}
+
+fn collect_specs(bots: Vec<BotType>, ext: Vec<String>) -> Vec<BotSpec> {
+    let mut specs: Vec<BotSpec> = bots.into_iter().map(BotSpec::BuiltIn).collect();
+    specs.extend(ext.into_iter().map(BotSpec::External));
+    specs
+}
+
+fn make_strategy(spec: &BotSpec) -> Box<dyn strategy::Strategy> {
+    match spec {
+        BotSpec::External(cmd) => Box::new(external::ExternalBot::new(cmd)),
+        BotSpec::BuiltIn(bot) => {
+            let genes = Arc::new(bot::default_genes());
+            match bot {
+                BotType::Ga => {
+                    let champion = bot::DNA::load_weights("champion.txt", genes)
+                        .expect("No champion.txt found. Run `evolve` first.");
+                    Box::new(champion)
+                }
+                BotType::Dqn => Box::new(dqn::DqnStrategy::load("dqn_model")),
+                BotType::Mcts => {
+                    let champion = bot::DNA::load_weights("champion.txt", genes)
+                        .expect("No champion.txt found. Run `evolve` first.");
+                    Box::new(mcts::MonteCarlo::with_ga(200, champion))
+                }
+                BotType::Opportunist => Box::<strategy::Opportunist>::default(),
+                BotType::Conservative => Box::<strategy::Conservative>::default(),
+                BotType::Random => Box::new(strategy::Random),
+            }
         }
-        BotType::Opportunist => Box::<strategy::Opportunist>::default(),
-        BotType::Conservative => Box::<strategy::Conservative>::default(),
-        BotType::Random => Box::new(strategy::Random),
     }
 }
 
@@ -54,9 +84,11 @@ struct StrategyTemplates {
 }
 
 impl StrategyTemplates {
-    fn new(bots: &[BotType]) -> Self {
-        let needs_dqn = bots.iter().any(|b| matches!(b, BotType::Dqn));
-        let needs_champion = bots.iter().any(|b| matches!(b, BotType::Ga | BotType::Mcts));
+    fn new(specs: &[BotSpec]) -> Self {
+        let needs_dqn = specs.iter().any(|s| matches!(s, BotSpec::BuiltIn(BotType::Dqn)));
+        let needs_champion = specs
+            .iter()
+            .any(|s| matches!(s, BotSpec::BuiltIn(BotType::Ga | BotType::Mcts)));
         let genes = Arc::new(bot::default_genes());
         StrategyTemplates {
             dqn: if needs_dqn {
@@ -75,19 +107,22 @@ impl StrategyTemplates {
         }
     }
 
-    fn create(&self, bot: &BotType) -> Box<dyn strategy::Strategy> {
-        match bot {
-            BotType::Ga => Box::new(self.champion.as_ref().unwrap().clone()),
-            BotType::Dqn => {
-                let t = self.dqn.as_ref().unwrap();
-                Box::new(dqn::DqnStrategy::from_shared(t.model.clone(), t.device.clone()))
-            }
-            BotType::Mcts => {
-                Box::new(mcts::MonteCarlo::with_ga(200, self.champion.as_ref().unwrap().clone()))
-            }
-            BotType::Opportunist => Box::<strategy::Opportunist>::default(),
-            BotType::Conservative => Box::<strategy::Conservative>::default(),
-            BotType::Random => Box::new(strategy::Random),
+    fn create(&self, spec: &BotSpec) -> Box<dyn strategy::Strategy> {
+        match spec {
+            BotSpec::External(cmd) => Box::new(external::ExternalBot::new(cmd)),
+            BotSpec::BuiltIn(bot) => match bot {
+                BotType::Ga => Box::new(self.champion.as_ref().unwrap().clone()),
+                BotType::Dqn => {
+                    let t = self.dqn.as_ref().unwrap();
+                    Box::new(dqn::DqnStrategy::from_shared(t.model.clone(), t.device.clone()))
+                }
+                BotType::Mcts => {
+                    Box::new(mcts::MonteCarlo::with_ga(200, self.champion.as_ref().unwrap().clone()))
+                }
+                BotType::Opportunist => Box::<strategy::Opportunist>::default(),
+                BotType::Conservative => Box::<strategy::Conservative>::default(),
+                BotType::Random => Box::new(strategy::Random),
+            },
         }
     }
 }
@@ -113,8 +148,10 @@ enum Commands {
     /// Play interactively against bots
     Play {
         /// Bot types to play against
-        #[arg(default_value = "mcts")]
         bots: Vec<BotType>,
+        /// External bot commands (e.g. -e ./my_bot)
+        #[arg(short = 'e', long = "ext")]
+        external: Vec<String>,
         /// Show bot decisions and boards
         #[arg(short, long)]
         verbose: bool,
@@ -123,6 +160,9 @@ enum Commands {
     Bench {
         /// Bot types (2+)
         bots: Vec<BotType>,
+        /// External bot commands (e.g. -e ./my_bot)
+        #[arg(short = 'e', long = "ext")]
+        external: Vec<String>,
         /// Number of games
         #[arg(short, long, default_value = "1000")]
         num_games: usize,
@@ -153,13 +193,13 @@ enum Commands {
     },
 }
 
-fn run_play(bots: Vec<BotType>, verbose: bool) {
-    let bot_names: Vec<String> = bots.iter().map(|b| b.to_string()).collect();
-    println!("Playing against: {}\n", bot_names.join(", "));
+fn run_play(specs: Vec<BotSpec>, verbose: bool) {
+    let names: Vec<String> = specs.iter().map(|s| s.to_string()).collect();
+    println!("Playing against: {}\n", names.join(", "));
 
-    let mut players: Vec<Player> = bots
+    let mut players: Vec<Player> = specs
         .iter()
-        .map(|b| Player::new(make_strategy(b), Box::new(SmallRng::from_entropy())))
+        .map(|s| Player::new(make_strategy(s), Box::new(SmallRng::from_entropy())))
         .collect();
     players.push(Player::new(
         Box::<strategy::Interactive>::default(),
@@ -172,16 +212,16 @@ fn run_play(bots: Vec<BotType>, verbose: bool) {
     game.print_game_over();
 }
 
-fn run_bench(bots: Vec<BotType>, num_games: usize) {
-    if bots.len() < 2 {
+fn run_bench(specs: Vec<BotSpec>, num_games: usize) {
+    if specs.len() < 2 {
         eprintln!("Need at least 2 bots to benchmark");
         return;
     }
 
-    let num_players = bots.len();
+    let num_players = specs.len();
     println!(
         "Benchmarking {} ({num_games} games, rotating seats):\n",
-        bots.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" vs ")
+        specs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(" vs ")
     );
 
     #[cfg(feature = "parallel")]
@@ -193,7 +233,7 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
         let players: Vec<Player> = (0..num_players)
             .map(|j| {
                 let bot_idx = (j + num_players - rotation) % num_players;
-                Player::new(templates.create(&bots[bot_idx]), Box::new(SmallRng::from_entropy()))
+                Player::new(templates.create(&specs[bot_idx]), Box::new(SmallRng::from_entropy()))
             })
             .collect();
 
@@ -218,12 +258,12 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
     #[cfg(feature = "parallel")]
     let results: Vec<(Vec<(usize, isize)>, bool)> = (0..num_games)
         .into_par_iter()
-        .map_init(|| StrategyTemplates::new(&bots), |t, i| bench_game(t, i))
+        .map_init(|| StrategyTemplates::new(&specs), |t, i| bench_game(t, i))
         .collect();
 
     #[cfg(not(feature = "parallel"))]
     let results: Vec<(Vec<(usize, isize)>, bool)> = {
-        let templates = StrategyTemplates::new(&bots);
+        let templates = StrategyTemplates::new(&specs);
         (0..num_games).map(|i| bench_game(&templates, i)).collect()
     };
 
@@ -247,10 +287,10 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
     }
 
     // Per-player stats
-    for (i, bot) in bots.iter().enumerate() {
+    for (i, spec) in specs.iter().enumerate() {
         println!(
             "  {:<16} {:>5} wins ({:>4.1}%)  avg {:.1} pts",
-            format!("{} #{}", bot, i + 1),
+            format!("{} #{}", spec, i + 1),
             wins[i],
             wins[i] as f64 / num_games as f64 * 100.0,
             total_pts[i] as f64 / num_games as f64
@@ -266,9 +306,9 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
     }
 
     // Aggregate stats per strategy (when multiple bots share a strategy)
-    let unique_strategies: Vec<String> = bots
+    let unique_strategies: Vec<String> = specs
         .iter()
-        .map(|b| b.to_string())
+        .map(|s| s.to_string())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -282,14 +322,14 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
         let mut strat_count: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         let mut strat_ties = 0u32;
 
-        for bot in &bots {
-            let name = bot.to_string();
+        for spec in &specs {
+            let name = spec.to_string();
             strat_count.entry(name.clone()).or_insert(0);
             strat_wins.entry(name.clone()).or_insert(0);
             strat_pts.entry(name.clone()).or_insert(0);
         }
-        for (i, bot) in bots.iter().enumerate() {
-            let name = bot.to_string();
+        for (i, spec) in specs.iter().enumerate() {
+            let name = spec.to_string();
             *strat_count.entry(name).or_insert(0) += 1;
             let _ = i; // count only
         }
@@ -299,7 +339,7 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
 
             // Accumulate points per strategy
             for &(bot_idx, score) in per_bot {
-                let name = bots[bot_idx].to_string();
+                let name = specs[bot_idx].to_string();
                 *strat_pts.entry(name).or_insert(0) += score as i64;
             }
 
@@ -307,7 +347,7 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
             let winning_strategies: std::collections::BTreeSet<String> = per_bot
                 .iter()
                 .filter(|(_, s)| *s == max)
-                .map(|(idx, _)| bots[*idx].to_string())
+                .map(|(idx, _)| specs[*idx].to_string())
                 .collect();
 
             if winning_strategies.len() == 1 {
@@ -370,7 +410,7 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
             let moe = z * se;
             println!(
                 "\n  99% CI: {} wins {:.2}% - {:.2}%",
-                bots[leader],
+                specs[leader],
                 (p - moe) * 100.0,
                 (p + moe) * 100.0
             );
@@ -400,7 +440,7 @@ fn run_solo(num_games: usize) {
         let mut max = i64::MIN;
         for _ in 0..num_games {
             let mut game = game::Game::new(vec![Player::new(
-                make_strategy(bot),
+                make_strategy(&BotSpec::BuiltIn(bot.clone())),
                 Box::new(SmallRng::from_entropy()),
             )]);
             game.play();
@@ -421,7 +461,10 @@ fn run_train() {
 
     let _champion = pop.current_champion().clone();
     println!("\nBenchmarking champion vs Opportunist...\n");
-    run_bench(vec![BotType::Ga, BotType::Opportunist], 100_000);
+    run_bench(
+        vec![BotSpec::BuiltIn(BotType::Ga), BotSpec::BuiltIn(BotType::Opportunist)],
+        100_000,
+    );
 }
 
 #[cfg(feature = "dqn")]
@@ -433,8 +476,16 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Play { bots, verbose }) => run_play(bots, verbose),
-        Some(Commands::Bench { bots, num_games }) => run_bench(bots, num_games),
+        Some(Commands::Play { bots, external, verbose }) => {
+            let mut specs = collect_specs(bots, external);
+            if specs.is_empty() {
+                specs.push(BotSpec::BuiltIn(BotType::Mcts));
+            }
+            run_play(specs, verbose);
+        }
+        Some(Commands::Bench { bots, external, num_games }) => {
+            run_bench(collect_specs(bots, external), num_games);
+        }
         Some(Commands::Solo { num_games }) => run_solo(num_games),
         Some(Commands::Evolve) => run_train(),
         #[cfg(feature = "dqn")]
@@ -446,8 +497,7 @@ fn main() {
             start_iteration,
         }) => run_dqn_selfplay(iterations, bench, checkpoints, start_iteration),
         None => {
-            // Default: play against MCTS
-            run_play(vec![BotType::Mcts], false);
+            run_play(vec![BotSpec::BuiltIn(BotType::Mcts)], false);
         }
     }
 }
