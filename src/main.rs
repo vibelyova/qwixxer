@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum BotType {
-    Ga,
-    Dqn,
-    Mcts,
-    Opportunist,
+    // Ga,
+    // Dqn,
+    // Mcts,
+    // Opportunist,
     Conservative,
     Random,
 }
@@ -19,10 +19,10 @@ enum BotType {
 impl std::fmt::Display for BotType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            BotType::Ga => write!(f, "GA"),
-            BotType::Dqn => write!(f, "DQN"),
-            BotType::Mcts => write!(f, "MCTS"),
-            BotType::Opportunist => write!(f, "Opportunist"),
+            // BotType::Ga => write!(f, "GA"),
+            // BotType::Dqn => write!(f, "DQN"),
+            // BotType::Mcts => write!(f, "MCTS"),
+            // BotType::Opportunist => write!(f, "Opportunist"),
             BotType::Conservative => write!(f, "Conservative"),
             BotType::Random => write!(f, "Random"),
         }
@@ -57,20 +57,21 @@ fn make_strategy(spec: &BotSpec) -> Box<dyn strategy::Strategy> {
     match spec {
         BotSpec::External(cmd) => Box::new(external::ExternalBot::new(cmd)),
         BotSpec::BuiltIn(bot) => {
-            let genes = Arc::new(bot::default_genes());
             match bot {
-                BotType::Ga => {
-                    let champion = bot::DNA::load_weights("champion.txt", genes)
-                        .expect("No champion.txt found. Run `evolve` first.");
-                    Box::new(champion)
-                }
-                BotType::Dqn => Box::new(dqn::DqnStrategy::load("dqn_model")),
-                BotType::Mcts => {
-                    let champion = bot::DNA::load_weights("champion.txt", genes)
-                        .expect("No champion.txt found. Run `evolve` first.");
-                    Box::new(mcts::MonteCarlo::with_ga(200, champion))
-                }
-                BotType::Opportunist => Box::<strategy::Opportunist>::default(),
+                // BotType::Ga => {
+                //     let genes = Arc::new(bot::default_genes());
+                //     let champion = bot::DNA::load_weights("champion.txt", genes)
+                //         .expect("No champion.txt found. Run `evolve` first.");
+                //     Box::new(champion)
+                // }
+                // BotType::Dqn => Box::new(dqn::DqnStrategy::load("dqn_model")),
+                // BotType::Mcts => {
+                //     let genes = Arc::new(bot::default_genes());
+                //     let champion = bot::DNA::load_weights("champion.txt", genes)
+                //         .expect("No champion.txt found. Run `evolve` first.");
+                //     Box::new(mcts::MonteCarlo::with_ga(200, champion))
+                // }
+                // BotType::Opportunist => Box::<strategy::Opportunist>::default(),
                 BotType::Conservative => Box::<strategy::Conservative>::default(),
                 BotType::Random => Box::new(strategy::Random),
             }
@@ -79,31 +80,31 @@ fn make_strategy(spec: &BotSpec) -> Box<dyn strategy::Strategy> {
 }
 
 struct StrategyTemplates {
-    dqn: Option<dqn::DqnStrategy>,
-    champion: Option<bot::DNA>,
+    // dqn: Option<dqn::DqnStrategy>,
+    // champion: Option<bot::DNA>,
 }
 
 impl StrategyTemplates {
-    fn new(specs: &[BotSpec]) -> Self {
-        let needs_dqn = specs.iter().any(|s| matches!(s, BotSpec::BuiltIn(BotType::Dqn)));
-        let needs_champion = specs
-            .iter()
-            .any(|s| matches!(s, BotSpec::BuiltIn(BotType::Ga | BotType::Mcts)));
-        let genes = Arc::new(bot::default_genes());
+    fn new(_specs: &[BotSpec]) -> Self {
+        // let needs_dqn = specs.iter().any(|s| matches!(s, BotSpec::BuiltIn(BotType::Dqn)));
+        // let needs_champion = specs
+        //     .iter()
+        //     .any(|s| matches!(s, BotSpec::BuiltIn(BotType::Ga | BotType::Mcts)));
+        // let genes = Arc::new(bot::default_genes());
         StrategyTemplates {
-            dqn: if needs_dqn {
-                Some(dqn::DqnStrategy::load("dqn_model"))
-            } else {
-                None
-            },
-            champion: if needs_champion {
-                Some(
-                    bot::DNA::load_weights("champion.txt", genes)
-                        .expect("No champion.txt found. Run `evolve` first."),
-                )
-            } else {
-                None
-            },
+            // dqn: if needs_dqn {
+            //     Some(dqn::DqnStrategy::load("dqn_model"))
+            // } else {
+            //     None
+            // },
+            // champion: if needs_champion {
+            //     Some(
+            //         bot::DNA::load_weights("champion.txt", genes)
+            //             .expect("No champion.txt found. Run `evolve` first."),
+            //     )
+            // } else {
+            //     None
+            // },
         }
     }
 
@@ -111,15 +112,15 @@ impl StrategyTemplates {
         match spec {
             BotSpec::External(cmd) => Box::new(external::ExternalBot::new(cmd)),
             BotSpec::BuiltIn(bot) => match bot {
-                BotType::Ga => Box::new(self.champion.as_ref().unwrap().clone()),
-                BotType::Dqn => {
-                    let t = self.dqn.as_ref().unwrap();
-                    Box::new(dqn::DqnStrategy::from_shared(t.model.clone(), t.device.clone()))
-                }
-                BotType::Mcts => {
-                    Box::new(mcts::MonteCarlo::with_ga(200, self.champion.as_ref().unwrap().clone()))
-                }
-                BotType::Opportunist => Box::<strategy::Opportunist>::default(),
+                // BotType::Ga => Box::new(self.champion.as_ref().unwrap().clone()),
+                // BotType::Dqn => {
+                //     let t = self.dqn.as_ref().unwrap();
+                //     Box::new(dqn::DqnStrategy::from_shared(t.model.clone(), t.device.clone()))
+                // }
+                // BotType::Mcts => {
+                //     Box::new(mcts::MonteCarlo::with_ga(200, self.champion.as_ref().unwrap().clone()))
+                // }
+                // BotType::Opportunist => Box::<strategy::Opportunist>::default(),
                 BotType::Conservative => Box::<strategy::Conservative>::default(),
                 BotType::Random => Box::new(strategy::Random),
             },
@@ -173,24 +174,24 @@ enum Commands {
         #[arg(short, long, default_value = "10000")]
         num_games: usize,
     },
-    /// Evolve the GA champion via genetic algorithm
-    Evolve,
-    /// DQN self-play reinforcement learning
-    #[cfg(feature = "dqn")]
-    DqnSelfplay {
-        /// Number of iterations
-        #[arg(short, long, default_value = "40")]
-        iterations: usize,
-        /// Benchmark games per iteration (0 to disable)
-        #[arg(short, long, default_value = "0")]
-        bench: usize,
-        /// Save per-iteration checkpoints as iter-N.mpk
-        #[arg(short, long)]
-        checkpoints: bool,
-        /// Starting iteration offset (for epsilon schedule when resuming)
-        #[arg(short, long, default_value = "0")]
-        start_iteration: usize,
-    },
+    // /// Evolve the GA champion via genetic algorithm
+    // Evolve,
+    // /// DQN self-play reinforcement learning
+    // #[cfg(feature = "dqn")]
+    // DqnSelfplay {
+    //     /// Number of iterations
+    //     #[arg(short, long, default_value = "40")]
+    //     iterations: usize,
+    //     /// Benchmark games per iteration (0 to disable)
+    //     #[arg(short, long, default_value = "0")]
+    //     bench: usize,
+    //     /// Save per-iteration checkpoints as iter-N.mpk
+    //     #[arg(short, long)]
+    //     checkpoints: bool,
+    //     /// Starting iteration offset (for epsilon schedule when resuming)
+    //     #[arg(short, long, default_value = "0")]
+    //     start_iteration: usize,
+    // },
 }
 
 fn run_play(specs: Vec<BotSpec>, verbose: bool) {
@@ -419,15 +420,10 @@ fn run_bench(specs: Vec<BotSpec>, num_games: usize) {
 }
 
 fn run_solo(num_games: usize) {
-    let genes = Arc::new(bot::default_genes());
-    let champion = bot::DNA::load_weights("champion.txt", genes).ok();
-
     let all_bots: Vec<(BotType, bool)> = vec![
         (BotType::Random, true),
         (BotType::Conservative, true),
-        (BotType::Opportunist, true),
-        (BotType::Ga, champion.is_some()),
-        (BotType::Dqn, std::path::Path::new("dqn_model/model.mpk").exists()),
+        // (BotType::Opportunist, true),
     ];
 
     println!("Single-player scores over {num_games} games:\n");
@@ -454,18 +450,18 @@ fn run_solo(num_games: usize) {
     }
 }
 
-fn run_train() {
-    println!("Training GA bot (population=100, 200 generations)...\n");
-    let mut pop = bot::Population::new(100, bot::default_genes(), 42);
-    pop.evolve(200);
-
-    let _champion = pop.current_champion().clone();
-    println!("\nBenchmarking champion vs Opportunist...\n");
-    run_bench(
-        vec![BotSpec::BuiltIn(BotType::Ga), BotSpec::BuiltIn(BotType::Opportunist)],
-        100_000,
-    );
-}
+// fn run_train() {
+//     println!("Training GA bot (population=100, 200 generations)...\n");
+//     let mut pop = bot::Population::new(100, bot::default_genes(), 42);
+//     pop.evolve(200);
+//
+//     let _champion = pop.current_champion().clone();
+//     println!("\nBenchmarking champion vs Opportunist...\n");
+//     run_bench(
+//         vec![BotSpec::BuiltIn(BotType::Ga), BotSpec::BuiltIn(BotType::Opportunist)],
+//         100_000,
+//     );
+// }
 
 #[cfg(feature = "dqn")]
 fn run_dqn_selfplay(iterations: usize, bench_games: usize, checkpoints: bool, start_iteration: usize) {
@@ -479,7 +475,7 @@ fn main() {
         Some(Commands::Play { bots, external, verbose }) => {
             let mut specs = collect_specs(bots, external);
             if specs.is_empty() {
-                specs.push(BotSpec::BuiltIn(BotType::Mcts));
+                specs.push(BotSpec::BuiltIn(BotType::Random));
             }
             run_play(specs, verbose);
         }
@@ -487,17 +483,16 @@ fn main() {
             run_bench(collect_specs(bots, external), num_games);
         }
         Some(Commands::Solo { num_games }) => run_solo(num_games),
-        Some(Commands::Evolve) => run_train(),
-        #[cfg(feature = "dqn")]
-        #[cfg(feature = "dqn")]
-        Some(Commands::DqnSelfplay {
-            iterations,
-            bench,
-            checkpoints,
-            start_iteration,
-        }) => run_dqn_selfplay(iterations, bench, checkpoints, start_iteration),
+        // Some(Commands::Evolve) => run_train(),
+        // #[cfg(feature = "dqn")]
+        // Some(Commands::DqnSelfplay {
+        //     iterations,
+        //     bench,
+        //     checkpoints,
+        //     start_iteration,
+        // }) => run_dqn_selfplay(iterations, bench, checkpoints, start_iteration),
         None => {
-            run_play(vec![BotSpec::BuiltIn(BotType::Mcts)], false);
+            run_play(vec![BotSpec::BuiltIn(BotType::Random)], false);
         }
     }
 }
