@@ -1,6 +1,8 @@
 target/
 dqn_model/
 !dqn_model/model.mpk
+pair_model/
+!pair_model/model.mpk
 champion-*.txt
 divergences.txt
 *.pdf

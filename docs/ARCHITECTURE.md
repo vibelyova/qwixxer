@@ -218,6 +218,21 @@ These meta-rules are shared by DQN, GA, and training code via `State::apply_meta
 
 Features 20-24 are game-end-proximity signals: they let the network predict how much of the game remains, which is the dominant driver of remaining-score variance.
 
+### Pair Network (`dqn/pair.rs`, `dqn/pair_train.rs`)
+
+Experimental successor to the DQN: a joint two-board MLP (45 -> 128 -> 64 -> 2)
+that predicts the distribution of the *future score differential*
+`final_diff - current_diff` as `(mu, log sigma^2)`. Inputs are two 20-feature
+board blocks (per-row progress/marks/locked/weighted-prob with the lock-rule
+fix, strikes, blanks, aggregate wprob, lockable rows) plus 5 pair-level
+features (current diff, opponent count, all-opponent summaries). Candidates
+are ranked by `(current_diff + mu) / sigma` against the leading opponent.
+Training is pure self-play with per-opponent TD(lambda=0.8) chains; every
+sample is also emitted board-swapped with negated targets (pairwise
+consistency); color permutations are applied in the batcher to both blocks.
+Passive skips are recorded (the old recorder dropped them). Model dir:
+`pair_model/`. Design doc: `docs/superpowers/specs/2026-06-10-pair-network-design.md`.
+
 ### Monte Carlo Tree Search (`mcts.rs`)
 
 **`MonteCarlo`** runs `N` rollout simulations per candidate move (default 500). For each move:
