@@ -77,6 +77,143 @@ pub fn pair_features(our: &State, paired: &State, all_opps: &[State]) -> [f32; P
     f
 }
 
+// ---- Model ----
+
+#[derive(Module, Debug)]
+pub struct PairModel<B: Backend> {
+    layer1: Linear<B>,
+    layer2: Linear<B>,
+    output_mean: Linear<B>,
+    output_log_var: Linear<B>,
+    activation: Relu,
+}
+
+#[derive(Config, Debug)]
+pub struct PairModelConfig {
+    #[config(default = 128)]
+    pub hidden1: usize,
+    #[config(default = 64)]
+    pub hidden2: usize,
+}
+
+impl PairModelConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> PairModel<B> {
+        PairModel {
+            layer1: LinearConfig::new(PAIR_FEATURES, self.hidden1)
+                .with_bias(true)
+                .init(device),
+            layer2: LinearConfig::new(self.hidden1, self.hidden2)
+                .with_bias(true)
+                .init(device),
+            output_mean: LinearConfig::new(self.hidden2, 1).with_bias(true).init(device),
+            output_log_var: LinearConfig::new(self.hidden2, 1).with_bias(true).init(device),
+            activation: Relu::new(),
+        }
+    }
+}
+
+impl<B: Backend> PairModel<B> {
+    /// Forward pass returning `[batch, 2]`: col 0 = μ_diff (future-space),
+    /// col 1 = raw `log σ²_diff` (clamped by callers / the loss).
+    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+        let x = self.activation.forward(self.layer1.forward(input));
+        let x = self.activation.forward(self.layer2.forward(x));
+        let mean = self.output_mean.forward(x.clone());
+        let log_var = self.output_log_var.forward(x);
+        Tensor::cat(vec![mean, log_var], 1)
+    }
+}
+
+/// Run the model on a batch of pair-feature vectors in one forward pass.
+/// Returns `(μ, log σ²)` per input row.
+pub fn pair_batch_forward(
+    model: &PairModel<MyBackend>,
+    device: &burn::backend::ndarray::NdArrayDevice,
+    features_list: &[[f32; PAIR_FEATURES]],
+) -> Vec<(f32, f32)> {
+    if features_list.is_empty() {
+        return Vec::new();
+    }
+    let n = features_list.len();
+    let flat: Vec<f32> = features_list.iter().flat_map(|f| f.iter().copied()).collect();
+    let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), device).reshape([n, PAIR_FEATURES]);
+    let output = model.forward(input);
+    let values = output.into_data().to_vec::<f32>().unwrap();
+    (0..n).map(|i| (values[2 * i], values[2 * i + 1])).collect()
+}
+
+// ---- Strategy ----
+
+pub struct PairStrategy {
+    pub model: Arc<PairModel<MyBackend>>,
+    pub device: burn::backend::ndarray::NdArrayDevice,
+}
+
+impl std::fmt::Debug for PairStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "PairStrategy")
+    }
+}
+
+impl PairStrategy {
+    pub fn load(artifact_dir: &str) -> Self {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = PairModelConfig::new()
+            .init::<MyBackend>(&device)
+            .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+            .expect("Failed to load pair model");
+        PairStrategy {
+            model: Arc::new(model),
+            device,
+        }
+    }
+
+    pub fn from_model(model: PairModel<MyBackend>, device: burn::backend::ndarray::NdArrayDevice) -> Self {
+        PairStrategy {
+            model: Arc::new(model),
+            device,
+        }
+    }
+
+    pub fn from_shared(model: Arc<PairModel<MyBackend>>, device: burn::backend::ndarray::NdArrayDevice) -> Self {
+        PairStrategy { model, device }
+    }
+}
+
+impl Bot for PairStrategy {
+    fn evaluate(&self, our_state: &State, opp_states: &[State]) -> f32 {
+        self.evaluate_batch(&[*our_state], opp_states)[0]
+    }
+
+    fn evaluate_batch(&self, candidates: &[State], opp_states: &[State]) -> Vec<f32> {
+        // Solo fallback: rank against an empty default board. Solo play is
+        // officially unsupported for the pair bot (the old DQN covers it).
+        let default_opps;
+        let opp_states = if opp_states.is_empty() {
+            default_opps = [State::default()];
+            &default_opps[..]
+        } else {
+            opp_states
+        };
+        let leader = opp_states.iter().max_by_key(|s| s.count_points()).unwrap();
+        let leader_points = leader.count_points();
+
+        let feats: Vec<[f32; PAIR_FEATURES]> = candidates
+            .iter()
+            .map(|c| pair_features(c, leader, opp_states))
+            .collect();
+        pair_batch_forward(&self.model, &self.device, &feats)
+            .into_iter()
+            .zip(candidates)
+            .map(|((mu, log_var), cand)| {
+                let cdiff = (cand.count_points() - leader_points) as f32;
+                let sigma = (0.5 * log_var.clamp(LOG_VAR_MIN, LOG_VAR_MAX)).exp();
+                (cdiff + mu) / sigma
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +310,30 @@ mod tests {
         assert_eq!(ab[42], 0.0); // A's opponent (B) is fresh
         assert!((ba[42] - total_progress(&a)).abs() < 1e-6);
         assert!((ba[43] - 1.0 / 3.0).abs() < 1e-6); // A has 1 strike
+    }
+
+    #[test]
+    fn evaluate_batch_shape_and_determinism() {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let bot = PairStrategy::from_model(PairModelConfig::new().init::<MyBackend>(&device), device);
+
+        let mut cand = State::default();
+        cand.apply_mark(Mark { row: 1, number: 5 });
+        let candidates = [State::default(), cand];
+        let opps = [State::default()];
+
+        let v1 = bot.evaluate_batch(&candidates, &opps);
+        let v2 = bot.evaluate_batch(&candidates, &opps);
+        assert_eq!(v1.len(), 2);
+        assert_eq!(v1, v2);
+        assert!(v1.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn evaluate_handles_empty_opponents() {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let bot = PairStrategy::from_model(PairModelConfig::new().init::<MyBackend>(&device), device);
+        let v = bot.evaluate(&State::default(), &[]);
+        assert!(v.is_finite());
     }
 }
