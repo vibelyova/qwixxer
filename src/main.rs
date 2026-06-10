@@ -9,6 +9,7 @@ use std::sync::Arc;
 enum BotType {
     Ga,
     Dqn,
+    Pair,
     Mcts,
     Opportunist,
     Conservative,
@@ -20,6 +21,7 @@ impl std::fmt::Display for BotType {
         match self {
             BotType::Ga => write!(f, "GA"),
             BotType::Dqn => write!(f, "DQN"),
+            BotType::Pair => write!(f, "PAIR"),
             BotType::Mcts => write!(f, "MCTS"),
             BotType::Opportunist => write!(f, "Opportunist"),
             BotType::Conservative => write!(f, "Conservative"),
@@ -37,6 +39,7 @@ fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
             Box::new(champion)
         }
         BotType::Dqn => Box::new(dqn::DqnStrategy::load("dqn_model")),
+        BotType::Pair => Box::new(dqn::pair::PairStrategy::load("pair_model")),
         BotType::Mcts => {
             let champion =
                 bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt found. Run `train ga` first.");
@@ -50,17 +53,24 @@ fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
 
 struct StrategyTemplates {
     dqn: Option<dqn::DqnStrategy>,
+    pair: Option<dqn::pair::PairStrategy>,
     champion: Option<bot::DNA>,
 }
 
 impl StrategyTemplates {
     fn new(bots: &[BotType]) -> Self {
         let needs_dqn = bots.iter().any(|b| matches!(b, BotType::Dqn));
+        let needs_pair = bots.iter().any(|b| matches!(b, BotType::Pair));
         let needs_champion = bots.iter().any(|b| matches!(b, BotType::Ga | BotType::Mcts));
         let genes = Arc::new(bot::default_genes());
         StrategyTemplates {
             dqn: if needs_dqn {
                 Some(dqn::DqnStrategy::load("dqn_model"))
+            } else {
+                None
+            },
+            pair: if needs_pair {
+                Some(dqn::pair::PairStrategy::load("pair_model"))
             } else {
                 None
             },
@@ -78,6 +88,10 @@ impl StrategyTemplates {
             BotType::Dqn => {
                 let t = self.dqn.as_ref().unwrap();
                 Box::new(dqn::DqnStrategy::from_shared(t.model.clone(), t.device.clone()))
+            }
+            BotType::Pair => {
+                let t = self.pair.as_ref().unwrap();
+                Box::new(dqn::pair::PairStrategy::from_shared(t.model.clone(), t.device.clone()))
             }
             BotType::Mcts => Box::new(mcts::MonteCarlo::with_ga(200, self.champion.as_ref().unwrap().clone())),
             BotType::Opportunist => Box::<strategy::Opportunist>::default(),
@@ -147,6 +161,25 @@ enum Commands {
         checkpoints: bool,
         /// Starting iteration offset (for epsilon schedule when resuming)
         #[arg(short, long, default_value = "0")]
+        start_iteration: usize,
+    },
+    /// Pair-network self-play reinforcement learning
+    #[cfg(feature = "dqn")]
+    PairTrain {
+        /// Number of iterations
+        #[arg(short, long, default_value = "40")]
+        iterations: usize,
+        /// Games per iteration
+        #[arg(short, long, default_value = "20000")]
+        games: usize,
+        /// Benchmark games per iteration (0 to disable)
+        #[arg(short, long, default_value = "0")]
+        bench: usize,
+        /// Save per-iteration checkpoints as iter-N.mpk
+        #[arg(short, long)]
+        checkpoints: bool,
+        /// Starting iteration offset (for epsilon schedule when resuming)
+        #[arg(long, default_value = "0")]
         start_iteration: usize,
     },
 }
@@ -528,6 +561,16 @@ fn main() {
             checkpoints,
             start_iteration,
         }) => run_dqn_selfplay(iterations, bench, checkpoints, start_iteration),
+        #[cfg(feature = "dqn")]
+        Some(Commands::PairTrain {
+            iterations,
+            games,
+            bench,
+            checkpoints,
+            start_iteration,
+        }) => {
+            dqn::pair_train::self_play_train("pair_model", iterations, games, 10, bench, checkpoints, start_iteration)
+        }
         None => {
             // Default: play against MCTS
             run_play(vec![BotType::Mcts], false);
