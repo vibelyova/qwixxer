@@ -69,30 +69,49 @@ fn find_safe_lock(state: &State, marks: &[Mark]) -> Option<Mark> {
         })
 }
 
+/// Outcome of the pure-logic half of a decision pipeline: either the meta
+/// rules fully determine the move, or a filtered+pruned candidate list
+/// remains for value-based selection.
+pub(crate) enum Decision {
+    Forced(Option<Mark>),
+    /// (move, post-move state) pairs; `None` = skip/baseline.
+    Choices(Vec<(Option<Mark>, State)>),
+}
+
+/// Index of the maximum value, matching `Iterator::max_by` semantics
+/// (last maximum wins) so refactored paths pick identical moves.
+pub(crate) fn argmax(values: &[f32]) -> usize {
+    values
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .unwrap()
+        .0
+}
+
+pub(crate) fn eval_decision(bot: &impl Bot, decision: Decision, eval_opps: &[State]) -> Option<Mark> {
+    match decision {
+        Decision::Forced(m) => m,
+        Decision::Choices(cands) => {
+            let states: Vec<State> = cands.iter().map(|(_, s)| *s).collect();
+            let values = bot.evaluate_batch(&states, eval_opps);
+            cands[argmax(&values)].0
+        }
+    }
+}
+
 /// Core decision logic shared by passive_phase1 and active_phase2.
 ///
 /// Given candidate marks and a baseline state (skip for passive, skip-or-strike
-/// for phase2), applies meta-rules then evaluates with the bot:
-///   1. Force winning baseline (e.g. winning 4th strike) → None
-///   2. Force safe lock → Some(mark)
-///   3. Force winning game-ending mark → Some(mark)
-///   4. Filter out all losing game-ends (marks AND baseline)
-///   5. Post-state dominance pruning
-///   6. Evaluate survivors, return best
-fn pick_best_mark(
-    bot: &impl Bot,
-    state: &State,
-    opp_states: &[State],
-    marks: &[Mark],
-    baseline: State,
-    opp_best: isize,
-) -> Option<Mark> {
+/// for phase2), applies meta-rules and returns either a forced move or a
+/// filtered+pruned candidate list for value-based selection.
+pub(crate) fn mark_choices(state: &State, marks: &[Mark], baseline: State, opp_best: isize) -> Decision {
     if marks.is_empty() {
-        return None;
+        return Decision::Forced(None);
     }
 
     if let Some(m) = find_safe_lock(state, marks) {
-        return Some(m);
+        return Decision::Forced(Some(m));
     }
     // TODO: smart strike
 
@@ -115,7 +134,7 @@ fn pick_best_mark(
         .filter(|(_, post)| post.would_end_game() && post.count_points() > opp_best)
         .max_by_key(|(_, post)| post.count_points())
     {
-        return mark;
+        return Decision::Forced(mark);
     }
 
     // Build candidates: marks + baseline. Filter out losing game-ends.
@@ -130,49 +149,38 @@ fn pick_best_mark(
         .collect();
 
     if cands.is_empty() {
-        return None;
+        return Decision::Forced(None);
     }
     if cands.len() == 1 {
-        return cands[0].0;
+        return Decision::Forced(cands[0].0);
     }
 
     prune_dominated(&mut cands, |(_, s)| s);
 
     if cands.is_empty() {
-        return None;
+        return Decision::Forced(None);
     }
     if cands.len() == 1 {
-        return cands[0].0;
+        return Decision::Forced(cands[0].0);
     }
 
-    // Evaluate all survivors
-    let states: Vec<State> = cands.iter().map(|(_, s)| *s).collect();
-    let values = bot.evaluate_batch(&states, opp_states);
-    let best_idx = values
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .unwrap()
-        .0;
-    cands[best_idx].0
+    Decision::Choices(cands)
 }
 
 // ---------------------------------------------------------------------------
 
-pub(crate) fn passive_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+pub(crate) fn passive_phase1_choices(state: &State, opp_states: &[State], dice: [u8; 6]) -> Decision {
     let white_sum = dice[0] + dice[1];
     let marks = state.generate_white_moves(white_sum);
     let opp_best = opp_best_phase1_score(opp_states, white_sum);
-    pick_best_mark(bot, state, opp_states, &marks, *state, opp_best)
+    mark_choices(state, &marks, *state, opp_best)
 }
 
-pub(crate) fn active_phase2_impl(
-    bot: &impl Bot,
-    state: &State,
-    opp_states: &[State],
-    dice: [u8; 6],
-    has_marked: bool,
-) -> Option<Mark> {
+pub(crate) fn passive_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+    eval_decision(bot, passive_phase1_choices(state, opp_states, dice), opp_states)
+}
+
+pub(crate) fn active_phase2_choices(state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Decision {
     let opp_best = opp_states.iter().map(|s| s.count_points()).max().unwrap_or(0);
     let marks = state.generate_color_moves(dice);
     let baseline = if has_marked {
@@ -182,7 +190,21 @@ pub(crate) fn active_phase2_impl(
         s.apply_strike();
         s
     };
-    pick_best_mark(bot, state, opp_states, &marks, baseline, opp_best)
+    mark_choices(state, &marks, baseline, opp_best)
+}
+
+pub(crate) fn active_phase2_impl(
+    bot: &impl Bot,
+    state: &State,
+    opp_states: &[State],
+    dice: [u8; 6],
+    has_marked: bool,
+) -> Option<Mark> {
+    eval_decision(
+        bot,
+        active_phase2_choices(state, opp_states, dice, has_marked),
+        opp_states,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -210,15 +232,14 @@ fn simulate_opp_phase1(bot: &impl Bot, state: &State, opp_states: &[State], dice
         .collect()
 }
 
-pub(crate) fn active_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+/// Pure-logic phase-1 plan pipeline. `comparison_opps` supplies `opp_best`
+/// for the winning/losing endgame filters — predicted post-phase1 states in
+/// the full pipeline, current states in the simulator's lite mode. Returned
+/// `Choices` carry (phase1 mark, plan end-state); the phase-2 part of each
+/// plan is internal (the chooser only commits phase 1).
+pub(crate) fn phase1_plan_choices(state: &State, comparison_opps: &[State], dice: [u8; 6]) -> Decision {
     let white_sum = dice[0] + dice[1];
-
-    // Simulate opponents' likely phase1 marks to get predicted post-phase1
-    // opponent states. This replaces the RISKY filter: instead of conservatively
-    // removing plans that might be invalidated, we predict what opponents will
-    // do and plan around it.
-    let sim_opp = simulate_opp_phase1(bot, state, opp_states, dice);
-    let opp_best = sim_opp.iter().map(|s| s.count_points()).max().unwrap_or(0);
+    let opp_best = comparison_opps.iter().map(|s| s.count_points()).max().unwrap_or(0);
 
     let white_marks = state.generate_white_moves(white_sum);
     let color_marks = state.generate_color_moves(dice);
@@ -255,7 +276,7 @@ pub(crate) fn active_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[St
     }
 
     if plans.is_empty() {
-        return None;
+        return Decision::Forced(None);
     }
 
     // Force best winning game-end
@@ -265,7 +286,7 @@ pub(crate) fn active_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[St
         .filter(|(_, (_, _, post))| post.would_end_game() && post.count_points() > opp_best)
         .max_by_key(|(_, (_, _, post))| post.count_points());
     if let Some((i, _)) = winning {
-        return plans[i].0;
+        return Decision::Forced(plans[i].0);
     }
 
     // Remove losing game-ends
@@ -284,23 +305,37 @@ pub(crate) fn active_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[St
                 s.apply_mark(*m);
                 !s.would_end_game()
             } {
-                return Some(*m);
+                return Decision::Forced(Some(*m));
             }
         }
     }
 
     prune_dominated(&mut plans, |(_, _, s)| s);
 
-    // Evaluate plans against simulated post-opponent states
-    let post_states: Vec<State> = plans.iter().map(|(_, _, s)| *s).collect();
-    let values = bot.evaluate_batch(&post_states, &sim_opp);
-    let best_idx = values
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .unwrap()
-        .0;
-    plans[best_idx].0
+    Decision::Choices(plans.into_iter().map(|(p1, _, s)| (p1, s)).collect())
+}
+
+/// Full phase-1 pipeline: simulate opponents' phase-1 responses, then run the
+/// plan pipeline against them. Returns the decision plus the simulated
+/// post-phase1 opponent states (also the evaluation context for Choices).
+pub(crate) fn active_phase1_choices(
+    bot: &impl Bot,
+    state: &State,
+    opp_states: &[State],
+    dice: [u8; 6],
+) -> (Decision, Vec<State>) {
+    // Simulate opponents' likely phase1 marks to get predicted post-phase1
+    // opponent states. This replaces the RISKY filter: instead of conservatively
+    // removing plans that might be invalidated, we predict what opponents will
+    // do and plan around it.
+    let sim_opp = simulate_opp_phase1(bot, state, opp_states, dice);
+    let decision = phase1_plan_choices(state, &sim_opp, dice);
+    (decision, sim_opp)
+}
+
+pub(crate) fn active_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+    let (decision, sim_opp) = active_phase1_choices(bot, state, opp_states, dice);
+    eval_decision(bot, decision, &sim_opp)
 }
 
 // ---------------------------------------------------------------------------
