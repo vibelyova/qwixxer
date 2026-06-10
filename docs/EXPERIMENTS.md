@@ -609,3 +609,58 @@ Qwixx's structural ceiling against a well-tuned GA is probably in the 60-62% ran
 - `examples/sigma_validation.rs` — batched MC rollouts from real-game decisions, compares DQN (μ, σ) to empirical (μ, σ); writes CSV.
 - `examples/score_distribution.rs` — dumps the final-score distribution from a fixed snapshot.
 - `scripts/sigma_validation_plots.py` — produces μ/σ scatter and σ-vs-turn plots from the CSV.
+
+---
+
+## Phase 12: Pairwise Differential Network ("pair" bot)
+
+All numbers below are under the corrected two-phase rules and paired-seed
+benchmarking (the pre-refactor numbers above are not comparable; the old DQN's
+baseline under the new regime is **59.10%** vs GA on the seed-42 set).
+
+### Design
+
+Replaced the single-board value net + hand-built `OpponentContext` with a joint
+two-board MLP (45 → 128 → 64 → 2) predicting the **future score differential**
+`final_diff − current_diff` as `(μ, log σ²)`. Motivation: row-level opponent
+visibility (lock races) and implicit covariance handling — `σ_diff` is the
+calibrated quantity, no independence assumption. Training: pure self-play
+(1v1/3p/4p thirds), per-opponent TD(λ=0.8) chains, board-swap sample doubling
+with exactly-recomputed pair-level features, passive skips recorded, color
+permutation on both blocks in the batcher. Ranking: `(current_diff + μ)/σ` vs
+the leading opponent. Spec: `docs/superpowers/specs/2026-06-10-pair-network-design.md`.
+
+### Epochs finding: 10 epochs/iteration overfits
+
+The pair pipeline generates ~6.2M samples/iteration (~3.4× the old pipeline:
+per-opponent chains × swap doubling × skip recording), so 10 epochs over the
+3-iteration replay buffer was ~10× the old gradient work. At 10 epochs the
+winrate plateaued at **56.5%** (iters 4–10). Switching to **3 epochs** at
+iteration 11 broke the plateau: winrate climbed to a peak of **59.02%** at
+iteration 19, converging to ~58.0–58.4% by iteration 31, while avg score rose
+to ~65. Fewer epochs per buffer snapshot = less overfitting to recent
+self-play, plus ~2.4× faster iterations.
+
+### Results (iter-19 checkpoint, 100k games each)
+
+| Matchup | seed 42 | seed 7 |
+|---------|---------|--------|
+| PAIR vs GA | **59.22%** (CI 58.86–59.58) | **59.26%** (CI 58.90–59.62) |
+| PAIR vs old DQN | 49.56% vs 48.89% (1.6% ties) | 49.35% vs 49.06% (1.6% ties) |
+
+- vs GA: statistical **parity with the old DQN** (59.10%), confirmed on an
+  independent seed.
+- Head-to-head: **dead even** — PAIR takes ~50.1–50.3% of decisive games, not
+  significant. PAIR scores slightly higher on average (76.0 vs 75.7).
+
+### Conclusion
+
+Joint two-board evaluation reaches parity with compressed-context evaluation,
+not superiority. This is strong evidence for the structural-ceiling
+hypothesis: at ~59–60% vs GA, the binding constraint is not the evaluation
+function's opponent information — both representations extract essentially all
+the available signal. What the pair net does buy: ~2× cheaper inference per
+decision (N feature rows instead of 2N interleaved), much simpler context
+handling (no per-candidate `OpponentContext` rebuild), and a cleaner platform
+for decision-time search — which is the next lever that can plausibly move the
+number.

@@ -41,7 +41,7 @@ Model artifacts:
 | Strategy | Description | vs GA (1v1) |
 |---|---|---|
 | **DQN** | TD(λ) value network + Gaussian P(win) ranking + shared meta-rules | **~60.3%** |
-| **Pair** | Joint two-board net ranking by score-differential P(win) (experimental) | TBD |
+| **Pair** | Joint two-board net ranking by score-differential P(win) | ~59.2% (parity with DQN) |
 | **GA Champion** | Genetically-evolved 4-weight heuristic + meta-rules | baseline |
 | **MCTS** | Monte Carlo tree search with GA rollouts | ~GA-level |
 | **Opportunist** | Max weighted probability, blank caps, always-lock | ~30% |
