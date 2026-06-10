@@ -4,7 +4,7 @@
 //! mid-turn, with all players' decisions driven by a `Bot`.
 
 use super::bot_impl::{
-    active_phase1_impl, active_phase2_choices, eval_decision, passive_phase1_choices, phase1_plan_choices,
+    active_phase1_impl, active_phase2_choices, eval_decision, passive_phase1_choices, phase1_plan_choices, Decision,
 };
 use super::Bot;
 use crate::game::DiceSource;
@@ -126,6 +126,159 @@ pub fn play_sim_turn(bot: &impl Bot, sim: &mut SimGame, fidelity: Fidelity) {
     sim.active = (sim.active + 1) % n;
 }
 
+/// Advances many sims in lockstep, batching each phase's net evaluations of
+/// ALL live sims into one `evaluate_batch_multi` call. Decisions inside are
+/// Lite-fidelity (see [`Fidelity::Lite`]).
+pub struct BatchedRollouts<'a, B: Bot> {
+    pub bot: &'a B,
+    pub sims: Vec<SimGame>,
+}
+
+/// One unevaluated decision gathered from a sim.
+struct PendingChoice {
+    sim: usize,
+    player: usize,
+    cands: Vec<(Option<Mark>, State)>,
+    states: Vec<State>,
+    view: Vec<State>,
+}
+
+impl<'a, B: Bot> BatchedRollouts<'a, B> {
+    pub fn new(bot: &'a B, sims: Vec<SimGame>) -> Self {
+        Self { bot, sims }
+    }
+
+    pub fn all_over(&self) -> bool {
+        self.sims.iter().all(|s| s.over)
+    }
+
+    /// Resolve a batch of pending choices with one multi-group evaluation.
+    /// Returns (sim, player, chosen mark) triples.
+    fn resolve(&self, pending: Vec<PendingChoice>) -> Vec<(usize, usize, Option<Mark>)> {
+        let groups: Vec<(&[State], &[State])> = pending
+            .iter()
+            .map(|p| (p.states.as_slice(), p.view.as_slice()))
+            .collect();
+        let values = self.bot.evaluate_batch_multi(&groups);
+        pending
+            .into_iter()
+            .zip(values)
+            .map(|(p, vals)| (p.sim, p.player, p.cands[super::bot_impl::argmax(&vals)].0))
+            .collect()
+    }
+
+    /// Advance every live sim by one full turn.
+    pub fn step_turn(&mut self) {
+        let live: Vec<usize> = (0..self.sims.len()).filter(|&i| !self.sims[i].over).collect();
+        if live.is_empty() {
+            return;
+        }
+
+        // ---- Phase 1: roll + gather all players' decisions ----
+        let mut dice_of: Vec<[u8; 6]> = Vec::with_capacity(live.len());
+        let mut snapshots: Vec<Vec<State>> = Vec::with_capacity(live.len());
+        for &si in &live {
+            let sim = &mut self.sims[si];
+            let active = sim.active;
+            dice_of.push(sim.rngs[active].roll());
+            snapshots.push(sim.states.clone());
+        }
+
+        let mut marks: Vec<Vec<Option<Mark>>> = live.iter().map(|&si| vec![None; self.sims[si].n()]).collect();
+        let mut pending: Vec<PendingChoice> = Vec::new();
+        for (li, &si) in live.iter().enumerate() {
+            let sim = &self.sims[si];
+            let n = sim.n();
+            let dice = dice_of[li];
+            for j in 0..n {
+                let view = SimGame::opp_view(&snapshots[li], j);
+                let decision = if j == sim.active {
+                    phase1_plan_choices(&snapshots[li][j], &view, dice)
+                } else {
+                    passive_phase1_choices(&snapshots[li][j], &view, dice)
+                };
+                match decision {
+                    Decision::Forced(m) => marks[li][j] = m,
+                    Decision::Choices(cands) => {
+                        let states: Vec<State> = cands.iter().map(|(_, s)| *s).collect();
+                        pending.push(PendingChoice {
+                            sim: li,
+                            player: j,
+                            cands,
+                            states,
+                            view,
+                        });
+                    }
+                }
+            }
+        }
+        for (li, j, m) in self.resolve(pending) {
+            marks[li][j] = m;
+        }
+
+        // ---- Apply phase 1, locks, game-over ----
+        let mut has_marked: Vec<bool> = Vec::with_capacity(live.len());
+        for (li, &si) in live.iter().enumerate() {
+            let sim = &mut self.sims[si];
+            has_marked.push(marks[li][sim.active].is_some());
+            for (j, m) in marks[li].iter().enumerate() {
+                if let Some(m) = m {
+                    sim.states[j].apply_mark(*m);
+                }
+            }
+            SimGame::propagate_locks(&mut sim.states);
+            if SimGame::game_over(&sim.states) {
+                sim.over = true;
+            }
+        }
+
+        // ---- Phase 2: active players of still-live sims ----
+        let mut pending: Vec<PendingChoice> = Vec::new();
+        let mut phase2_marks: Vec<Option<Option<Mark>>> = vec![None; live.len()]; // outer None = pending
+        for (li, &si) in live.iter().enumerate() {
+            let sim = &self.sims[si];
+            if sim.over {
+                continue;
+            }
+            let view = SimGame::opp_view(&sim.states, sim.active);
+            match active_phase2_choices(&sim.states[sim.active], &view, dice_of[li], has_marked[li]) {
+                Decision::Forced(m) => phase2_marks[li] = Some(m),
+                Decision::Choices(cands) => {
+                    let states: Vec<State> = cands.iter().map(|(_, s)| *s).collect();
+                    pending.push(PendingChoice {
+                        sim: li,
+                        player: sim.active,
+                        cands,
+                        states,
+                        view,
+                    });
+                }
+            }
+        }
+        for (li, _, m) in self.resolve(pending) {
+            phase2_marks[li] = Some(m);
+        }
+
+        for (li, &si) in live.iter().enumerate() {
+            let sim = &mut self.sims[si];
+            if sim.over {
+                continue;
+            }
+            match phase2_marks[li].expect("phase 2 decision missing") {
+                Some(m) => sim.states[sim.active].apply_mark(m),
+                None if !has_marked[li] => sim.states[sim.active].apply_strike(),
+                None => {}
+            }
+            SimGame::propagate_locks(&mut sim.states);
+            if SimGame::game_over(&sim.states) {
+                sim.over = true;
+                continue;
+            }
+            sim.active = (sim.active + 1) % sim.n();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +374,43 @@ mod tests {
             }
         }
         assert!(saw_lock_end, "no trained game ended via locks — lock path not covered");
+    }
+
+    #[test]
+    fn lockstep_driver_matches_sequential_lite_sims() {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = Arc::new(PairModelConfig::new().init::<MyBackend>(&device));
+        let bot = PairStrategy::from_shared(model, device);
+
+        let make_sims = || -> Vec<SimGame> {
+            (0..8u64)
+                .map(|k| SimGame {
+                    states: vec![State::default(); 2],
+                    active: 0,
+                    rngs: (0..2).map(|i| SmallRng::seed_from_u64(7000 + 10 * k + i)).collect(),
+                    over: false,
+                })
+                .collect()
+        };
+
+        // Sequential reference (Lite fidelity).
+        let mut seq = make_sims();
+        for _ in 0..6 {
+            for sim in seq.iter_mut() {
+                play_sim_turn(&bot, sim, Fidelity::Lite);
+            }
+        }
+
+        // Lockstep.
+        let mut batched = BatchedRollouts::new(&bot, make_sims());
+        for _ in 0..6 {
+            batched.step_turn();
+        }
+
+        for (a, b) in seq.iter().zip(&batched.sims) {
+            assert_eq!(a.over, b.over);
+            assert_eq!(a.active, b.active);
+            assert_eq!(a.states, b.states);
+        }
     }
 }
