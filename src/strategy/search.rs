@@ -17,6 +17,9 @@ pub const K_CANDIDATES: usize = 2;
 pub const K_SAMPLES: usize = 64;
 /// Top-2 static value gap (bot's evaluate units) below which search triggers.
 pub const GATE_MARGIN: f32 = 0.15;
+/// Full turns simulated after completing the current turn, as a multiple of
+/// the player count (1 = one full round).
+pub const HORIZON_ROUNDS: usize = 1;
 
 /// Capability for search leaf scoring: a calibrated win probability, batched
 /// over independent (our_state, opp_states) groups in one inference call.
@@ -170,8 +173,7 @@ impl<B: WinProb> SearchBot<B> {
         }
 
         let mut driver = BatchedRollouts::new(&self.bot, sims);
-        for _ in 0..n {
-            // HORIZON_TURNS = one full round
+        for _ in 0..(HORIZON_ROUNDS * n) {
             if driver.all_over() {
                 break;
             }
@@ -226,9 +228,9 @@ impl<B: WinProb> SearchBot<B> {
     /// Gate bookkeeping. Returns true if search should run. Never searches
     /// with no opponents (solo is unsupported; the simulator's outcome and
     /// leader logic require at least one opponent).
-    fn gate_and_record(&self, cands: &[Candidate], our: &State, opps: &[State]) -> bool {
+    fn gate_and_record(&self, cands: &[Candidate], our: &State, opps: &[State]) -> Option<(bool, bool)> {
         if opps.is_empty() {
-            return false;
+            return None;
         }
         if let Some(stats) = &self.stats {
             stats.borrow_mut().eligible += 1;
@@ -244,7 +246,11 @@ impl<B: WinProb> SearchBot<B> {
                 s.gate_endgame += 1;
             }
         }
-        self.force || close || endgame
+        if self.force || close || endgame {
+            Some((close, endgame))
+        } else {
+            None
+        }
     }
 
     fn record_search_result(&self, gated: bool, disagreed: bool) {
@@ -294,10 +300,13 @@ impl<B: WinProb> Strategy for SearchBot<B> {
         }
         cands.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap());
 
-        if cands.len() < 2 || !self.gate_and_record(&cands, state, opp_states) {
+        let Some((close, endgame)) = (if cands.len() < 2 {
+            None
+        } else {
+            self.gate_and_record(&cands, state, opp_states)
+        }) else {
             return cands[0].mark;
-        }
-        let (close, endgame) = gates(&cands, state, opp_states);
+        };
 
         // Entry per shortlisted phase-1 mark: opponents' (shared, simultaneous)
         // phase-1 marks are sim_opp; complete OUR turn deterministically.
@@ -355,10 +364,13 @@ impl<B: WinProb> Strategy for SearchBot<B> {
             .collect();
         cands.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap());
 
-        if cands.len() < 2 || !self.gate_and_record(&cands, state, opp_states) {
+        let Some((close, endgame)) = (if cands.len() < 2 {
+            None
+        } else {
+            self.gate_and_record(&cands, state, opp_states)
+        }) else {
             return cands[0].mark;
-        }
-        let (close, endgame) = gates(&cands, state, opp_states);
+        };
 
         // Entry per candidate: post state + lock propagation; turn is then over.
         let shortlist = &cands[..cands.len().min(K_CANDIDATES)];
