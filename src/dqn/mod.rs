@@ -18,6 +18,9 @@
 #[cfg(feature = "dqn")]
 pub mod train;
 
+#[cfg(feature = "dqn")]
+pub mod pair_train;
+
 pub mod pair;
 
 use crate::state::State;
