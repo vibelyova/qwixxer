@@ -186,31 +186,45 @@ impl Bot for PairStrategy {
     }
 
     fn evaluate_batch(&self, candidates: &[State], opp_states: &[State]) -> Vec<f32> {
-        // Solo fallback: rank against an empty default board. Solo play is
-        // officially unsupported for the pair bot (the old DQN covers it).
-        let default_opps;
-        let opp_states = if opp_states.is_empty() {
-            default_opps = [State::default()];
-            &default_opps[..]
-        } else {
-            opp_states
-        };
-        let leader = opp_states.iter().max_by_key(|s| s.count_points()).unwrap();
-        let leader_points = leader.count_points();
+        self.evaluate_batch_multi(&[(candidates, opp_states)]).pop().unwrap()
+    }
 
-        let feats: Vec<[f32; PAIR_FEATURES]> = candidates
-            .iter()
-            .map(|c| pair_features(c, leader, opp_states))
-            .collect();
-        pair_batch_forward(&self.model, &self.device, &feats)
-            .into_iter()
-            .zip(candidates)
-            .map(|((mu, log_var), cand)| {
-                let cdiff = (cand.count_points() - leader_points) as f32;
-                let sigma = (0.5 * log_var.clamp(LOG_VAR_MIN, LOG_VAR_MAX)).exp();
-                (cdiff + mu) / sigma
-            })
-            .collect()
+    fn evaluate_batch_multi(&self, groups: &[(&[State], &[State])]) -> Vec<Vec<f32>> {
+        let default_opps = [State::default()];
+        let mut leaders: Vec<isize> = Vec::with_capacity(groups.len());
+        let mut feats: Vec<[f32; PAIR_FEATURES]> = Vec::new();
+        for (candidates, opp_states) in groups {
+            // Solo fallback: rank against an empty default board. Solo play is
+            // officially unsupported for the pair bot (the old DQN covers it).
+            let opps: &[State] = if opp_states.is_empty() {
+                &default_opps
+            } else {
+                opp_states
+            };
+            let leader = opps.iter().max_by_key(|s| s.count_points()).unwrap();
+            for c in *candidates {
+                feats.push(pair_features(c, leader, opps));
+            }
+            leaders.push(leader.count_points());
+        }
+        let values = pair_batch_forward(&self.model, &self.device, &feats);
+
+        let mut out = Vec::with_capacity(groups.len());
+        let mut idx = 0;
+        for ((candidates, _), leader_points) in groups.iter().zip(leaders) {
+            let group = candidates
+                .iter()
+                .map(|cand| {
+                    let (mu, log_var) = values[idx];
+                    idx += 1;
+                    let cdiff = (cand.count_points() - leader_points) as f32;
+                    let sigma = (0.5 * log_var.clamp(LOG_VAR_MIN, LOG_VAR_MAX)).exp();
+                    (cdiff + mu) / sigma
+                })
+                .collect();
+            out.push(group);
+        }
+        out
     }
 }
 
@@ -327,6 +341,31 @@ mod tests {
         assert_eq!(v1.len(), 2);
         assert_eq!(v1, v2);
         assert!(v1.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn evaluate_batch_multi_matches_per_group_calls() {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let bot = PairStrategy::from_model(PairModelConfig::new().init::<MyBackend>(&device), device);
+
+        let mut a = State::default();
+        a.apply_mark(Mark { row: 0, number: 4 });
+        let mut b = State::default();
+        b.apply_mark(Mark { row: 2, number: 9 });
+        let mut opp = State::default();
+        opp.apply_mark(Mark { row: 1, number: 6 });
+
+        let g1_c = [State::default(), a];
+        let g1_o = [opp];
+        let g2_c = [b];
+        let g2_o = [State::default(), a]; // different leader situation
+
+        let multi = bot.evaluate_batch_multi(&[(&g1_c[..], &g1_o[..]), (&g2_c[..], &g2_o[..])]);
+        let solo1 = bot.evaluate_batch(&g1_c, &g1_o);
+        let solo2 = bot.evaluate_batch(&g2_c, &g2_o);
+        assert_eq!(multi.len(), 2);
+        assert_eq!(multi[0], solo1);
+        assert_eq!(multi[1], solo2);
     }
 
     #[test]

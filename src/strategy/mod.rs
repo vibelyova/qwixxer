@@ -28,6 +28,12 @@ pub trait Bot: std::fmt::Debug {
     fn evaluate_batch(&self, candidates: &[State], opp_states: &[State]) -> Vec<f32> {
         candidates.iter().map(|s| self.evaluate(s, opp_states)).collect()
     }
+    /// Evaluate several independent (candidates, opp_states) groups. The
+    /// default loops `evaluate_batch`; bots with batched inference override
+    /// this to run all groups in a single forward pass.
+    fn evaluate_batch_multi(&self, groups: &[(&[State], &[State])]) -> Vec<Vec<f32>> {
+        groups.iter().map(|(c, o)| self.evaluate_batch(c, o)).collect()
+    }
 }
 
 // ---- Interactive ----
