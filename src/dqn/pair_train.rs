@@ -248,4 +248,53 @@ mod tests {
         permute_colors(&mut f, true, false, false);
         assert_eq!(f, orig);
     }
+
+    #[test]
+    fn permute_colors_covers_gb_and_asc_desc_paths() {
+        // Distinct values everywhere so swaps are observable.
+        let mut f = [0.0f32; PAIR_FEATURES];
+        for (i, v) in f.iter_mut().enumerate() {
+            *v = i as f32;
+        }
+        let orig = f;
+
+        // green <-> blue
+        permute_colors(&mut f, false, true, false);
+        for block in [0, BOARD_FEATURES] {
+            for base in [2usize, 6, 10, 14] {
+                assert_eq!(f[block + base], orig[block + base + 1]);
+                assert_eq!(f[block + base + 1], orig[block + base]);
+            }
+            // red/yellow untouched
+            for base in [0usize, 4, 8, 12] {
+                assert_eq!(f[block + base], orig[block + base]);
+            }
+            // per-board aggregates untouched
+            assert_eq!(f[block + 16..block + 20], orig[block + 16..block + 20]);
+        }
+        // Pair-level untouched.
+        assert_eq!(f[40..45], orig[40..45]);
+        // Involution.
+        permute_colors(&mut f, false, true, false);
+        assert_eq!(f, orig);
+
+        // asc <-> desc pairs (two swaps per base).
+        f = orig;
+        permute_colors(&mut f, false, false, true);
+        for block in [0, BOARD_FEATURES] {
+            for base in [0usize, 4, 8, 12] {
+                assert_eq!(f[block + base], orig[block + base + 2]);
+                assert_eq!(f[block + base + 1], orig[block + base + 3]);
+                assert_eq!(f[block + base + 2], orig[block + base]);
+                assert_eq!(f[block + base + 3], orig[block + base + 1]);
+            }
+            // per-board aggregates untouched
+            assert_eq!(f[block + 16..block + 20], orig[block + 16..block + 20]);
+        }
+        // Pair-level untouched.
+        assert_eq!(f[40..45], orig[40..45]);
+        // Involution.
+        permute_colors(&mut f, false, false, true);
+        assert_eq!(f, orig);
+    }
 }
