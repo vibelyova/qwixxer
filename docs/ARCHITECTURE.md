@@ -233,6 +233,29 @@ consistency); color permutations are applied in the batcher to both blocks.
 Passive skips are recorded (the old recorder dropped them). Model dir:
 `pair_model/`. Design doc: `docs/superpowers/specs/2026-06-10-pair-network-design.md`.
 
+### Pair-Search (`strategy/search.rs`, `strategy/sim.rs`)
+
+Decision-time search on top of the pair network. At gated active decisions
+(top-2 static gap below GATE_MARGIN, or endgame proximity: any locked row, 3
+strikes, or a locking candidate), the top-2 candidates are re-ranked by
+truncated rollouts: complete the current turn deterministically, simulate one
+full round with every player played greedily by the value net
+(lockstep-batched through `Bot::evaluate_batch_multi`), then score each
+sampled future as the exact outcome if the game ended or the net's win
+probability (`WinProb` trait) at the horizon. 64 samples per candidate with
+common-random-number dice derived by hashing the decision context, so the bot
+is stateless-deterministic and benches are byte-reproducible. Meta-rules stay
+single-source: the shared bot_impl pipelines expose pure-logic `*_choices()`
+consumed by both the blanket `Bot -> Strategy` impl and the search bot. The
+simulator is pinned to `Game::play` by an equivalence test covering both
+strike- and lock-terminated games. Calibration diagnostic:
+`cargo run --release --example search_calibration -- 300`.
+
+Measured (50k-game paired benches): 59.8% vs GA (static pair bot: 59.2%);
+head-to-head vs the static pair bot +1.6-1.7% win margin, replicated on two
+seeds. Cost: ~100x the static bot (~27 games/s on 8 cores); optimization
+deferred until needed (see EXPERIMENTS.md Phase 13).
+
 ### Monte Carlo Tree Search (`mcts.rs`)
 
 **`MonteCarlo`** runs `N` rollout simulations per candidate move (default 500). For each move:

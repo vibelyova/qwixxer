@@ -664,3 +664,72 @@ decision (N feature rows instead of 2N interleaved), much simpler context
 handling (no per-candidate `OpponentContext` rebuild), and a cleaner platform
 for decision-time search — which is the next lever that can plausibly move the
 number.
+
+## Phase 13: Decision-Time Search (pair-search)
+
+All numbers below are under the corrected two-phase rules and paired-seed
+benchmarking, building directly on the Phase 12 pair net.
+
+### Design
+
+Decision-time search layered on the pair network, gated so it only runs where
+it can matter. At each active decision we score the top-2 static candidates by
+**truncated rollouts**: complete the current turn deterministically, simulate
+one full round with every player played greedily by the value net
+(lockstep-batched through `Bot::evaluate_batch_multi`), then take the leaf
+value as the exact game outcome if the round ended the game, otherwise the
+net's win probability (`WinProb` trait) at the horizon. 64 samples per
+candidate with **common-random-number** dice derived by hashing the decision
+context, so the same decision always draws the same dice across candidates and
+runs — the bot is stateless-deterministic and benches are byte-reproducible.
+The per-player greedy sim policy uses the Lite pipeline (`*_choices()` pure
+logic shared with the production bot, no allocation-heavy ranking machinery).
+Meta-rules stay single-source: the shared bot_impl `*_choices()` are consumed
+by both the blanket `Bot -> Strategy` impl and the search bot, and the
+simulator is pinned to `Game::play` by an equivalence test covering both
+strike- and lock-terminated games.
+
+### Calibration and the GATE_MARGIN decision
+
+`cargo run --release --example search_calibration -- 50` with search forced
+everywhere over the paired-seed game set:
+
+- 1260 active decisions, 1019 eligible; the close gate (top-2 static gap below
+  GATE_MARGIN) fires on 51.3% of eligible decisions, the endgame gate (any
+  locked row, 3 strikes, or a locking candidate) on 19.9%.
+- Disagreements (search picked a different move than the static net): 6.6% of
+  searched decisions. **100% of those disagreements occurred at decisions where
+  a gate had already fired** — gating loses no realized search value.
+- Top-2 static gap percentiles: p10 0.015, p25 0.053, p50 0.147, p75 0.281,
+  p90 0.500.
+
+Since every disagreement fell inside a fired gate, **GATE_MARGIN stays at
+0.15** — no constant change. Cost: ~0.17 s/game with search forced everywhere;
+gated benches run ~27 games/s wall on 8 cores, ~100× the static pair bot.
+Optimization is deferred; the identified levers are profiling, allocation reuse
+in the rollout driver, cached opponent feature blocks, and a lighter sim
+policy.
+
+### Acceptance results (50k games each, paired dice)
+
+| Matchup | Result | Margin |
+|---------|--------|--------|
+| pair-search vs pair, seed 42 | 24939 vs 24083 (978 ties) — 49.88% / 48.17% | **+856 (+1.71%)**, paired SE 0.155% |
+| pair-search vs pair, seed 7 | 24924 vs 24137 (939 ties) | **+787 (+1.57%)**, replicates on independent seed |
+| pair-search vs GA, seed 42 | **59.83%** (99% CI 59.32–60.34) | static pair bot 59.2% — strongest bot under the corrected rules |
+| pair-search vs DQN (old), seed 42 | 50.26% vs 48.25% (1.5% ties) | — |
+
+### Verdict
+
+Decision-time search produces the **first measurable strength gain since the
+two-phase rules fix**: +0.6% vs GA and a +1.6–1.7% head-to-head win margin over
+the static pair bot, statistically solid and replicated across two independent
+seeds. The size is small and consistent with the structural-ceiling hypothesis
+from Phase 12. Criterion caveat: with ~2% ties no bot's raw win rate exceeds
+50% head-to-head, so the meaningful statistic is the **win margin**, not a
+">50%" threshold. Cost is ~100× the static bot (~27 games/s on 8 cores), with
+optimization deferred until it is needed.
+
+The decisive takeaway: search now **demonstrably beats static play**, which
+justifies the next escalation — **expert iteration**, training the net on
+search-improved play.
