@@ -10,6 +10,7 @@ enum BotType {
     Ga,
     Dqn,
     Pair,
+    PairSearch,
     Mcts,
     Opportunist,
     Conservative,
@@ -22,6 +23,7 @@ impl std::fmt::Display for BotType {
             BotType::Ga => write!(f, "GA"),
             BotType::Dqn => write!(f, "DQN"),
             BotType::Pair => write!(f, "PAIR"),
+            BotType::PairSearch => write!(f, "PAIR-SEARCH"),
             BotType::Mcts => write!(f, "MCTS"),
             BotType::Opportunist => write!(f, "Opportunist"),
             BotType::Conservative => write!(f, "Conservative"),
@@ -40,6 +42,9 @@ fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
         }
         BotType::Dqn => Box::new(dqn::DqnStrategy::load("dqn_model")),
         BotType::Pair => Box::new(dqn::pair::PairStrategy::load("pair_model")),
+        BotType::PairSearch => Box::new(strategy::search::SearchBot::new(dqn::pair::PairStrategy::load(
+            "pair_model",
+        ))),
         BotType::Mcts => {
             let champion =
                 bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt found. Run `train ga` first.");
@@ -60,7 +65,7 @@ struct StrategyTemplates {
 impl StrategyTemplates {
     fn new(bots: &[BotType]) -> Self {
         let needs_dqn = bots.iter().any(|b| matches!(b, BotType::Dqn));
-        let needs_pair = bots.iter().any(|b| matches!(b, BotType::Pair));
+        let needs_pair = bots.iter().any(|b| matches!(b, BotType::Pair | BotType::PairSearch));
         let needs_champion = bots.iter().any(|b| matches!(b, BotType::Ga | BotType::Mcts));
         let genes = Arc::new(bot::default_genes());
         StrategyTemplates {
@@ -92,6 +97,13 @@ impl StrategyTemplates {
             BotType::Pair => {
                 let t = self.pair.as_ref().unwrap();
                 Box::new(dqn::pair::PairStrategy::from_shared(t.model.clone(), t.device.clone()))
+            }
+            BotType::PairSearch => {
+                let t = self.pair.as_ref().unwrap();
+                Box::new(strategy::search::SearchBot::new(dqn::pair::PairStrategy::from_shared(
+                    t.model.clone(),
+                    t.device.clone(),
+                )))
             }
             BotType::Mcts => Box::new(mcts::MonteCarlo::with_ga(200, self.champion.as_ref().unwrap().clone())),
             BotType::Opportunist => Box::<strategy::Opportunist>::default(),
