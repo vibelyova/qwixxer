@@ -62,49 +62,18 @@ pub fn board_features(state: &State) -> [f32; BOARD_FEATURES] {
 /// Layout: `[our 20 | paired 20 | cdiff/100, num_opps/4, max opp progress,
 /// max opp strikes/3, opp lockable-rows sum/8]`.
 pub fn pair_features(our: &State, paired: &State, all_opps: &[State]) -> [f32; PAIR_FEATURES] {
-    pair_features_cached(our, &PairedContext::new(paired, all_opps))
-}
-
-/// The candidate-independent part of a pair-feature row: the paired
-/// opponent's board block and the pair-level features 41–44. In a
-/// multi-candidate group these are constant, so callers ranking many
-/// candidates against one opponent set compute this once.
-pub struct PairedContext {
-    paired_points: isize,
-    opp_block: [f32; BOARD_FEATURES],
-    pair_level: [f32; 4], // features 41..=44
-}
-
-impl PairedContext {
-    pub fn new(paired: &State, all_opps: &[State]) -> Self {
-        // Invariant: `paired` must be one of `all_opps`.
-        debug_assert!(all_opps.contains(paired));
-        PairedContext {
-            paired_points: paired.count_points(),
-            opp_block: board_features(paired),
-            pair_level: [
-                all_opps.len() as f32 / 4.0,
-                all_opps.iter().map(total_progress).fold(0.0, f32::max),
-                all_opps.iter().map(|s| s.strikes).max().unwrap_or(0) as f32 / 3.0,
-                all_opps.iter().map(lockable_rows).sum::<u8>() as f32 / 8.0,
-            ],
-        }
-    }
-
-    pub fn paired_points(&self) -> isize {
-        self.paired_points
-    }
-}
-
-/// `pair_features` with the candidate-independent part precomputed.
-pub fn pair_features_cached(our: &State, ctx: &PairedContext) -> [f32; PAIR_FEATURES] {
+    // Invariant: `paired` must be one of `all_opps`.
+    debug_assert!(all_opps.contains(paired));
     let mut f = [0.0f32; PAIR_FEATURES];
     f[..BOARD_FEATURES].copy_from_slice(&board_features(our));
-    f[BOARD_FEATURES..2 * BOARD_FEATURES].copy_from_slice(&ctx.opp_block);
+    f[BOARD_FEATURES..2 * BOARD_FEATURES].copy_from_slice(&board_features(paired));
 
-    let cdiff = (our.count_points() - ctx.paired_points) as f32;
+    let cdiff = (our.count_points() - paired.count_points()) as f32;
     f[40] = (cdiff / 100.0).clamp(-1.0, 1.0);
-    f[41..].copy_from_slice(&ctx.pair_level);
+    f[41] = all_opps.len() as f32 / 4.0;
+    f[42] = all_opps.iter().map(total_progress).fold(0.0, f32::max);
+    f[43] = all_opps.iter().map(|s| s.strikes).max().unwrap_or(0) as f32 / 3.0;
+    f[44] = all_opps.iter().map(lockable_rows).sum::<u8>() as f32 / 8.0;
     f
 }
 
@@ -233,11 +202,10 @@ impl Bot for PairStrategy {
                 opp_states
             };
             let leader = opps.iter().max_by_key(|s| s.count_points()).unwrap();
-            let ctx = PairedContext::new(leader, opps);
             for c in *candidates {
-                feats.push(pair_features_cached(c, &ctx));
+                feats.push(pair_features(c, leader, opps));
             }
-            leaders.push(ctx.paired_points());
+            leaders.push(leader.count_points());
         }
         let values = pair_batch_forward(&self.model, &self.device, &feats);
 
