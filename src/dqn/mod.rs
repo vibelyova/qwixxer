@@ -18,6 +18,8 @@
 #[cfg(feature = "dqn")]
 pub mod train;
 
+pub mod pair;
+
 use crate::state::State;
 use crate::strategy::Bot;
 use burn::{
