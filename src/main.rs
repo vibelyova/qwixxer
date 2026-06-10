@@ -1,6 +1,13 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use game::Player;
 use qwixxer::*;
+
+/// Pools freed memory instead of returning it to the OS: the search bot's
+/// rollout driver and burn's per-forward buffers otherwise cause constant
+/// cross-thread munmap/TLB-shootdown churn (~17% of cycles in
+/// smp_call_function_many_cond before this).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use std::sync::Arc;
@@ -561,6 +568,14 @@ mod tests {
 }
 
 fn main() {
+    // Our matmuls are tiny (≤ a few hundred rows of a 45→128→64 MLP) and run
+    // inside rayon-parallel games; matrixmultiply's own thread pool on top is
+    // pure scheduler churn (measured 2x slowdown on search benches). Respect
+    // an explicit user override.
+    if std::env::var_os("MATMUL_NUM_THREADS").is_none() {
+        std::env::set_var("MATMUL_NUM_THREADS", "1");
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
