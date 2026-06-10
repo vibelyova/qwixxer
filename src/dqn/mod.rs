@@ -20,13 +20,13 @@ pub mod train;
 
 use crate::state::State;
 use crate::strategy::Bot;
-use std::sync::Arc;
 use burn::{
     backend::ndarray::NdArray,
     nn::{Linear, LinearConfig, Relu},
     prelude::*,
     record::{HalfPrecisionSettings, NamedMpkBytesRecorder, Recorder},
 };
+use std::sync::Arc;
 
 /// Default backend for native and wasm inference.
 pub type MyBackend = NdArray;
@@ -371,12 +371,18 @@ impl DqnStrategy {
             .init::<MyBackend>(&device)
             .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
             .expect("Failed to load model");
-        DqnStrategy { model: Arc::new(model), device }
+        DqnStrategy {
+            model: Arc::new(model),
+            device,
+        }
     }
 
     /// Construct a strategy around an already-loaded model.
     pub fn from_model(model: QwixxModel<MyBackend>, device: burn::backend::ndarray::NdArrayDevice) -> Self {
-        DqnStrategy { model: Arc::new(model), device }
+        DqnStrategy {
+            model: Arc::new(model),
+            device,
+        }
     }
 
     /// Construct a strategy sharing an existing Arc'd model (cheap clone).
@@ -393,7 +399,10 @@ impl DqnStrategy {
             .load(model_bytes.to_vec(), &device)
             .expect("Failed to load model from bytes");
         let model = QwixxModelConfig::new().init::<MyBackend>(&device).load_record(record);
-        DqnStrategy { model: Arc::new(model), device }
+        DqnStrategy {
+            model: Arc::new(model),
+            device,
+        }
     }
 
     /// Evaluate a state with a custom opponent context (for state explorer).

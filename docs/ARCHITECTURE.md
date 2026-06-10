@@ -332,6 +332,12 @@ The `bench` subcommand runs N games between 2+ bot types with seat rotation to c
 
 **Seat rotation**: Game `i` rotates seats by `i % num_players`, so each bot plays from every position equally across the benchmark run.
 
+**Paired dice (common random numbers)**: Dice streams are a deterministic function of `(--seed, pair, seat)`, where a "pair" is the block of `num_players` consecutive games covering all rotations. Within a pair, each seat replays the same dice stream, so luck attaches to the seat and cancels across the rotations. Consequences:
+- The same `--seed` (default 42) replays the identical game set — reruns are byte-identical for deterministic bots, and two models can be compared on exactly the same games (no dice variance between experiments).
+- Different `--seed` values give independent samples (the base seed is hashed with SplitMix64 so stream sets of nearby seeds are disjoint).
+- The 99% CI is computed over per-pair means (the pair is the independent sampling unit), which both stays honest under within-pair correlation and captures the pairing gain. Measured: ~1.3x efficiency in 1v1; ~0.8x in 2v2 (with 4 rotations the seat luck already cancels, while pair-shared luck correlates the games — the paired CI accounts for it).
+- The per-iteration training benchmark (`benchmark_vs_ga`) uses a fixed base seed, so winrate differences between iterations are purely model-driven.
+
 **Parallelism**: When the `parallel` feature is enabled, games run on a rayon thread pool. Each game constructs its own strategies and RNG (no shared mutable state). Results are collected into a `Vec` and aggregated serially.
 
 **Aggregation**: Tracks wins (outright, no ties), total points, and tie count per bot. Reports win rate percentage and average points. When multiple bots share a strategy, prints aggregate stats where ties between same-strategy bots count as wins for that strategy. For 1v1 and 2-strategy matchups, shows 99% confidence interval (SE = sqrt(p*(1-p)/N), z=2.576).

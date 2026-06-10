@@ -65,10 +65,7 @@ impl StrategyTemplates {
                 None
             },
             champion: if needs_champion {
-                Some(
-                    bot::DNA::load_weights("champion.txt", genes)
-                        .expect("No champion.txt found. Run `evolve` first."),
-                )
+                Some(bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt found. Run `evolve` first."))
             } else {
                 None
             },
@@ -82,9 +79,7 @@ impl StrategyTemplates {
                 let t = self.dqn.as_ref().unwrap();
                 Box::new(dqn::DqnStrategy::from_shared(t.model.clone(), t.device.clone()))
             }
-            BotType::Mcts => {
-                Box::new(mcts::MonteCarlo::with_ga(200, self.champion.as_ref().unwrap().clone()))
-            }
+            BotType::Mcts => Box::new(mcts::MonteCarlo::with_ga(200, self.champion.as_ref().unwrap().clone())),
             BotType::Opportunist => Box::<strategy::Opportunist>::default(),
             BotType::Conservative => Box::<strategy::Conservative>::default(),
             BotType::Random => Box::new(strategy::Random),
@@ -126,6 +121,9 @@ enum Commands {
         /// Number of games
         #[arg(short, long, default_value = "1000")]
         num_games: usize,
+        /// Base seed for paired dice streams (same seed = identical game set)
+        #[arg(short, long, default_value = "42")]
+        seed: u64,
     },
     /// Single-player score benchmark
     Solo {
@@ -172,15 +170,34 @@ fn run_play(bots: Vec<BotType>, verbose: bool) {
     game.print_game_over();
 }
 
-fn run_bench(bots: Vec<BotType>, num_games: usize) {
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// Dice-stream seed for one seat of one game pair. Distinct `(pair, seat)`
+/// inputs map to distinct values within a run (seats < 8); hashing `base`
+/// keeps the stream sets of nearby base seeds disjoint, so different `--seed`
+/// runs are independent samples. `seed_from_u64` expands the result into a
+/// decorrelated stream state.
+fn seat_dice_seed(base: u64, pair: usize, seat: usize) -> u64 {
+    splitmix64(base).wrapping_add(pair as u64 * 8 + seat as u64)
+}
+
+fn run_bench(bots: Vec<BotType>, num_games: usize, seed: u64) {
     if bots.len() < 2 {
         eprintln!("Need at least 2 bots to benchmark");
         return;
     }
 
     let num_players = bots.len();
+    // Games come in pairs of num_players rotations sharing per-seat dice
+    // streams, so round up to complete the final pair.
+    let num_games = num_games.div_ceil(num_players) * num_players;
     println!(
-        "Benchmarking {} ({num_games} games, rotating seats):\n",
+        "Benchmarking {} ({num_games} games, rotating seats, paired dice, seed {seed}):\n",
         bots.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" vs ")
     );
 
@@ -189,11 +206,15 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
     use rayon::prelude::*;
 
     let bench_game = |templates: &StrategyTemplates, i: usize| {
+        let pair = i / num_players;
         let rotation = i % num_players;
         let players: Vec<Player> = (0..num_players)
             .map(|j| {
                 let bot_idx = (j + num_players - rotation) % num_players;
-                Player::new(templates.create(&bots[bot_idx]), Box::new(SmallRng::from_entropy()))
+                Player::new(
+                    templates.create(&bots[bot_idx]),
+                    Box::new(SmallRng::seed_from_u64(seat_dice_seed(seed, pair, j))),
+                )
             })
             .collect();
 
@@ -338,41 +359,60 @@ fn run_bench(bots: Vec<BotType>, num_games: usize) {
                 strat_ties as f64 / num_games as f64 * 100.0
             );
         }
+    }
 
-        // CI for 2-strategy matchups
-        if unique_strategies.len() == 2 {
-            let s0 = &unique_strategies[0];
-            let s1 = &unique_strategies[1];
-            let w0 = *strat_wins.get(s0).unwrap_or(&0);
-            let w1 = *strat_wins.get(s1).unwrap_or(&0);
-            let leader = if w0 >= w1 { s0 } else { s1 };
-            let leader_wins = w0.max(w1);
-            let n = num_games as f64;
-            let p = leader_wins as f64 / n;
-            let se = (p * (1.0 - p) / n).sqrt();
-            let z = 2.576;
-            let moe = z * se;
+    // 99% CI on winrate for 2-strategy matchups (covers plain 1v1 and
+    // aggregated NvN). Computed over pair means: the games of one pair share
+    // per-seat dice streams, so their outcomes are correlated and the pair is
+    // the independent sampling unit. This both keeps the CI honest and
+    // captures the variance reduction from pairing.
+    if unique_strategies.len() == 2 {
+        // Winning strategy per game (None = tie between the two strategies).
+        let game_winners: Vec<Option<String>> = results
+            .iter()
+            .map(|(per_bot, _)| {
+                let max = per_bot.iter().map(|(_, s)| *s).max().unwrap();
+                let winners: std::collections::BTreeSet<String> = per_bot
+                    .iter()
+                    .filter(|(_, s)| *s == max)
+                    .map(|(idx, _)| bots[*idx].to_string())
+                    .collect();
+                if winners.len() == 1 {
+                    winners.into_iter().next()
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let count_wins = |name: &str| game_winners.iter().filter(|w| w.as_deref() == Some(name)).count();
+        let (s0, s1) = (&unique_strategies[0], &unique_strategies[1]);
+        let leader = if count_wins(s0) >= count_wins(s1) { s0 } else { s1 };
+
+        let pair_means: Vec<f64> = game_winners
+            .chunks(num_players)
+            .map(|chunk| {
+                chunk.iter().filter(|w| w.as_deref() == Some(leader.as_str())).count() as f64 / chunk.len() as f64
+            })
+            .collect();
+        let num_pairs = pair_means.len() as f64;
+        let p = pair_means.iter().sum::<f64>() / num_pairs;
+        let var = pair_means.iter().map(|a| (a - p).powi(2)).sum::<f64>() / (num_pairs - 1.0);
+        let se_paired = (var / num_pairs).sqrt();
+        let se_naive = (p * (1.0 - p) / num_games as f64).sqrt();
+        let z = 2.576;
+        println!(
+            "\n  99% CI (paired): {} wins {:.2}% - {:.2}%",
+            leader,
+            (p - z * se_paired) * 100.0,
+            (p + z * se_paired) * 100.0
+        );
+        if se_paired > 0.0 {
             println!(
-                "\n  99% CI: {} wins {:.2}% - {:.2}%",
-                leader,
-                (p - moe) * 100.0,
-                (p + moe) * 100.0
-            );
-        }
-    } else {
-        // Simple 1v1 CI (no duplicate strategies)
-        if num_players == 2 {
-            let leader = if wins[0] >= wins[1] { 0 } else { 1 };
-            let n = num_games as f64;
-            let p = wins[leader] as f64 / n;
-            let se = (p * (1.0 - p) / n).sqrt();
-            let z = 2.576;
-            let moe = z * se;
-            println!(
-                "\n  99% CI: {} wins {:.2}% - {:.2}%",
-                bots[leader],
-                (p - moe) * 100.0,
-                (p + moe) * 100.0
+                "  Pairing efficiency: {:.2}x (naive SE {:.3}%, paired SE {:.3}%)",
+                (se_naive / se_paired).powi(2),
+                se_naive * 100.0,
+                se_paired * 100.0
             );
         }
     }
@@ -421,12 +461,55 @@ fn run_train() {
 
     let _champion = pop.current_champion().clone();
     println!("\nBenchmarking champion vs Opportunist...\n");
-    run_bench(vec![BotType::Ga, BotType::Opportunist], 100_000);
+    run_bench(vec![BotType::Ga, BotType::Opportunist], 100_000, 42);
 }
 
 #[cfg(feature = "dqn")]
 fn run_dqn_selfplay(iterations: usize, bench_games: usize, checkpoints: bool, start_iteration: usize) {
-    dqn::train::self_play_train("dqn_model", iterations, 20000, 10, bench_games, checkpoints, start_iteration);
+    dqn::train::self_play_train(
+        "dqn_model",
+        iterations,
+        20000,
+        10,
+        bench_games,
+        checkpoints,
+        start_iteration,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seat_dice_seeds_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for pair in 0..1000 {
+            for seat in 0..5 {
+                assert!(seen.insert(seat_dice_seed(42, pair, seat)));
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_games_are_deterministic() {
+        let play = || {
+            let players = vec![
+                Player::new(
+                    Box::<strategy::Opportunist>::default(),
+                    Box::new(SmallRng::seed_from_u64(seat_dice_seed(42, 7, 0))),
+                ),
+                Player::new(
+                    Box::<strategy::Conservative>::default(),
+                    Box::new(SmallRng::seed_from_u64(seat_dice_seed(42, 7, 1))),
+                ),
+            ];
+            let mut game = game::Game::new(players);
+            game.play();
+            game.players.iter().map(|p| p.state.count_points()).collect::<Vec<_>>()
+        };
+        assert_eq!(play(), play());
+    }
 }
 
 fn main() {
@@ -434,7 +517,7 @@ fn main() {
 
     match cli.command {
         Some(Commands::Play { bots, verbose }) => run_play(bots, verbose),
-        Some(Commands::Bench { bots, num_games }) => run_bench(bots, num_games),
+        Some(Commands::Bench { bots, num_games, seed }) => run_bench(bots, num_games, seed),
         Some(Commands::Solo { num_games }) => run_solo(num_games),
         Some(Commands::Evolve) => run_train(),
         #[cfg(feature = "dqn")]

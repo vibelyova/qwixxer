@@ -402,6 +402,11 @@ fn play_training_game(
 
 // ---- Self-play benchmark + training loop ----
 
+/// Base seed for benchmark dice streams. Fixed so every iteration's benchmark
+/// plays the identical game set: winrate differences between iterations are
+/// then purely model-driven, not dice luck (DQN and GA are deterministic).
+const BENCH_SEED: u64 = 0xB54C;
+
 fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 {
     use crate::game::{Game, Player};
 
@@ -411,16 +416,20 @@ fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 
             || DqnStrategy::load(artifact_dir),
             |template, i| {
                 let dqn = DqnStrategy::from_shared(template.model.clone(), template.device.clone());
+                // Games i = 2k, 2k+1 form a seat-swapped pair sharing per-seat
+                // dice streams, so seat luck cancels within the pair.
+                let pair = (i / 2) as u64;
                 let rotation = i % 2;
+                let seat_dice = |seat: u64| Box::new(SmallRng::seed_from_u64(BENCH_SEED.wrapping_add(pair * 2 + seat)));
                 let players: Vec<Player> = if rotation == 0 {
                     vec![
-                        Player::new(Box::new(dqn), Box::new(SmallRng::from_entropy())),
-                        Player::new(Box::new(champion.clone()), Box::new(SmallRng::from_entropy())),
+                        Player::new(Box::new(dqn), seat_dice(0)),
+                        Player::new(Box::new(champion.clone()), seat_dice(1)),
                     ]
                 } else {
                     vec![
-                        Player::new(Box::new(champion.clone()), Box::new(SmallRng::from_entropy())),
-                        Player::new(Box::new(dqn), Box::new(SmallRng::from_entropy())),
+                        Player::new(Box::new(champion.clone()), seat_dice(0)),
+                        Player::new(Box::new(dqn), seat_dice(1)),
                     ]
                 };
                 let mut game = Game::new(players);
@@ -475,10 +484,7 @@ pub fn self_play_train(
     for iteration in 0..num_iterations {
         let global_iter = start_iteration + iteration;
         let epsilon = (0.2 * (0.95f32).powi(global_iter as i32)).max(0.07);
-        println!(
-            "\n=== Iteration {} (epsilon={epsilon:.3}) ===",
-            global_iter + 1
-        );
+        println!("\n=== Iteration {} (epsilon={epsilon:.3}) ===", global_iter + 1);
 
         let games_each = games_per_iteration / 3;
 
@@ -593,7 +599,12 @@ pub fn self_play_train(
 }
 
 /// Train with a specific number of epochs, loading from existing model if present.
-fn train_with_epochs(samples: Vec<TrainingSample>, artifact_dir: &str, num_epochs: usize, lr: f64) -> QwixxModel<MyBackend> {
+fn train_with_epochs(
+    samples: Vec<TrainingSample>,
+    artifact_dir: &str,
+    num_epochs: usize,
+    lr: f64,
+) -> QwixxModel<MyBackend> {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
 
     let split = (samples.len() * 9) / 10;
