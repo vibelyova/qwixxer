@@ -201,6 +201,172 @@ impl<B: Backend> Batcher<B, PairSample, PairBatch<B>> for PairBatcher<B> {
     }
 }
 
+// ---- Self-play recording ----
+
+/// One recorded decision: our post-decision state + all opponents' states at
+/// that moment (turn-ordered relative to us, constant order per game).
+type Snapshot = (State, Vec<State>);
+
+/// Pair-bot wrapper used during self-play training. ε-greedy on active
+/// decisions, greedy on passive; records snapshots for chain building.
+/// Recording cadence: active turns once after phase 2 (post-turn state);
+/// passive turns after every real decision — including skips, which the old
+/// recorder dropped (skip afterstates are evaluated at inference, so they
+/// belong in the training distribution).
+struct RecordingPair {
+    bot: PairStrategy,
+    epsilon: f32,
+    rng: SmallRng,
+    recorded: std::rc::Rc<std::cell::RefCell<Vec<Snapshot>>>,
+}
+
+impl std::fmt::Debug for RecordingPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "RecordingPair")
+    }
+}
+
+impl Strategy for RecordingPair {
+    fn active_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+        if self.rng.gen::<f32>() < self.epsilon {
+            let white_marks = state.generate_white_moves(dice[0] + dice[1]);
+            if white_marks.is_empty() {
+                return None;
+            }
+            let idx = self.rng.gen_range(0..=white_marks.len());
+            if idx < white_marks.len() {
+                Some(white_marks[idx])
+            } else {
+                None
+            }
+        } else {
+            crate::strategy::active_phase1_impl(&self.bot, state, opp_states, dice)
+        }
+    }
+
+    fn active_phase2(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Option<Mark> {
+        let marks = state.generate_color_moves(dice);
+        let no_mark_state = if has_marked {
+            *state
+        } else {
+            let mut s = *state;
+            s.apply_strike();
+            s
+        };
+
+        if marks.is_empty() {
+            self.recorded.borrow_mut().push((no_mark_state, opp_states.to_vec()));
+            return None;
+        }
+
+        let mark = if self.rng.gen::<f32>() < self.epsilon {
+            let idx = self.rng.gen_range(0..=marks.len());
+            if idx < marks.len() {
+                Some(marks[idx])
+            } else {
+                None
+            }
+        } else {
+            crate::strategy::active_phase2_impl(&self.bot, state, opp_states, dice, has_marked)
+        };
+
+        let chosen_state = match mark {
+            Some(m) => {
+                let mut s = *state;
+                s.apply_mark(m);
+                s
+            }
+            None => no_mark_state,
+        };
+        self.recorded.borrow_mut().push((chosen_state, opp_states.to_vec()));
+        mark
+    }
+
+    fn passive_phase1(
+        &mut self,
+        state: &State,
+        opp_states: &[State],
+        dice: [u8; 6],
+        _active_player: usize,
+    ) -> Option<Mark> {
+        let marks = state.generate_white_moves(dice[0] + dice[1]);
+        if marks.is_empty() {
+            return None;
+        }
+
+        let mark = crate::strategy::passive_phase1_impl(&self.bot, state, opp_states, dice);
+
+        let post = match mark {
+            Some(m) => {
+                let mut s = *state;
+                s.apply_mark(m);
+                s
+            }
+            None => *state, // record skips too
+        };
+        self.recorded.borrow_mut().push((post, opp_states.to_vec()));
+        mark
+    }
+}
+
+/// Build training samples from one player's trajectory: one TD(λ) chain per
+/// opponent, every sample emitted in both board orders (swap doubling) with
+/// pair-level features recomputed exactly from the swapped perspective and
+/// targets negated.
+fn build_pair_samples(
+    model: &PairModel<MyBackend>,
+    device: &burn::backend::ndarray::NdArrayDevice,
+    snapshots: &[Snapshot],
+    our_final: f32,
+    opp_finals: &[f32],
+) -> Vec<PairSample> {
+    let mut samples = Vec::new();
+    if snapshots.is_empty() {
+        return samples;
+    }
+    let num_opps = snapshots[0].1.len();
+    debug_assert_eq!(num_opps, opp_finals.len());
+
+    for k in 0..num_opps {
+        let final_diff = our_final - opp_finals[k];
+        let feats: Vec<[f32; PAIR_FEATURES]> = snapshots
+            .iter()
+            .map(|(our, opps)| pair_features(our, &opps[k], opps))
+            .collect();
+        let cdiffs: Vec<f32> = snapshots
+            .iter()
+            .map(|(our, opps)| (our.count_points() - opps[k].count_points()) as f32)
+            .collect();
+        let mus: Vec<f32> = pair_batch_forward(model, device, &feats)
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
+        let g = td_diff_targets(&mus, &cdiffs, final_diff, LAMBDA);
+
+        for (t, (our, opps)) in snapshots.iter().enumerate() {
+            let value = g[t] - cdiffs[t];
+            let fdiff = final_diff - cdiffs[t];
+            samples.push(PairSample {
+                features: feats[t],
+                value,
+                final_diff: fdiff,
+            });
+
+            // Swapped sample: the paired opponent's perspective. Their
+            // opponents are us plus the remaining opponents.
+            let mut swapped_opps: Vec<State> = Vec::with_capacity(num_opps);
+            swapped_opps.push(*our);
+            swapped_opps.extend(opps.iter().enumerate().filter(|(j, _)| *j != k).map(|(_, s)| *s));
+            samples.push(PairSample {
+                features: pair_features(&opps[k], our, &swapped_opps),
+                value: -value,
+                final_diff: -fdiff,
+            });
+        }
+    }
+    samples
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +462,47 @@ mod tests {
         // Involution.
         permute_colors(&mut f, false, false, true);
         assert_eq!(f, orig);
+    }
+
+    #[test]
+    fn build_pair_samples_emits_negated_swapped_samples() {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = PairModelConfig::new().init::<MyBackend>(&device);
+
+        // 2-step 1v1 trajectory with asymmetric boards.
+        let mut our1 = State::default();
+        our1.apply_mark(crate::state::Mark { row: 0, number: 5 });
+        let opp1 = State::default();
+        let mut our2 = our1;
+        our2.apply_mark(crate::state::Mark { row: 0, number: 7 });
+        let mut opp2 = State::default();
+        opp2.apply_mark(crate::state::Mark { row: 2, number: 10 });
+
+        let snapshots = vec![(our1, vec![opp1]), (our2, vec![opp2])];
+        let samples = build_pair_samples(&model, &device, &snapshots, 30.0, &[20.0]);
+
+        // 2 steps × 1 opponent × 2 orders.
+        assert_eq!(samples.len(), 4);
+        for pair in samples.chunks(2) {
+            let (fwd, swp) = (&pair[0], &pair[1]);
+            assert_eq!(swp.value, -fwd.value);
+            assert_eq!(swp.final_diff, -fwd.final_diff);
+            // Board blocks exchanged.
+            assert_eq!(
+                fwd.features[..BOARD_FEATURES],
+                swp.features[BOARD_FEATURES..2 * BOARD_FEATURES]
+            );
+            assert_eq!(
+                fwd.features[BOARD_FEATURES..2 * BOARD_FEATURES],
+                swp.features[..BOARD_FEATURES]
+            );
+            // cdiff input negated (within clamp range here).
+            assert!((fwd.features[40] + swp.features[40]).abs() < 1e-6);
+        }
+        // Last forward sample's targets: G_{n−1} = final_diff = 10;
+        // cdiff at t=1: our 3 pts (2 marks) − opp 1 pt (1 mark) = 2.
+        let last_fwd = &samples[2];
+        assert!((last_fwd.value - 8.0).abs() < 1e-5);
+        assert!((last_fwd.final_diff - 8.0).abs() < 1e-5);
     }
 }
