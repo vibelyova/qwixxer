@@ -228,6 +228,28 @@ impl Bot for PairStrategy {
     }
 }
 
+impl crate::strategy::search::WinProb for PairStrategy {
+    fn win_prob_multi(&self, groups: &[(&State, &[State])]) -> Vec<f32> {
+        let default_opps = [State::default()];
+        let mut feats = Vec::with_capacity(groups.len());
+        let mut cdiffs = Vec::with_capacity(groups.len());
+        for (our, opps) in groups {
+            let opps: &[State] = if opps.is_empty() { &default_opps } else { opps };
+            let leader = opps.iter().max_by_key(|s| s.count_points()).unwrap();
+            feats.push(pair_features(our, leader, opps));
+            cdiffs.push((our.count_points() - leader.count_points()) as f32);
+        }
+        pair_batch_forward(&self.model, &self.device, &feats)
+            .into_iter()
+            .zip(cdiffs)
+            .map(|((mu, log_var), cdiff)| {
+                let sigma = (0.5 * log_var.clamp(LOG_VAR_MIN, LOG_VAR_MAX)).exp();
+                crate::strategy::search::phi((cdiff + mu) / sigma)
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +396,26 @@ mod tests {
         let bot = PairStrategy::from_model(PairModelConfig::new().init::<MyBackend>(&device), device);
         let v = bot.evaluate(&State::default(), &[]);
         assert!(v.is_finite());
+    }
+
+    #[test]
+    fn win_prob_multi_is_probability_and_monotone_in_score() {
+        use crate::strategy::search::WinProb;
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let bot = PairStrategy::from_model(PairModelConfig::new().init::<MyBackend>(&device), device);
+
+        // Same opponent; in the second group we are far ahead on points.
+        let behind = State::default();
+        let mut ahead = State::default();
+        for n in 2..=8 {
+            ahead.apply_mark(Mark { row: 0, number: n });
+        }
+        let opp = State::default();
+
+        let p = bot.win_prob_multi(&[(&behind, &[opp]), (&ahead, &[opp])]);
+        assert_eq!(p.len(), 2);
+        assert!(p.iter().all(|x| (0.0..=1.0).contains(x)));
+        // A 28-point lead with the same opponent must not be rated worse.
+        assert!(p[1] >= p[0]);
     }
 }
