@@ -179,5 +179,47 @@ mod tests {
                 }
             }
         }
+
+        // Trained weights play lock-seeking games, covering the 2-locks
+        // game-over path and cross-player lock propagation (the random-init
+        // model above only ever ends games by strikes).
+        let trained = PairStrategy::load("pair_model");
+        let model = trained.model.clone();
+        let mut saw_lock_end = false;
+        for &n in &[2usize, 3, 4] {
+            for seed in 0..2u64 {
+                let players: Vec<Player> = (0..n)
+                    .map(|i| {
+                        Player::new(
+                            Box::new(PairStrategy::from_shared(model.clone(), device)),
+                            Box::new(SmallRng::seed_from_u64(5000 * seed + i as u64)),
+                        )
+                    })
+                    .collect();
+                let mut game = Game::new(players);
+                game.play();
+
+                let bot = PairStrategy::from_shared(model.clone(), device);
+                let mut sim = SimGame {
+                    states: vec![State::default(); n],
+                    active: 0,
+                    rngs: (0..n)
+                        .map(|i| SmallRng::seed_from_u64(5000 * seed + i as u64))
+                        .collect(),
+                    over: false,
+                };
+                let mut guard = 0;
+                while !sim.over {
+                    play_sim_turn(&bot, &mut sim, Fidelity::Full);
+                    guard += 1;
+                    assert!(guard < 500, "sim did not terminate");
+                }
+                saw_lock_end |= sim.states.iter().map(|s| s.count_locked()).max().unwrap() >= 2;
+                for (i, p) in game.players.iter().enumerate() {
+                    assert_eq!(sim.states[i], p.state, "trained n={n} seed={seed} player={i}");
+                }
+            }
+        }
+        assert!(saw_lock_end, "no trained game ended via locks — lock path not covered");
     }
 }
