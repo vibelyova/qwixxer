@@ -24,7 +24,7 @@ pair-search vs pair > 50% with significant paired CI is the primary acceptance s
 SearchBot<B: WinProb>          (src/dqn/search.rs — generic over the value bot)
   ├─ implements Strategy directly (search needs turn context Bot doesn't carry)
   ├─ candidates from shared *_choices() pipelines   (bot_impl refactor)
-  ├─ symmetry dedup → top K_CANDIDATES by static value → gate check
+  ├─ top K_CANDIDATES by static value → gate check
   ├─ BatchedSim: lockstep simulation of K_SAMPLES futures per candidate
   └─ leaf scoring: exact outcome if game ended, else WinProb at horizon
 ```
@@ -33,7 +33,7 @@ SearchBot<B: WinProb>          (src/dqn/search.rs — generic over the value bot
 
 | Const | Default | Meaning |
 |---|---|---|
-| `K_CANDIDATES` | 2 | candidates searched (after symmetry dedup, by static value) |
+| `K_CANDIDATES` | 2 | candidates searched (top by static value) |
 | `K_SAMPLES` | 64 | sampled futures per candidate, CRN dice shared across candidates |
 | `HORIZON_TURNS` | num_players | full turns simulated after completing the current turn (one round) |
 | `GATE_MARGIN` | 0.15 (calibrate) | top-2 static z-gap below which search triggers |
@@ -101,24 +101,6 @@ evaluation.
 `bench ga opportunist -n 10000` (default seed) must produce byte-identical output
 to before the refactor.
 
-## Symmetry dedup
-
-Two candidates are strategically identical iff some color permutation maps one
-post-state to the other **while fixing every opponent board** — the same 8-element
-group as the training augmentation (red↔yellow, green↔blue, asc-pair↔desc-pair;
-the pair swap is a true game symmetry because `P(sum=s) = P(sum=14−s)`).
-
-- New helper `State::permuted(swap_ry: bool, swap_gb: bool, swap_pairs: bool) -> State`
-  in state.rs. Under the pair swap, row contents move to the opposite-direction row
-  with marked numbers mapped `x → 14−x` (free pointer likewise; totals/strikes
-  unchanged; locked stays locked).
-- Canonical form of a position = the lexicographically smallest serialization of
-  `(our_state, opp_states)` over the 8 joint permutations. Candidates with equal
-  canonical forms are deduped (keep the first); dedup runs BEFORE the top-K cut so
-  a symmetric twin cannot consume the search budget.
-- Property test: `board_features(s.permuted(a,b,c))` equals the batcher's
-  `permute_colors(board_features(s), a,b,c)` (per-board block), for random states.
-
 ## The simulator (`BatchedSim`)
 
 A dedicated lockstep simulator over plain `State`s — `Game` can't be entered
@@ -165,7 +147,7 @@ rollouts; it shares the same mechanics code path and is covered by unit tests.
 
 ## Gating
 
-Search triggers at an active decision iff there are ≥2 deduped candidates AND:
+Search triggers at an active decision iff there are ≥2 candidates AND:
 
 - top-2 static z-gap < `GATE_MARGIN`, OR
 - endgame proximity: any player has ≥1 locked row, any player has 3 strikes, or
@@ -208,11 +190,10 @@ expert iteration, which only makes sense if search beats static play).
 
 ## Testing
 
-Unit: Φ approximation vs known values; `State::permuted` property test vs
-`permute_colors`; canonical-form dedup (symmetric twins collapse, asymmetric
-don't); seed-hash determinism (same context → same streams, candidate-independent);
-gating predicate truth table; segmented `evaluate_batch_multi` override equals the
-default loop's results (same model, same groups).
+Unit: Φ approximation vs known values; seed-hash determinism (same context → same
+streams, candidate-independent); gating predicate truth table; segmented
+`evaluate_batch_multi` override equals the default loop's results (same model,
+same groups).
 
 Integration: simulator-vs-`Game::play` equivalence over seeded games (2p/3p/4p);
 `bench pair-search pair -n 200` smoke (runs, deterministic across two invocations);
@@ -220,6 +201,9 @@ the three byte-identical regression benches.
 
 ## Out of scope (v2+ candidates)
 
+- Symmetry dedup of candidates (canonical forms over the 8 color permutations,
+  with a `State::permuted` helper) — avoids spending the search budget on a
+  strategically identical twin; deferred to keep v1 simple
 - Search on passive decisions
 - Lockstep batching across *decisions* (process-wide); GPU backends
 - `WinProb` for `DqnStrategy`/GA
