@@ -367,6 +367,291 @@ fn build_pair_samples(
     samples
 }
 
+// ---- Self-play training loop ----
+
+/// Play one pure-self-play training game; every player is a recording pair
+/// bot (player 0 explores with ε, the rest are greedy). Returns all samples
+/// plus player 0's final score.
+fn play_training_game(
+    model: &PairModel<MyBackend>,
+    device: &burn::backend::ndarray::NdArrayDevice,
+    num_opponents: usize,
+    epsilon: f32,
+    seed: u64,
+) -> (Vec<PairSample>, f32) {
+    use crate::game::{Game, Player};
+
+    let n = num_opponents + 1;
+    let mut buffers = Vec::with_capacity(n);
+    let mut players: Vec<Player> = Vec::with_capacity(n);
+    for i in 0..n {
+        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        buffers.push(std::rc::Rc::clone(&buf));
+        players.push(Player::new(
+            Box::new(RecordingPair {
+                bot: PairStrategy::from_model(model.clone(), device.clone()),
+                epsilon: if i == 0 { epsilon } else { 0.0 },
+                rng: SmallRng::seed_from_u64(seed.wrapping_add(100 + i as u64)),
+                recorded: buf,
+            }),
+            Box::new(SmallRng::seed_from_u64(seed.wrapping_add(i as u64))),
+        ));
+    }
+
+    let mut game = Game::new(players);
+    game.play();
+
+    let finals: Vec<f32> = game.players.iter().map(|p| p.state.count_points() as f32).collect();
+
+    let mut all_samples = Vec::new();
+    for (i, buf) in buffers.iter().enumerate() {
+        let snapshots = std::mem::take(&mut *buf.borrow_mut());
+        // Opponent k of player i is player (i + 1 + k) % n — matches the
+        // turn-ordered opp_states the game loop passes to strategies.
+        let opp_finals: Vec<f32> = (1..n).map(|off| finals[(i + off) % n]).collect();
+        all_samples.extend(build_pair_samples(model, device, &snapshots, finals[i], &opp_finals));
+    }
+
+    (all_samples, finals[0])
+}
+
+/// Same fixed-game-set paired benchmark as `train::benchmark_vs_ga`, for the
+/// pair bot. Seat-swapped pairs share per-seat dice streams.
+const BENCH_SEED: u64 = 0xB54C;
+
+fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 {
+    use crate::game::{Game, Player};
+
+    let wins: u32 = (0..num_games)
+        .into_par_iter()
+        .map_init(
+            || PairStrategy::load(artifact_dir),
+            |template, i| {
+                let bot = PairStrategy::from_shared(template.model.clone(), template.device.clone());
+                let pair = (i / 2) as u64;
+                let rotation = i % 2;
+                let seat_dice = |seat: u64| Box::new(SmallRng::seed_from_u64(BENCH_SEED.wrapping_add(pair * 2 + seat)));
+                let players: Vec<Player> = if rotation == 0 {
+                    vec![
+                        Player::new(Box::new(bot), seat_dice(0)),
+                        Player::new(Box::new(champion.clone()), seat_dice(1)),
+                    ]
+                } else {
+                    vec![
+                        Player::new(Box::new(champion.clone()), seat_dice(0)),
+                        Player::new(Box::new(bot), seat_dice(1)),
+                    ]
+                };
+                let mut game = Game::new(players);
+                game.play();
+                let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+                let idx = rotation;
+                if scores[idx] > scores[1 - idx] {
+                    1u32
+                } else {
+                    0u32
+                }
+            },
+        )
+        .sum();
+    wins as f64 / num_games as f64
+}
+
+pub fn self_play_train(
+    artifact_dir: &str,
+    num_iterations: usize,
+    games_per_iteration: usize,
+    epochs_per_iteration: usize,
+    bench_games: usize,
+    checkpoints: bool,
+    start_iteration: usize,
+) {
+    let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+    MyBackend::seed(&device, TRAIN_SEED);
+    std::fs::create_dir_all(artifact_dir).ok();
+    let buffer_iterations = 3;
+    let mut replay_buffer: std::collections::VecDeque<Vec<PairSample>> = std::collections::VecDeque::new();
+
+    let scores_log_path = format!("{artifact_dir}/training_scores.csv");
+    if start_iteration == 0 {
+        std::fs::write(&scores_log_path, "iteration,avg_score,winrate\n").ok();
+    }
+
+    let genes = Arc::new(bot::default_genes());
+    let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
+    let start_time = std::time::Instant::now();
+
+    let mut iteration_stats: Vec<(usize, f32, Option<f64>)> = Vec::new();
+
+    let mut model: PairModel<MyBackend> = PairModelConfig::new()
+        .init::<MyBackend>(&device)
+        .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+        .unwrap_or_else(|_| {
+            println!("  No pretrained pair model, starting fresh");
+            PairModelConfig::new().init::<MyBackend>(&device)
+        });
+
+    for iteration in 0..num_iterations {
+        let global_iter = start_iteration + iteration;
+        let epsilon = (0.2 * (0.95f32).powi(global_iter as i32)).max(0.07);
+        println!("\n=== Pair iteration {} (epsilon={epsilon:.3}) ===", global_iter + 1);
+
+        let games_each = games_per_iteration / 3;
+        // Pure self-play thirds: 1v1, 3p, 4p.
+        let game_configs: Vec<usize> = [1usize, 2, 3]
+            .iter()
+            .flat_map(|&num_opps| std::iter::repeat(num_opps).take(games_each))
+            .collect();
+
+        let models: Vec<PairModel<MyBackend>> = (0..game_configs.len()).map(|_| model.clone()).collect();
+
+        let game_results: Vec<(Vec<PairSample>, f32)> = game_configs
+            .into_par_iter()
+            .zip(models.into_par_iter())
+            .enumerate()
+            .map(|(game_idx, (num_opps, thread_model))| {
+                let seed = TRAIN_SEED.wrapping_add((iteration * games_per_iteration + game_idx) as u64);
+                play_training_game(&thread_model, &device, num_opps, epsilon, seed)
+            })
+            .collect();
+
+        let game_scores: Vec<f32> = game_results.iter().map(|(_, score)| *score).collect();
+        let new_samples: Vec<PairSample> = game_results.into_iter().flat_map(|(s, _)| s).collect();
+        let avg_score = if game_scores.is_empty() {
+            0.0
+        } else {
+            game_scores.iter().sum::<f32>() / game_scores.len() as f32
+        };
+
+        replay_buffer.push_back(new_samples);
+        if replay_buffer.len() > buffer_iterations {
+            replay_buffer.pop_front();
+        }
+
+        let all_samples: Vec<PairSample> = replay_buffer.iter().flatten().copied().collect();
+        println!(
+            "  Generated {} new samples (avg score: {avg_score:.1}), replay buffer: {} total",
+            replay_buffer.back().unwrap().len(),
+            all_samples.len()
+        );
+
+        model = train_with_epochs(all_samples, artifact_dir, epochs_per_iteration, 4e-4);
+
+        if checkpoints {
+            let src = format!("{artifact_dir}/model.mpk");
+            let dst = format!("{artifact_dir}/iter-{}.mpk", global_iter + 1);
+            if let Err(e) = std::fs::copy(&src, &dst) {
+                eprintln!("  Failed to save iter-{} checkpoint: {e}", global_iter + 1);
+            }
+        }
+
+        let elapsed = start_time.elapsed().as_secs();
+        let (mins, secs) = (elapsed / 60, elapsed % 60);
+
+        use std::io::Write;
+        let winrate_opt = if bench_games > 0 {
+            let winrate = benchmark_vs_ga(artifact_dir, &champion, bench_games);
+            println!(
+                "  Iteration {:>3}: avg score {:.1}, winrate {:.1}%, elapsed {}m{}s",
+                global_iter + 1,
+                avg_score,
+                winrate * 100.0,
+                mins,
+                secs,
+            );
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
+                writeln!(f, "{},{avg_score:.2},{:.2}", global_iter + 1, winrate * 100.0).ok();
+            }
+            Some(winrate)
+        } else {
+            println!(
+                "  Iteration {:>3}: avg score {:.1}, elapsed {}m{}s",
+                global_iter + 1,
+                avg_score,
+                mins,
+                secs,
+            );
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
+                writeln!(f, "{},{avg_score:.2}", global_iter + 1).ok();
+            }
+            None
+        };
+
+        iteration_stats.push((global_iter + 1, avg_score, winrate_opt));
+    }
+
+    println!("\nPair self-play training complete. Model saved to {artifact_dir}/model");
+
+    if bench_games > 0 {
+        let best_wr = iteration_stats
+            .iter()
+            .filter_map(|&(i, s, w)| w.map(|w| (i, s, w)))
+            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+        let best_score = iteration_stats.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        if let Some((i, s, w)) = best_wr {
+            println!("  Best winrate:    iter {i:>3}: {:.1}% (avg score {s:.1})", w * 100.0);
+        }
+        if let Some(&(i, s, w)) = best_score {
+            let wr_str = w.map(|w| format!("{:.1}%", w * 100.0)).unwrap_or_else(|| "-".into());
+            println!("  Best avg score:  iter {i:>3}: {s:.1} (winrate {wr_str})");
+        }
+    }
+}
+
+fn train_with_epochs(samples: Vec<PairSample>, artifact_dir: &str, num_epochs: usize, lr: f64) -> PairModel<MyBackend> {
+    let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+
+    let split = (samples.len() * 9) / 10;
+    let train_data = InMemDataset::new(samples[..split].to_vec());
+    let valid_data = InMemDataset::new(samples[split..].to_vec());
+
+    let model: PairModel<MyAutodiffBackend> = PairModelConfig::new()
+        .init::<MyAutodiffBackend>(&device)
+        .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+        .unwrap_or_else(|_| PairModelConfig::new().init::<MyAutodiffBackend>(&device));
+
+    let batcher_train = PairBatcher::<MyAutodiffBackend> {
+        _phantom: std::marker::PhantomData,
+    };
+    let batcher_valid = PairBatcher::<MyBackend> {
+        _phantom: std::marker::PhantomData,
+    };
+
+    let dataloader_train = DataLoaderBuilder::new(batcher_train)
+        .batch_size(1024)
+        .shuffle(TRAIN_SEED)
+        .build(train_data);
+
+    let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
+        .batch_size(1024)
+        .shuffle(TRAIN_SEED)
+        .build(valid_data);
+
+    let ckpt_dir = format!("{artifact_dir}/ckpt");
+    std::fs::remove_dir_all(&ckpt_dir).ok();
+    std::fs::create_dir_all(&ckpt_dir).ok();
+
+    let training = SupervisedTraining::new(&ckpt_dir, dataloader_train, dataloader_valid)
+        .metric_train_numeric(LossMetric::new())
+        .metric_valid_numeric(LossMetric::new())
+        .num_epochs(num_epochs)
+        .summary();
+
+    let result = training.launch(Learner::new(model, AdamConfig::new().init(), lr));
+
+    result
+        .model
+        .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
+        .expect("Failed to save pair model");
+
+    std::fs::remove_dir_all(&ckpt_dir).ok();
+
+    PairModelConfig::new()
+        .init::<MyBackend>(&device)
+        .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+        .expect("Failed to reload pair model for inference")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
