@@ -62,6 +62,8 @@ pub fn board_features(state: &State) -> [f32; BOARD_FEATURES] {
 /// Layout: `[our 20 | paired 20 | cdiff/100, num_opps/4, max opp progress,
 /// max opp strikes/3, opp lockable-rows sum/8]`.
 pub fn pair_features(our: &State, paired: &State, all_opps: &[State]) -> [f32; PAIR_FEATURES] {
+    // Invariant: `paired` must be one of `all_opps`.
+    debug_assert!(all_opps.contains(paired));
     let mut f = [0.0f32; PAIR_FEATURES];
     f[..BOARD_FEATURES].copy_from_slice(&board_features(our));
     f[BOARD_FEATURES..2 * BOARD_FEATURES].copy_from_slice(&board_features(paired));
@@ -104,6 +106,17 @@ mod tests {
         assert_eq!(s.row_totals()[0], 5);
         let f = board_features(&s);
         assert!(f[12] > 0.0);
+
+        // Row 2 (descending): descending rows mark high->low, so mark
+        // 12, 11, 3 in that order -> free = 2 (terminal) with only 3 marks.
+        let mut s = State::default();
+        for n in [12u8, 11, 3] {
+            s.apply_mark(Mark { row: 2, number: n });
+        }
+        assert_eq!(s.row_free_values()[2], Some(2));
+        assert_eq!(s.row_totals()[2], 3);
+        let f = board_features(&s);
+        assert_eq!(f[14], 0.0, "descending terminal with <5 marks must contribute 0 ways");
     }
 
     #[test]
