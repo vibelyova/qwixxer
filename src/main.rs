@@ -172,6 +172,9 @@ enum Commands {
         /// Games per iteration
         #[arg(short, long, default_value = "20000")]
         games: usize,
+        /// Training epochs per iteration over the replay buffer
+        #[arg(short, long, default_value = "10")]
+        epochs: usize,
         /// Benchmark games per iteration (0 to disable)
         #[arg(short, long, default_value = "0")]
         bench: usize,
@@ -565,12 +568,19 @@ fn main() {
         Some(Commands::PairTrain {
             iterations,
             games,
+            epochs,
             bench,
             checkpoints,
             start_iteration,
-        }) => {
-            dqn::pair_train::self_play_train("pair_model", iterations, games, 10, bench, checkpoints, start_iteration)
-        }
+        }) => dqn::pair_train::self_play_train(
+            "pair_model",
+            iterations,
+            games,
+            epochs,
+            bench,
+            checkpoints,
+            start_iteration,
+        ),
         None => {
             // Default: play against MCTS
             run_play(vec![BotType::Mcts], false);
