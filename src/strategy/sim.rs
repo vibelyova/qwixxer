@@ -395,7 +395,7 @@ mod tests {
 
         // Sequential reference (Lite fidelity).
         let mut seq = make_sims();
-        for _ in 0..6 {
+        for _ in 0..30 {
             for sim in seq.iter_mut() {
                 play_sim_turn(&bot, sim, Fidelity::Lite);
             }
@@ -403,7 +403,7 @@ mod tests {
 
         // Lockstep.
         let mut batched = BatchedRollouts::new(&bot, make_sims());
-        for _ in 0..6 {
+        for _ in 0..30 {
             batched.step_turn();
         }
 
@@ -412,5 +412,12 @@ mod tests {
             assert_eq!(a.active, b.active);
             assert_eq!(a.states, b.states);
         }
+
+        // The over-mask path must actually be exercised: with 30 turns the
+        // random-init bot strikes out some sims at staggered times.
+        assert!(
+            batched.sims.iter().any(|s| s.over),
+            "no sim finished — over-mask path untested"
+        );
     }
 }
