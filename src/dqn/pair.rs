@@ -142,11 +142,135 @@ pub fn pair_batch_forward(
     (0..n).map(|i| (values[2 * i], values[2 * i + 1])).collect()
 }
 
+// ---- Manual inference path ----
+
+/// Plain-array forward pass extracted from a [`PairModel`]. At our sizes
+/// (batches of tens to a few hundred rows through a 45→128→64→2 MLP),
+/// burn's matmul spends more on cache-tile packing and tensor glue than on
+/// the arithmetic; this direct implementation skips all of it. Inference
+/// only — training keeps burn's autodiff. Numerics differ from burn in the
+/// last ulps (different summation order), so equivalence is validated by a
+/// tolerance test, not byte equality.
+/// Hidden sizes, fixed to [`PairModelConfig`]'s defaults. `from_model`
+/// asserts the loaded model matches; generalize to const generics only if
+/// the architecture ever actually varies.
+const D_H1: usize = 128;
+const D_H2: usize = 64;
+/// Output-tile width in [`ManualPairNet::forward`]: 32 floats = 4 AVX2
+/// vectors of accumulators held in registers across each input loop.
+const TILE: usize = 32;
+
+pub struct ManualPairNet {
+    /// Input-major (burn's native layout): `w1[i * D_H1..][..D_H1]` are the
+    /// weights input i contributes to every neuron. This makes the inner
+    /// loop an axpy over independent outputs — vectorizable — instead of a
+    /// serial reduction chain, which LLVM must not reorder for f32.
+    w1: Box<[f32]>,
+    b1: Box<[f32]>,
+    w2: Box<[f32]>,
+    b2: Box<[f32]>,
+    /// Heads interleaved per h2 input: `[w_mu[i], w_lv[i]]` pairs.
+    w_heads: Box<[f32]>,
+    b_mu: f32,
+    b_lv: f32,
+}
+
+/// Extract a burn Linear's weights (input-major, as stored) plus its bias.
+/// Returns `(weights, bias, d_in, d_out)`.
+fn extract_linear(layer: &Linear<MyBackend>) -> (Vec<f32>, Vec<f32>, usize, usize) {
+    let dims = layer.weight.shape().dims;
+    let (d_in, d_out) = (dims[0], dims[1]);
+    let w = layer.weight.val().into_data().to_vec::<f32>().unwrap();
+    let b = layer.bias.as_ref().unwrap().val().into_data().to_vec::<f32>().unwrap();
+    (w, b, d_in, d_out)
+}
+
+impl ManualPairNet {
+    pub fn from_model(model: &PairModel<MyBackend>) -> Self {
+        let (w1, b1, d_in1, d_h1) = extract_linear(&model.layer1);
+        assert_eq!((d_in1, d_h1), (PAIR_FEATURES, D_H1));
+        let (w2, b2, d_in2, d_h2) = extract_linear(&model.layer2);
+        assert_eq!((d_in2, d_h2), (D_H1, D_H2));
+        let (w_mu, b_mu, d_mu_in, d_mu_out) = extract_linear(&model.output_mean);
+        assert_eq!((d_mu_in, d_mu_out), (D_H2, 1));
+        let (w_lv, b_lv, d_lv_in, d_lv_out) = extract_linear(&model.output_log_var);
+        assert_eq!((d_lv_in, d_lv_out), (D_H2, 1));
+        let w_heads: Vec<f32> = w_mu.iter().zip(&w_lv).flat_map(|(&m, &l)| [m, l]).collect();
+        ManualPairNet {
+            w1: w1.into_boxed_slice(),
+            b1: b1.into_boxed_slice(),
+            w2: w2.into_boxed_slice(),
+            b2: b2.into_boxed_slice(),
+            w_heads: w_heads.into_boxed_slice(),
+            b_mu: b_mu[0],
+            b_lv: b_lv[0],
+        }
+    }
+
+    /// Returns `(μ, log σ²)` per row, like [`pair_batch_forward`]. Each
+    /// layer is computed in output tiles of [`TILE`] floats: the tile's
+    /// accumulators stay in vector registers across the whole input loop
+    /// (one store per tile, instead of a load-modify-store per input —
+    /// the axpy formulation's bottleneck). Inputs that are exactly 0.0
+    /// (common: fresh rows, locked flags) skip their contribution.
+    pub fn forward(&self, rows: &[[f32; PAIR_FEATURES]]) -> Vec<(f32, f32)> {
+        let mut h1 = [0.0f32; D_H1];
+        let mut h2 = [0.0f32; D_H2];
+        rows.iter()
+            .map(|x| {
+                for t in 0..D_H1 / TILE {
+                    let mut acc: [f32; TILE] = self.b1[t * TILE..(t + 1) * TILE].try_into().unwrap();
+                    for (i, &xi) in x.iter().enumerate() {
+                        if xi != 0.0 {
+                            let w: &[f32; TILE] = self.w1[i * D_H1 + t * TILE..i * D_H1 + (t + 1) * TILE]
+                                .try_into()
+                                .unwrap();
+                            for k in 0..TILE {
+                                acc[k] += xi * w[k];
+                            }
+                        }
+                    }
+                    for (k, &a) in acc.iter().enumerate() {
+                        h1[t * TILE + k] = a.max(0.0);
+                    }
+                }
+
+                for t in 0..D_H2 / TILE {
+                    let mut acc: [f32; TILE] = self.b2[t * TILE..(t + 1) * TILE].try_into().unwrap();
+                    for (i, &xi) in h1.iter().enumerate() {
+                        if xi != 0.0 {
+                            let w: &[f32; TILE] = self.w2[i * D_H2 + t * TILE..i * D_H2 + (t + 1) * TILE]
+                                .try_into()
+                                .unwrap();
+                            for k in 0..TILE {
+                                acc[k] += xi * w[k];
+                            }
+                        }
+                    }
+                    for (k, &a) in acc.iter().enumerate() {
+                        h2[t * TILE + k] = a.max(0.0);
+                    }
+                }
+
+                let mut mu = self.b_mu;
+                let mut lv = self.b_lv;
+                for (i, &hi) in h2.iter().enumerate() {
+                    mu += hi * self.w_heads[2 * i];
+                    lv += hi * self.w_heads[2 * i + 1];
+                }
+                (mu, lv)
+            })
+            .collect()
+    }
+}
+
 // ---- Strategy ----
 
 pub struct PairStrategy {
     pub model: Arc<PairModel<MyBackend>>,
     pub device: burn::backend::ndarray::NdArrayDevice,
+    /// Fast inference path; rebuilt from `model` at construction.
+    pub net: Arc<ManualPairNet>,
 }
 
 impl std::fmt::Debug for PairStrategy {
@@ -162,21 +286,16 @@ impl PairStrategy {
             .init::<MyBackend>(&device)
             .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
             .expect("Failed to load pair model");
-        PairStrategy {
-            model: Arc::new(model),
-            device,
-        }
+        Self::from_model(model, device)
     }
 
     pub fn from_model(model: PairModel<MyBackend>, device: burn::backend::ndarray::NdArrayDevice) -> Self {
-        PairStrategy {
-            model: Arc::new(model),
-            device,
-        }
+        Self::from_shared(Arc::new(model), device)
     }
 
     pub fn from_shared(model: Arc<PairModel<MyBackend>>, device: burn::backend::ndarray::NdArrayDevice) -> Self {
-        PairStrategy { model, device }
+        let net = Arc::new(ManualPairNet::from_model(&model));
+        PairStrategy { model, device, net }
     }
 }
 
@@ -207,7 +326,7 @@ impl Bot for PairStrategy {
             }
             leaders.push(leader.count_points());
         }
-        let values = pair_batch_forward(&self.model, &self.device, &feats);
+        let values = self.net.forward(&feats);
 
         let mut out = Vec::with_capacity(groups.len());
         let mut idx = 0;
@@ -239,7 +358,8 @@ impl crate::strategy::search::WinProb for PairStrategy {
             feats.push(pair_features(our, leader, opps));
             cdiffs.push((our.count_points() - leader.count_points()) as f32);
         }
-        pair_batch_forward(&self.model, &self.device, &feats)
+        self.net
+            .forward(&feats)
             .into_iter()
             .zip(cdiffs)
             .map(|((mu, log_var), cdiff)| {
@@ -363,6 +483,42 @@ mod tests {
         assert_eq!(v1.len(), 2);
         assert_eq!(v1, v2);
         assert!(v1.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn manual_forward_matches_burn_within_tolerance() {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = PairModelConfig::new().init::<MyBackend>(&device);
+        let net = ManualPairNet::from_model(&model);
+
+        // Real-position rows plus synthetic rows covering the input range.
+        let mut a = State::default();
+        for n in [2u8, 4, 7] {
+            a.apply_mark(Mark { row: 0, number: n });
+        }
+        a.apply_strike();
+        let mut b = State::default();
+        b.apply_mark(Mark { row: 3, number: 8 });
+        let mut rows = vec![
+            pair_features(&a, &b, &[b]),
+            pair_features(&b, &a, &[a]),
+            pair_features(&State::default(), &a, &[a, b]),
+        ];
+        for k in 0..8 {
+            let mut f = [0.0f32; PAIR_FEATURES];
+            for (i, v) in f.iter_mut().enumerate() {
+                *v = ((i * (k + 3)) % 23) as f32 / 23.0 - 0.4;
+            }
+            rows.push(f);
+        }
+
+        let burn_out = pair_batch_forward(&model, &device, &rows);
+        let manual_out = net.forward(&rows);
+        assert_eq!(burn_out.len(), manual_out.len());
+        for (i, ((bm, bl), (mm, ml))) in burn_out.iter().zip(&manual_out).enumerate() {
+            assert!((bm - mm).abs() < 1e-3, "row {i}: mu {bm} vs {mm}");
+            assert!((bl - ml).abs() < 1e-3, "row {i}: log_var {bl} vs {ml}");
+        }
     }
 
     #[test]
