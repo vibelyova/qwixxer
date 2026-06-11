@@ -150,6 +150,20 @@ impl State {
         State { strikes, rows }
     }
 
+    /// Reconstruct a State from its observable parts: per-row `(total, free)`
+    /// — `free == None` means locked, `total` includes the lock bonus — plus
+    /// strikes. Rows 0,1 are ascending, 2,3 descending, as in `default`.
+    /// Analysis/test helper: `(total, free)` fully determines row behavior.
+    pub fn from_parts(strikes: u8, parts: [(u8, Option<u8>); 4]) -> State {
+        let mut s = State::default();
+        s.strikes = strikes;
+        for (i, &(total, free)) in parts.iter().enumerate() {
+            s.rows[i].total = total;
+            s.rows[i].free = free;
+        }
+        s
+    }
+
     pub fn count_points(&self) -> isize {
         self.rows
             .iter()
@@ -1216,5 +1230,33 @@ mod tests {
         }
         assert!(s.would_lock_row(Mark { row: 0, number: 12 }));
         assert!(!s.would_lock_row(Mark { row: 0, number: 7 }));
+    }
+
+    #[test]
+    fn from_parts_roundtrip() {
+        // Mid-game state with marks in two rows and a strike.
+        let mut mid = State::default();
+        for n in [2u8, 3, 5, 7, 10] {
+            mid.apply_mark(Mark { row: 0, number: n });
+        }
+        for n in [12u8, 9] {
+            mid.apply_mark(Mark { row: 3, number: n });
+        }
+        mid.apply_strike();
+        // State with a locked row (5 marks then the terminal).
+        let mut locked = State::default();
+        for n in [2u8, 3, 4, 5, 6, 12] {
+            locked.apply_mark(Mark { row: 1, number: n });
+        }
+        for orig in [State::default(), mid, locked] {
+            let totals = orig.row_totals();
+            let frees = orig.row_free_values();
+            let rebuilt = State::from_parts(orig.strikes, core::array::from_fn(|i| (totals[i], frees[i])));
+            assert_eq!(rebuilt.row_totals(), orig.row_totals());
+            assert_eq!(rebuilt.row_free_values(), orig.row_free_values());
+            assert_eq!(rebuilt.locked(), orig.locked());
+            assert_eq!(rebuilt.strikes, orig.strikes);
+            assert_eq!(rebuilt.count_points(), orig.count_points());
+        }
     }
 }

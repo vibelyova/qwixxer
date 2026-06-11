@@ -1,4 +1,4 @@
-mod bot_impl;
+pub mod bot_impl;
 pub mod search;
 pub mod sim;
 pub(crate) use bot_impl::{active_phase1_impl, active_phase2_impl, passive_phase1_impl};

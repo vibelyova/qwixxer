@@ -72,7 +72,8 @@ fn find_safe_lock(state: &State, marks: &[Mark]) -> Option<Mark> {
 /// Outcome of the pure-logic half of a decision pipeline: either the meta
 /// rules fully determine the move, or a filtered+pruned candidate list
 /// remains for value-based selection.
-pub(crate) enum Decision {
+/// Pub for analysis examples (see examples/divergence.rs).
+pub enum Decision {
     Forced(Option<Mark>),
     /// (move, post-move state) pairs; `None` = skip/baseline.
     Choices(Vec<(Option<Mark>, State)>),
@@ -80,7 +81,7 @@ pub(crate) enum Decision {
 
 /// Index of the maximum value, matching `Iterator::max_by` semantics
 /// (last maximum wins) so refactored paths pick identical moves.
-pub(crate) fn argmax(values: &[f32]) -> usize {
+pub fn argmax(values: &[f32]) -> usize {
     values
         .iter()
         .enumerate()
@@ -89,7 +90,7 @@ pub(crate) fn argmax(values: &[f32]) -> usize {
         .0
 }
 
-pub(crate) fn eval_decision(bot: &impl Bot, decision: Decision, eval_opps: &[State]) -> Option<Mark> {
+pub fn eval_decision(bot: &impl Bot, decision: Decision, eval_opps: &[State]) -> Option<Mark> {
     match decision {
         Decision::Forced(m) => m,
         Decision::Choices(cands) => {
@@ -180,7 +181,7 @@ pub(crate) fn passive_phase1_impl(bot: &impl Bot, state: &State, opp_states: &[S
     eval_decision(bot, passive_phase1_choices(state, opp_states, dice), opp_states)
 }
 
-pub(crate) fn active_phase2_choices(state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Decision {
+pub fn active_phase2_choices(state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Decision {
     let opp_best = opp_states.iter().map(|s| s.count_points()).max().unwrap_or(0);
     let marks = state.generate_color_moves(dice);
     let baseline = if has_marked {
@@ -318,7 +319,7 @@ pub(crate) fn phase1_plan_choices(state: &State, comparison_opps: &[State], dice
 /// Full phase-1 pipeline: simulate opponents' phase-1 responses, then run the
 /// plan pipeline against them. Returns the decision plus the simulated
 /// post-phase1 opponent states (also the evaluation context for Choices).
-pub(crate) fn active_phase1_choices(
+pub fn active_phase1_choices(
     bot: &impl Bot,
     state: &State,
     opp_states: &[State],
