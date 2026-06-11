@@ -405,6 +405,7 @@ fn play_training_game(
     model: &PairModel<MyBackend>,
     device: &burn::backend::ndarray::NdArrayDevice,
     num_opponents: usize,
+    search: bool,
     epsilon: f32,
     seed: u64,
 ) -> (Vec<PairSample>, f32) {
@@ -419,11 +420,16 @@ fn play_training_game(
     let mut buffers = Vec::with_capacity(n);
     let mut players: Vec<Player> = Vec::with_capacity(n);
     for (i, strategy) in strategies.into_iter().enumerate() {
+        let policy = if search {
+            PairPolicy::Search(SearchBot::new(strategy))
+        } else {
+            PairPolicy::Static(strategy)
+        };
         let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         buffers.push(std::rc::Rc::clone(&buf));
         players.push(Player::new(
             Box::new(RecordingPair {
-                policy: PairPolicy::Static(strategy),
+                policy,
                 epsilon: if i == 0 { epsilon } else { 0.0 },
                 rng: SmallRng::seed_from_u64(seed.wrapping_add(100 + i as u64)),
                 recorded: buf,
@@ -499,6 +505,7 @@ pub fn self_play_train(
     bench_games: usize,
     checkpoints: bool,
     start_iteration: usize,
+    search: bool,
 ) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
     MyBackend::seed(&device, TRAIN_SEED);
@@ -525,6 +532,10 @@ pub fn self_play_train(
             PairModelConfig::new().init::<MyBackend>(&device)
         });
 
+    if search {
+        println!("Expert iteration: generation uses the search bot (K=128) for all players");
+    }
+
     for iteration in 0..num_iterations {
         let global_iter = start_iteration + iteration;
         let epsilon = (0.2 * (0.95f32).powi(global_iter as i32)).max(0.07);
@@ -545,7 +556,7 @@ pub fn self_play_train(
             .enumerate()
             .map(|(game_idx, (num_opps, thread_model))| {
                 let seed = TRAIN_SEED.wrapping_add((iteration * games_per_iteration + game_idx) as u64);
-                play_training_game(&thread_model, &device, num_opps, epsilon, seed)
+                play_training_game(&thread_model, &device, num_opps, search, epsilon, seed)
             })
             .collect();
 
@@ -846,5 +857,58 @@ mod tests {
         let last_fwd = &samples[2];
         assert!((last_fwd.value - 8.0).abs() < 1e-5);
         assert!((last_fwd.final_diff - 8.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn exploring_decisions_never_invoke_search() {
+        use crate::game::{Game, Player};
+        use crate::strategy::search::{SearchBot, SearchStats};
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = PairModelConfig::new().init::<MyBackend>(&device);
+
+        let mut players = Vec::new();
+        let mut stats = Vec::new();
+        for i in 0..2u64 {
+            let mut sb = SearchBot::new(PairStrategy::from_model(model.clone(), device));
+            let st = std::rc::Rc::new(std::cell::RefCell::new(SearchStats::default()));
+            sb.stats = Some(st.clone());
+            stats.push(st);
+            players.push(Player::new(
+                Box::new(RecordingPair {
+                    policy: PairPolicy::Search(sb),
+                    epsilon: 1.0, // always explore
+                    rng: SmallRng::seed_from_u64(900 + i),
+                    recorded: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                }),
+                Box::new(SmallRng::seed_from_u64(910 + i)),
+            ));
+        }
+        let mut game = Game::new(players);
+        game.play();
+
+        for st in &stats {
+            assert_eq!(
+                st.borrow().active_decisions,
+                0,
+                "search ran despite epsilon=1.0 — the ε-coin must fire first"
+            );
+        }
+    }
+
+    #[test]
+    fn search_generation_is_deterministic() {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = PairModelConfig::new().init::<MyBackend>(&device);
+
+        let run = || play_training_game(&model, &device, 1, true, 0.07, 4242);
+        let (s1, f1) = run();
+        let (s2, f2) = run();
+        assert_eq!(f1, f2);
+        assert_eq!(s1.len(), s2.len());
+        for (a, b) in s1.iter().zip(&s2) {
+            assert_eq!(a.features, b.features);
+            assert_eq!(a.value, b.value);
+            assert_eq!(a.final_diff, b.final_diff);
+        }
     }
 }

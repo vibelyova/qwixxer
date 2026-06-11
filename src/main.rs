@@ -607,6 +607,7 @@ fn main() {
             bench,
             checkpoints,
             start_iteration,
+            false,
         ),
         None => {
             // Default: play against MCTS
