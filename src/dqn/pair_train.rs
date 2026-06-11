@@ -4,9 +4,7 @@
 //! Only compiled with the `dqn` feature, mirroring `dqn::train`.
 
 use crate::bot::{self, DNA};
-use crate::dqn::pair::{
-    pair_batch_forward, pair_features, PairModel, PairModelConfig, PairStrategy, BOARD_FEATURES, PAIR_FEATURES,
-};
+use crate::dqn::pair::{pair_features, PairModel, PairModelConfig, PairStrategy, BOARD_FEATURES, PAIR_FEATURES};
 use crate::dqn::{MyBackend, LOG_VAR_MAX, LOG_VAR_MIN, TRAIN_SEED};
 use crate::state::{Mark, State};
 use crate::strategy::Strategy;
@@ -314,8 +312,7 @@ impl Strategy for RecordingPair {
 /// pair-level features recomputed exactly from the swapped perspective and
 /// targets negated.
 fn build_pair_samples(
-    model: &PairModel<MyBackend>,
-    device: &burn::backend::ndarray::NdArrayDevice,
+    net: &crate::dqn::pair::ManualPairNet,
     snapshots: &[Snapshot],
     our_final: f32,
     opp_finals: &[f32],
@@ -337,10 +334,7 @@ fn build_pair_samples(
             .iter()
             .map(|(our, opps)| (our.count_points() - opps[k].count_points()) as f32)
             .collect();
-        let mus: Vec<f32> = pair_batch_forward(model, device, &feats)
-            .into_iter()
-            .map(|(m, _)| m)
-            .collect();
+        let mus: Vec<f32> = net.forward(&feats).into_iter().map(|(m, _)| m).collect();
         let g = td_diff_targets(&mus, &cdiffs, final_diff, LAMBDA);
 
         for (t, (our, opps)) in snapshots.iter().enumerate() {
@@ -382,14 +376,19 @@ fn play_training_game(
     use crate::game::{Game, Player};
 
     let n = num_opponents + 1;
+    let strategies: Vec<PairStrategy> = (0..n)
+        .map(|_| PairStrategy::from_model(model.clone(), device.clone()))
+        .collect();
+    let boot_net = strategies[0].net.clone();
+
     let mut buffers = Vec::with_capacity(n);
     let mut players: Vec<Player> = Vec::with_capacity(n);
-    for i in 0..n {
+    for (i, strategy) in strategies.into_iter().enumerate() {
         let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         buffers.push(std::rc::Rc::clone(&buf));
         players.push(Player::new(
             Box::new(RecordingPair {
-                bot: PairStrategy::from_model(model.clone(), device.clone()),
+                bot: strategy,
                 epsilon: if i == 0 { epsilon } else { 0.0 },
                 rng: SmallRng::seed_from_u64(seed.wrapping_add(100 + i as u64)),
                 recorded: buf,
@@ -409,7 +408,7 @@ fn play_training_game(
         // Opponent k of player i is player (i + 1 + k) % n — matches the
         // turn-ordered opp_states the game loop passes to strategies.
         let opp_finals: Vec<f32> = (1..n).map(|off| finals[(i + off) % n]).collect();
-        all_samples.extend(build_pair_samples(model, device, &snapshots, finals[i], &opp_finals));
+        all_samples.extend(build_pair_samples(&boot_net, &snapshots, finals[i], &opp_finals));
     }
 
     (all_samples, finals[0])
@@ -753,6 +752,7 @@ mod tests {
     fn build_pair_samples_emits_negated_swapped_samples() {
         let device = burn::backend::ndarray::NdArrayDevice::Cpu;
         let model = PairModelConfig::new().init::<MyBackend>(&device);
+        let net = crate::dqn::pair::ManualPairNet::from_model(&model);
 
         // 2-step 1v1 trajectory with asymmetric boards.
         let mut our1 = State::default();
@@ -764,7 +764,7 @@ mod tests {
         opp2.apply_mark(crate::state::Mark { row: 2, number: 10 });
 
         let snapshots = vec![(our1, vec![opp1]), (our2, vec![opp2])];
-        let samples = build_pair_samples(&model, &device, &snapshots, 30.0, &[20.0]);
+        let samples = build_pair_samples(&net, &snapshots, 30.0, &[20.0]);
 
         // 2 steps × 1 opponent × 2 orders.
         assert_eq!(samples.len(), 4);
