@@ -261,7 +261,6 @@ fn run_bench(bots: Vec<BotType>, num_games: usize, seed: u64) {
     );
 
     #[cfg(feature = "parallel")]
-    #[cfg(feature = "parallel")]
     use rayon::prelude::*;
 
     let bench_game = |templates: &StrategyTemplates, i: usize| {
@@ -587,7 +586,6 @@ fn main() {
         Some(Commands::Bench { bots, num_games, seed }) => run_bench(bots, num_games, seed),
         Some(Commands::Solo { num_games }) => run_solo(num_games),
         Some(Commands::Evolve) => run_train(),
-        #[cfg(feature = "dqn")]
         #[cfg(feature = "dqn")]
         Some(Commands::DqnSelfplay {
             iterations,

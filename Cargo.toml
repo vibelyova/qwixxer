@@ -27,5 +27,8 @@ rand = { version = "0.8", features = ["small_rng"] }
 rayon = { version = "1", optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 
+[dev-dependencies]
+matrixmultiply = "0.3"
+
 [profile.release]
 # lto = true

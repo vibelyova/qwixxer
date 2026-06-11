@@ -81,10 +81,10 @@ pub fn pair_features(our: &State, paired: &State, all_opps: &[State]) -> [f32; P
 
 #[derive(Module, Debug)]
 pub struct PairModel<B: Backend> {
-    layer1: Linear<B>,
-    layer2: Linear<B>,
-    output_mean: Linear<B>,
-    output_log_var: Linear<B>,
+    pub layer1: Linear<B>,
+    pub layer2: Linear<B>,
+    pub output_mean: Linear<B>,
+    pub output_log_var: Linear<B>,
     activation: Relu,
 }
 
@@ -156,8 +156,8 @@ pub fn pair_batch_forward(
 /// the architecture ever actually varies.
 const D_H1: usize = 128;
 const D_H2: usize = 64;
-/// Output-tile width in [`ManualPairNet::forward`]: 32 floats = 4 AVX2
-/// vectors of accumulators held in registers across each input loop.
+/// Output-tile width in [`layer_forward`]: 32 floats = 4 AVX2 vectors of
+/// accumulators held in registers across each input loop.
 const TILE: usize = 32;
 
 pub struct ManualPairNet {
@@ -185,6 +185,35 @@ fn extract_linear(layer: &Linear<MyBackend>) -> (Vec<f32>, Vec<f32>, usize, usiz
     (w, b, d_in, d_out)
 }
 
+/// One dense layer + ReLU, computed in output tiles of [`TILE`] floats: the
+/// tile's accumulators stay in vector registers across the whole input loop
+/// (one store per tile, instead of a load-modify-store per input — the axpy
+/// formulation's bottleneck). Inputs that are exactly 0.0 (common: fresh
+/// rows, locked flags) skip their contribution. `w` is input-major:
+/// `w[i * D_OUT..][..D_OUT]` are the weights input i contributes to every
+/// output.
+fn layer_forward<const D_IN: usize, const D_OUT: usize>(
+    x: &[f32; D_IN],
+    w: &[f32],
+    b: &[f32],
+    out: &mut [f32; D_OUT],
+) {
+    for t in 0..D_OUT / TILE {
+        let mut acc: [f32; TILE] = b[t * TILE..(t + 1) * TILE].try_into().unwrap();
+        for (i, &xi) in x.iter().enumerate() {
+            if xi != 0.0 {
+                let w: &[f32; TILE] = w[i * D_OUT + t * TILE..i * D_OUT + (t + 1) * TILE].try_into().unwrap();
+                for k in 0..TILE {
+                    acc[k] += xi * w[k];
+                }
+            }
+        }
+        for (k, &a) in acc.iter().enumerate() {
+            out[t * TILE + k] = a.max(0.0);
+        }
+    }
+}
+
 impl ManualPairNet {
     pub fn from_model(model: &PairModel<MyBackend>) -> Self {
         let (w1, b1, d_in1, d_h1) = extract_linear(&model.layer1);
@@ -207,50 +236,14 @@ impl ManualPairNet {
         }
     }
 
-    /// Returns `(μ, log σ²)` per row, like [`pair_batch_forward`]. Each
-    /// layer is computed in output tiles of [`TILE`] floats: the tile's
-    /// accumulators stay in vector registers across the whole input loop
-    /// (one store per tile, instead of a load-modify-store per input —
-    /// the axpy formulation's bottleneck). Inputs that are exactly 0.0
-    /// (common: fresh rows, locked flags) skip their contribution.
+    /// Returns `(μ, log σ²)` per row, like [`pair_batch_forward`].
     pub fn forward(&self, rows: &[[f32; PAIR_FEATURES]]) -> Vec<(f32, f32)> {
         let mut h1 = [0.0f32; D_H1];
         let mut h2 = [0.0f32; D_H2];
         rows.iter()
             .map(|x| {
-                for t in 0..D_H1 / TILE {
-                    let mut acc: [f32; TILE] = self.b1[t * TILE..(t + 1) * TILE].try_into().unwrap();
-                    for (i, &xi) in x.iter().enumerate() {
-                        if xi != 0.0 {
-                            let w: &[f32; TILE] = self.w1[i * D_H1 + t * TILE..i * D_H1 + (t + 1) * TILE]
-                                .try_into()
-                                .unwrap();
-                            for k in 0..TILE {
-                                acc[k] += xi * w[k];
-                            }
-                        }
-                    }
-                    for (k, &a) in acc.iter().enumerate() {
-                        h1[t * TILE + k] = a.max(0.0);
-                    }
-                }
-
-                for t in 0..D_H2 / TILE {
-                    let mut acc: [f32; TILE] = self.b2[t * TILE..(t + 1) * TILE].try_into().unwrap();
-                    for (i, &xi) in h1.iter().enumerate() {
-                        if xi != 0.0 {
-                            let w: &[f32; TILE] = self.w2[i * D_H2 + t * TILE..i * D_H2 + (t + 1) * TILE]
-                                .try_into()
-                                .unwrap();
-                            for k in 0..TILE {
-                                acc[k] += xi * w[k];
-                            }
-                        }
-                    }
-                    for (k, &a) in acc.iter().enumerate() {
-                        h2[t * TILE + k] = a.max(0.0);
-                    }
-                }
+                layer_forward(x, &self.w1, &self.b1, &mut h1);
+                layer_forward(&h1, &self.w2, &self.b2, &mut h2);
 
                 let mut mu = self.b_mu;
                 let mut lv = self.b_lv;

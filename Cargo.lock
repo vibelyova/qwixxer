@@ -4492,6 +4492,7 @@ dependencies = [
  "clap",
  "env_logger",
  "itertools 0.12.1",
+ "matrixmultiply",
  "mimalloc",
  "rand 0.8.5",
  "rayon",
