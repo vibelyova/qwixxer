@@ -20,17 +20,21 @@ def points(state):
 
 
 def move_feats(prefix, mark, state, phase, has_marked):
-    """Features of one candidate move from the pre-move state."""
+    """Features of one candidate move from the pre-move state.
+
+    Numeric move features (jump, to_terminal, row_total) are NaN for non-mark
+    moves; kind carries that information.
+    """
     if mark is None:
         kind = "skip" if phase == 1 or has_marked else "strike"
         return {
             f"{prefix}_kind": kind,
             f"{prefix}_row": -1,
-            f"{prefix}_jump": -1,
+            f"{prefix}_jump": float("nan"),
             f"{prefix}_points": -5 if kind == "strike" else 0,
             f"{prefix}_locks": False,
-            f"{prefix}_to_terminal": -1,
-            f"{prefix}_row_total": -1,
+            f"{prefix}_to_terminal": float("nan"),
+            f"{prefix}_row_total": float("nan"),
         }
     row, number = mark
     total, free = state["rows"][row]
@@ -59,43 +63,46 @@ def load(path):
             if obj["t"] == "g":
                 games[obj["game"]] = obj
             else:
-                decisions.append(obj)
+                decisions.append((lineno, obj))
     rows = []
-    for ev in decisions:
-        our, opp = ev["our"], ev["opps"][0]
-        static_mark = ev["cands"][ev["static_pick"]]["mark"]
-        r = {
-            "game": ev["game"],
-            "turn": ev["turn"],
-            "phase": ev["phase"],
-            "has_marked": ev["has_marked"],
-            "gate_close": ev["gate_close"],
-            "gate_endgame": ev["gate_endgame"],
-            "static_gap": ev["static_gap"],
-            "n_cands": len(ev["cands"]),
-            "disagree": ev["disagree"],
-            "our_points": ev["our_points"],
-            "opp_points": ev["opp_points"],
-            "cdiff": ev["our_points"] - ev["opp_points"],
-            "our_strikes": our["strikes"],
-            "opp_strikes": opp["strikes"],
-            "our_marks": sum(t for t, _ in our["rows"]),
-            "opp_marks": sum(t for t, _ in opp["rows"]),
-            "our_locked": sum(f is None for _, f in our["rows"]),
-            "opp_locked": sum(f is None for _, f in opp["rows"]),
-            "v_static": ev["cands"][ev["static_pick"]]["v"],
-            "v_search": ev["cands"][ev["search_pick"]]["v"],
-            "static_pick": ev["static_pick"],
-            "search_pick": ev["search_pick"],
-            "hk_gap_mean": ev.get("hk_gap_mean"),
-            "hk_gap_se": ev.get("hk_gap_se"),
-            "verdict": ev.get("verdict"),
-        }
-        r.update(move_feats("static", static_mark, our, ev["phase"], ev["has_marked"]))
-        r.update(move_feats("search", ev["search_mark"], our, ev["phase"], ev["has_marked"]))
-        g = games.get(ev["game"])
-        r["game_won"] = g["pair_won"] if g else None
-        rows.append(r)
+    for lineno, ev in decisions:
+        try:
+            our, opp = ev["our"], ev["opps"][0]
+            static_mark = ev["cands"][ev["static_pick"]]["mark"]
+            r = {
+                "game": ev["game"],
+                "turn": ev["turn"],
+                "phase": ev["phase"],
+                "has_marked": ev["has_marked"],
+                "gate_close": ev["gate_close"],
+                "gate_endgame": ev["gate_endgame"],
+                "static_gap": ev["static_gap"],
+                "n_cands": len(ev["cands"]),
+                "disagree": ev["disagree"],
+                "our_points": ev["our_points"],
+                "opp_points": ev["opp_points"],
+                "cdiff": ev["our_points"] - ev["opp_points"],
+                "our_strikes": our["strikes"],
+                "opp_strikes": opp["strikes"],
+                "our_marks": sum(t for t, _ in our["rows"]),
+                "opp_marks": sum(t for t, _ in opp["rows"]),
+                "our_locked": sum(f is None for _, f in our["rows"]),
+                "opp_locked": sum(f is None for _, f in opp["rows"]),
+                "v_static": ev["cands"][ev["static_pick"]]["v"],
+                "v_search": ev["cands"][ev["search_pick"]]["v"],
+                "static_pick": ev["static_pick"],
+                "search_pick": ev["search_pick"],
+                "hk_gap_mean": ev.get("hk_gap_mean"),
+                "hk_gap_se": ev.get("hk_gap_se"),
+                "verdict": ev.get("verdict"),
+            }
+            r.update(move_feats("static", static_mark, our, ev["phase"], ev["has_marked"]))
+            r.update(move_feats("search", ev["search_mark"], our, ev["phase"], ev["has_marked"]))
+            g = games.get(ev["game"])
+            r["game_won"] = g["pair_won"] if g else None
+            rows.append(r)
+        except KeyError as e:
+            sys.exit(f"{path}:{lineno}: missing field {e}")
     df = pd.DataFrame(rows)
     # search_right: relabeled disagreement where high-K confirms search's side.
     # verdict 'flip' favors cands[1], 'keep' favors cands[0].
