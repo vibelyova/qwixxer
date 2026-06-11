@@ -7,6 +7,7 @@ use crate::bot::{self, DNA};
 use crate::dqn::pair::{pair_features, PairModel, PairModelConfig, PairStrategy, BOARD_FEATURES, PAIR_FEATURES};
 use crate::dqn::{MyBackend, LOG_VAR_MAX, LOG_VAR_MIN, TRAIN_SEED};
 use crate::state::{Mark, State};
+use crate::strategy::search::SearchBot;
 use crate::strategy::Strategy;
 use burn::{
     backend::Autodiff,
@@ -205,14 +206,48 @@ impl<B: Backend> Batcher<B, PairSample, PairBatch<B>> for PairBatcher<B> {
 /// that moment (turn-ordered relative to us, constant order per game).
 type Snapshot = (State, Vec<State>);
 
+/// Move-selection policy for training-game players: today's static net, or
+/// the shipped search bot (expert iteration). The ε-coin in `RecordingPair`
+/// fires BEFORE the policy, so exploring decisions never pay for (or get
+/// polished by) search.
+enum PairPolicy {
+    Static(PairStrategy),
+    Search(SearchBot<PairStrategy>),
+}
+
+impl PairPolicy {
+    fn bot(&self) -> &PairStrategy {
+        match self {
+            PairPolicy::Static(b) => b,
+            PairPolicy::Search(s) => &s.bot,
+        }
+    }
+
+    fn active_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+        match self {
+            PairPolicy::Static(b) => crate::strategy::active_phase1_impl(&*b, state, opp_states, dice),
+            PairPolicy::Search(s) => crate::strategy::Strategy::active_phase1(s, state, opp_states, dice),
+        }
+    }
+
+    fn active_phase2(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Option<Mark> {
+        match self {
+            PairPolicy::Static(b) => crate::strategy::active_phase2_impl(&*b, state, opp_states, dice, has_marked),
+            PairPolicy::Search(s) => crate::strategy::Strategy::active_phase2(s, state, opp_states, dice, has_marked),
+        }
+    }
+}
+
 /// Pair-bot wrapper used during self-play training. ε-greedy on active
 /// decisions, greedy on passive; records snapshots for chain building.
-/// Recording cadence: active turns once after phase 2 (post-turn state);
-/// passive turns after every real decision — including skips, which the old
-/// recorder dropped (skip afterstates are evaluated at inference, so they
-/// belong in the training distribution).
+/// Move selection runs through a [`PairPolicy`] — either the static net or
+/// the search bot; the recording cadence is identical in both. Recording
+/// cadence: active turns once after phase 2 (post-turn state); passive turns
+/// after every real decision — including skips, which the old recorder
+/// dropped (skip afterstates are evaluated at inference, so they belong in
+/// the training distribution).
 struct RecordingPair {
-    bot: PairStrategy,
+    policy: PairPolicy,
     epsilon: f32,
     rng: SmallRng,
     recorded: std::rc::Rc<std::cell::RefCell<Vec<Snapshot>>>,
@@ -238,7 +273,7 @@ impl Strategy for RecordingPair {
                 None
             }
         } else {
-            crate::strategy::active_phase1_impl(&self.bot, state, opp_states, dice)
+            self.policy.active_phase1(state, opp_states, dice)
         }
     }
 
@@ -265,7 +300,7 @@ impl Strategy for RecordingPair {
                 None
             }
         } else {
-            crate::strategy::active_phase2_impl(&self.bot, state, opp_states, dice, has_marked)
+            self.policy.active_phase2(state, opp_states, dice, has_marked)
         };
 
         let chosen_state = match mark {
@@ -292,7 +327,7 @@ impl Strategy for RecordingPair {
             return None;
         }
 
-        let mark = crate::strategy::passive_phase1_impl(&self.bot, state, opp_states, dice);
+        let mark = crate::strategy::passive_phase1_impl(self.policy.bot(), state, opp_states, dice);
 
         let post = match mark {
             Some(m) => {
@@ -388,7 +423,7 @@ fn play_training_game(
         buffers.push(std::rc::Rc::clone(&buf));
         players.push(Player::new(
             Box::new(RecordingPair {
-                bot: strategy,
+                policy: PairPolicy::Static(strategy),
                 epsilon: if i == 0 { epsilon } else { 0.0 },
                 rng: SmallRng::seed_from_u64(seed.wrapping_add(100 + i as u64)),
                 recorded: buf,
@@ -746,6 +781,28 @@ mod tests {
         // Involution.
         permute_colors(&mut f, false, false, true);
         assert_eq!(f, orig);
+    }
+
+    #[test]
+    fn static_policy_dispatch_matches_impl_calls() {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = PairModelConfig::new().init::<MyBackend>(&device);
+        let bot = PairStrategy::from_model(model.clone(), device);
+        let mut policy = PairPolicy::Static(PairStrategy::from_shared(bot.model.clone(), bot.device));
+
+        let mut state = State::default();
+        state.apply_mark(Mark { row: 1, number: 6 });
+        let opps = [State::default()];
+        let dice = [3, 4, 2, 3, 5, 1];
+
+        assert_eq!(
+            policy.active_phase1(&state, &opps, dice),
+            crate::strategy::active_phase1_impl(&bot, &state, &opps, dice)
+        );
+        assert_eq!(
+            policy.active_phase2(&state, &opps, dice, false),
+            crate::strategy::active_phase2_impl(&bot, &state, &opps, dice, false)
+        );
     }
 
     #[test]
