@@ -754,3 +754,59 @@ pays. With K_SAMPLES=128, **pair-search vs GA reaches 60.09% (99% CI
 59.58–60.60)** — the first bot over 60% under the corrected rules, entering
 the hypothesized 60–62% structural-ceiling zone. Head-to-head cost ~41 games/s
 on 8 cores.
+
+---
+
+## Phase 14: Expert Iteration
+
+Closed the loop on Phase 13: `pair-train --search` generates self-play training
+games with the K=128 search bot as every player's policy (ε-coin fires before
+search, so exploration skips it; recording, TD(λ) targets, replay, and losses
+unchanged — pure trajectory-level distillation). Run configuration: 5k
+games/iteration, 5 epochs (gradient-passes band reasoning), 500k-game
+per-iteration static benchmark (paired SE ≈ 0.05%) as the primary metric, warm
+start from the Phase 12 model at the ε floor.
+
+### Result: small, real, and short of the bar
+
+Over 11–12 iterations the static-V winrate climbed **58.3% → 58.7%** on the
+fixed 500k bench — ≈ +0.04%/iteration, ~8σ in total, so the distillation signal
+is genuinely there — but it plateaued below the pre-registered adoption bar
+(+0.5% over the re-baseline). The checkpoint was not adopted:
+`pair_model/model.mpk` remains the Phase 12 net and the pair-search headline
+remains **60.1% vs GA**.
+
+### Interpretation
+
+The dilution mechanism flagged at design time is quantitatively consistent with
+the observed rate: the expert corrects ~1.3 decisions/game (6.6% of searched
+decisions), so ~93% of TD targets are statistically indistinguishable from what
+the net already fits, and the candidate *ranking* — the only thing that affects
+play — shifts even less than the values. Trajectory-level expert iteration
+works, but at this expert-student gap the per-iteration gain is a few
+hundredths of a percent and saturates.
+
+Ladder amendment: the "disagreement-weighted trajectory sampling" escalation is
+struck — at 1.3 disagreements/game nearly every trajectory contains one, so
+trajectory-level weighting is a no-op. The remaining untried rung is
+**search-value distillation**: emit extra training samples at searched
+decisions regressing V toward the rollouts' mean outcome in diff units (the
+sims carry actual final diffs, so no unit mismatch with μ). Estimated odds
+~30–40% of +0.3–0.5%; design questions around σ-target semantics and mixing
+weight. Not pursued in this campaign.
+
+### Campaign conclusion
+
+Every attack on the ~60% ceiling vs GA under the corrected rules has now been
+mounted and measured: joint two-board representation (parity with compressed
+context), decision-time search (+0.9% total, sample-noise-bound), and expert
+iteration (+0.4% static-V, below adoption). The structural-ceiling hypothesis
+— shared-dice luck dominating beyond ~60–62% — survived all of them. Final
+leaderboard vs GA (50k+ paired games, seed 42):
+
+| Bot | vs GA |
+|-----|-------|
+| **pair-search (K=128)** | **60.1%** |
+| pair-search (K=64) | 59.8% |
+| pair (static) | 59.2% |
+| old DQN | 59.1% |
