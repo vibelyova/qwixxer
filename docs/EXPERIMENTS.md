@@ -810,3 +810,172 @@ leaderboard vs GA (50k+ paired games, seed 42):
 | pair-search (K=64) | 59.8% |
 | pair (static) | 59.2% |
 | old DQN | 59.1% |
+
+## Phase 15: Search-Divergence Analysis (when and why search overrides static)
+
+Phase 13 established that decision-time search beats static pair play by
++2.3–2.5% head-to-head, but left open *which* decisions search rescues. If the
+override pattern reduced to a crisp board feature, the static net could be
+taught part of search's edge at static speed (no rollouts). This phase mines
+that question and returns a verdict on encoding a meta-rule.
+
+### Setup and data
+
+Shadow collection: 10,000 games of static-PAIR vs GA, rotating seats, paired
+dice, seed 0. At every eligible decision on the static bot's own trajectory,
+search was run with `force=true` (gate ignored) and the static-vs-search
+comparison logged — one JSONL event per eligible decision. Output
+`divergence-10k.jsonl` is ~96 MB / 201,749 lines (191,749 decision events +
+10,000 game records), collected in ~6 min wall. Every disagreement plus a 10%
+sample of agreements was then **relabeled** at K=2048 rollouts per candidate
+with CRN-paired stats (seed 1, 10m23s wall / 82m user, zero drift-guard panics),
+attaching `hk_gap_mean`/`hk_gap_se`/`verdict` to 35,927 events. A verdict of
+**flip** means cands[1] is confidently better than cands[0] (|z|>2), **keep**
+the reverse, **coinflip** otherwise. `search_right` = a disagreement whose
+high-K verdict confirms search's pick.
+
+Recomputed headline rates (from the file, the original run summary was lost):
+
+- **191,749 eligible decisions.** Close gate (top-2 static gap below
+  GATE_MARGIN) fires on **53.7%**, endgame gate on **23.3%**, any gate on
+  **70.1%** (134,350 decisions).
+- **Disagreements: 18,644 = 9.72% of eligible / 13.82% of gate-fired.** Only 72
+  of 18,644 (0.4%) fell outside a fired gate — gating still loses essentially no
+  realized search value, consistent with Phase 13's 100%.
+- **Pair (static) win rate vs GA: 58.95%** over the 10,000 games — in line with
+  the 59.2% leaderboard figure.
+
+These track the 500-game seed-7 validation (9.79% of eligible / 14.15% of
+gate-fired, 57.6% pair wins) closely.
+
+### Disagreement survival at high K: search is a tie-breaker, not a fixer
+
+Among the 18,644 disagreements, the K=2048 verdict split is **flip 39.3%
+(7,325) / keep 10.7% (2,001) / coinflip 50.0% (9,318)**. So search's pick is
+confirmed (`search_right`) on **39.3%** of disagreements, refuted on 10.7%, and
+**half are statistical ties even at 16× the search budget.**
+
+Agreement-control noise floor (verdict present, `disagree==False`, n=17,283):
+**keep 96.3% / coinflip 3.2% / flip 0.6%.** Here "keep" is the expected null
+(both candidates were the same static pick), so the floor of "the high-K
+estimate would have changed something" is flip+coinflip ≈ 3.8% — matching the
+500-game floor (0.5% + 3.5%). The disagreement coinflip rate (50%) sits far
+above this floor, so coinflips at disagreements are real near-ties, not
+relabel noise — but they carry no decidable signal.
+
+The headline: **search's edge is overwhelmingly a diffuse sampling-advantage,
+not the correction of identifiable static blunders.** Quantitatively, 26.4% of
+disagreements (4,918) have `hk_gap_se==0`, and **every one of them is a
+coinflip** — these are decisions where both rollout branches already terminate
+the game deterministically, so the K=2048 estimate is exact and the two
+candidates are genuinely equal-valued (an unbreakable tie, not a
+high-confidence stochastic call).
+
+### Transition matrices: no directional move-kind pattern
+
+Among confirmed disagreements (search_right, n=7,326), move-kind transitions are
+near-symmetric: **mark→mark 47% (3,453), skip→mark 27% (1,959), mark→skip 22%
+(1,592), mark→strike 2% (134).** Search marks slightly more than static skips
+(search marks 5,600 vs static 5,179; search skips 1,592 vs static 1,959), but
+there is no clean "search is bolder/more conservative" axis. Within confirmed
+mark→mark, the row-transition matrix is essentially uniform off-diagonal (every
+row pair ~260–360 events) and the **jump-size shift is symmetric: mean +0.005,
+median 0, std 0.80, |shift|>0 only 31% of the time.** Search is not
+systematically taking shorter or longer jumps — it is re-picking among nearly
+equivalent marks.
+
+### Decision tree and importances: it's all `static_gap`
+
+A depth-3 balanced tree predicting `search_right` over all relabeled events
+scores 0.685 held-out (base rate 0.796 — barely above majority-class). The only
+feature with meaningful permutation importance is **`static_gap` (0.162)**;
+everything else is ≤0.012 (`cdiff` 0.012, `static_jump` 0.010, all board/move
+features 0.000). `export_text` rounds the splits; the true thresholds are
+`static_gap <= 0.0741` (root), then `<= 0.0000` and `<= 0.0348`. The tree says
+`search_right` is most likely in a **low-but-nonzero static_gap band
+(0 < gap ≲ 0.074)** — i.e. exactly where the static net is nearly indifferent
+between its top two candidates. That is the diffuse-tie-breaking story restated,
+not a board feature. (`our_locked` and `opp_locked` are byte-identical in this
+data too — confirmed equal on all 191,749 rows — so they are one feature, not
+two, and neither carries signal.)
+
+### Candidate rule, tuned held-in (games < 5000) and reported held-out (≥ 5000)
+
+The only rule the data suggests is "trust search when the static top-2 gap is
+small." Best variant, **`0 < static_gap ≤ 0.074`**, held-out:
+
+- **Coverage** (of confirmed disagreements matched): 86.5%
+- **Precision** (rule-matched disagreements where search is confirmed): **53.8%**
+- **False-fire** (rule-matched relabeled agreements that aren't "keep"): 12.4%
+- **Estimated value** (Σ|hk_gap_mean| over rule-matched confirmed disagreements
+  / 10,000 games): **+0.0072 win-prob points/game**
+
+Tightening to `≤ 0.035` lifts precision only to 55.3% while coverage drops to
+70% and false-fire climbs to 21.4%. Even **"adopt search on every
+disagreement"** has precision just 39.5% and a net realized value of **+0.0072
+wpp/game** (sign-checked: Σ of signed hk_gap over all disagreements, oriented to
+search's pick / 10,000). The upper bound — Σ|hk| over confirmed only — is
+**+0.0085 wpp/game**.
+
+### Two estimator caveats
+
+(a) The K=2048 relabel reuses CRN samples 0..128 — the very draws that
+determined the original static-vs-search pick — inside the K=2048 estimate.
+Conditioning on the selection boundary biases the estimate toward the
+originally-chosen side: **conservative for "flip" verdicts** (a confirmed flip
+had to overcome its own initial-sample headwind, so the true flip rate is if
+anything higher) and **mildly anti-conservative for "keep"** (keeps are partly
+self-fulfilling). (b) `hk_gap_se==0` rows are **deterministic** outcomes — both
+rollout entries are already game-over, so the gap is exact-zero, not a
+high-confidence stochastic near-zero. All 4,918 such disagreements are
+coinflips and should be read as true ties, not confident calls.
+
+### Example positions (abridged, top |z|)
+
+The highest-|z| disagreements illustrate the tie-breaking character:
+
+- **game 8738 t5** (flip, z=+420): static skips (v=−0.205); search marks **R11**
+  (v=−0.217). Two essentially co-valued options; rollouts confirm the mark by a
+  hair (hk_gap +0.176).
+- **game 84 t8** (flip, z=+65): static marks R11 (v=+3.43), search marks **Y11**
+  (v=+2.69) — both strong marks one number apart; search prefers the lower-row
+  number. A within-mark re-pick, not a skip-vs-mark blunder.
+- **game 161 t8** (flip, z=+90): static marks R12 to lock-pace (v=+0.293),
+  search **skips** (v=−0.066) with a row already locked and the opponent far
+  ahead on R — the rare endgame case with a coherent "don't commit" story, but
+  it is one position among ~7,300 confirmed and does not generalize into the
+  stats.
+
+The top examples are dominated by low-gap re-picks between adjacent or
+co-valued marks, matching the `static_gap` tree split and the symmetric
+transition/jump statistics — there is no recurring human-legible board motif.
+
+### Verdict: NO-GO on encoding a meta-rule
+
+The numbers do not support a static-speed meta-rule:
+
+1. **Half of all disagreements are coinflips even at K=2048** (and 26.4% are
+   provably exact ties), so search's measured +2.3–2.5% cannot be a handful of
+   board-pattern fixes — it is a diffuse reduction of decision-sampling noise
+   spread across thousands of near-ties.
+2. **The only predictive feature is `static_gap`** — a statement about the net's
+   own indifference, not an encodable board condition. A `static_gap` threshold
+   *is* what the close gate already implements; there is nothing new to teach.
+3. **The best held-out rule peaks at 53.8% precision** (barely above a coin) with
+   a net value ceiling of **~+0.007–0.009 win-prob points/game**. Even adopting
+   search on every disagreement nets only +0.0072 wpp/game of the +2.3–2.5%
+   head-to-head edge — confirming the bulk of search's advantage lives in the
+   coinflip mass that no rule can adjudicate, and is consistent with Phase 13's
+   "sample-noise-bound" conclusion and Phase 14's dilution finding.
+
+A humanly-encodable rule that hands the static bot part of search's edge does
+not exist in this data. The realized override value is symmetric, gap-driven,
+and concentrated in genuine ties.
+
+**Next steps.** No Rust meta-rule. The remaining lever consistent with the
+diffuse-tie picture is the unstruck Phase 14 rung — **search-value
+distillation** (regress V toward rollout-mean outcomes at searched decisions),
+which targets the *value calibration* that produces these near-ties rather than
+trying to name them. The structural-ceiling hypothesis (shared-dice luck
+dominating beyond ~60–62%) again survives: search wins by sampling, not by
+knowing something nameable that the net doesn't.
