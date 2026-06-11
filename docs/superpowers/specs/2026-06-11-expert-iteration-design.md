@@ -56,8 +56,14 @@ documented run recipe:
 
 ```bash
 rm -f pair_model/iter-*.mpk     # clear stale checkpoints from the previous run
-cargo run --release -- pair-train --search -g 5000 -e 5 -b 100000 -c --start-iteration 20
+cargo run --release -- pair-train --search -g 5000 -e 5 -b 500000 -c --start-iteration 20
 ```
+
+The per-iteration benchmark runs at **500k games** (paired SE ≈ 0.05%): the expected
+per-iteration improvement is small, and the static bench is cheap (~2 min at static
+speed), so we buy the precision to see it. **The full training run is executed by
+the user on a separate machine** — the implementation work ends at the smoke test;
+the run recipe above is the handoff.
 
 - Trains **in place** on `pair_model/` — warm start is automatic (the loop loads
   `pair_model/model` if present); the git-committed `model.mpk` is the recovery
@@ -101,9 +107,11 @@ drift vs burn is acceptable here (targets are estimates by definition).
 
 ### Benchmarks, success, failure
 
-- **Per-iteration:** existing static `benchmark_vs_ga` (100k, fixed `BENCH_SEED`
-  set) — the primary curve, directly comparable to the previous run's history
-  (old peak: 59.02% at iteration 19).
+- **Per-iteration:** existing static `benchmark_vs_ga` (500k, fixed `BENCH_SEED`
+  set, paired SE ≈ 0.05%) — the primary curve. Comparable to the previous run's
+  history (old peak: 59.02% at iteration 19, measured at 100k — re-baseline the
+  current model at 500k in iteration "0" terms by reading the warm-start model's
+  first benchmark).
 - **Success:** the static curve exceeds the old peak by ≥ +0.5% at some checkpoint.
   Selection by best static winrate; confirm the chosen checkpoint on the seed-42
   CLI set (baseline 59.2%), then run the search-on acceptance benches on it
