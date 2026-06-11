@@ -733,3 +733,24 @@ optimization deferred until it is needed.
 The decisive takeaway: search now **demonstrably beats static play**, which
 justifies the next escalation — **expert iteration**, training the net on
 search-improved play.
+
+### Search-budget scan (post-perf-pass)
+
+After the 2.6x perf pass (single-threaded matmul + mimalloc; see the perf
+commit), a budget scan over the search constants, 50k-game margins vs the
+static pair bot on seed 42 (seed 7 confirmations in parentheses):
+
+| Config | Margin | Verdict |
+|--------|--------|---------|
+| K_SAMPLES=64, 1 round, 2 cands (baseline) | +1.71% (+1.57%) | — |
+| HORIZON_ROUNDS=2 | +1.33% | worse — greedy-rollout noise compounds faster than the bootstrap improves |
+| K_CANDIDATES=3 | +1.67% | neutral — there are rarely more than 2 good moves |
+| **K_SAMPLES=128** | **+2.50% (+2.16%)** | **adopted** |
+| K_SAMPLES=256 | +2.79% | past the knee — +0.3% for 2x cost |
+
+Search quality is sample-noise-bound, not depth- or width-bound: gates fire at
+close decisions where candidate values differ by a hair, so resolution is what
+pays. With K_SAMPLES=128, **pair-search vs GA reaches 60.09% (99% CI
+59.58–60.60)** — the first bot over 60% under the corrected rules, entering
+the hypothesized 60–62% structural-ceiling zone. Head-to-head cost ~41 games/s
+on 8 cores.
