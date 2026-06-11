@@ -12,3 +12,5 @@ web/node_modules/
 web/dist/
 web/.vite
 
+*.jsonl
+analysis/.venv/

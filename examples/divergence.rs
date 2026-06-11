@@ -205,6 +205,234 @@ fn refuse_overwrite(path: &str, force: bool) {
     }
 }
 
+// ---- Shadow strategy: plays static, logs what search would have done ----
+
+struct ShadowPair {
+    static_bot: PairStrategy,
+    search: SearchBot<PairStrategy>,
+    events: Rc<RefCell<Vec<DecisionEvent>>>,
+    turn: u32,
+}
+
+impl std::fmt::Debug for ShadowPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "ShadowPair")
+    }
+}
+
+impl ShadowPair {
+    fn new(template: &PairStrategy, events: Rc<RefCell<Vec<DecisionEvent>>>) -> Self {
+        let mut search = SearchBot::new(PairStrategy::from_shared(template.model.clone(), template.device));
+        search.force = true;
+        ShadowPair {
+            static_bot: PairStrategy::from_shared(template.model.clone(), template.device),
+            search,
+            events,
+            turn: 0,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn log(
+        &self,
+        phase: u8,
+        has_marked: Option<bool>,
+        state: &State,
+        opps: &[State],
+        dice: [u8; 6],
+        cands: &[Cand],
+        static_mark: Option<Mark>,
+        search_mark: Option<Mark>,
+    ) {
+        let find = |m: Option<Mark>, what: &str| {
+            cands
+                .iter()
+                .position(|c| c.mark == m)
+                .unwrap_or_else(|| panic!("{what} move {m:?} not among candidates — shadow/SearchBot drift"))
+        };
+        let static_pick = find(static_mark, "static");
+        let search_pick = find(search_mark, "search");
+        let (close, endgame) = gate_flags(cands, state, opps);
+        self.events.borrow_mut().push(DecisionEvent {
+            t: "d".into(),
+            game: 0, // stamped by the driver after the game
+            turn: self.turn,
+            phase,
+            has_marked,
+            dice,
+            our: StateJson::of(state),
+            opps: opps.iter().map(StateJson::of).collect(),
+            gate_close: close,
+            gate_endgame: endgame,
+            static_gap: cands[0].value - cands[1].value,
+            our_points: state.count_points(),
+            opp_points: opps.iter().map(|s| s.count_points()).max().unwrap(),
+            cands: cands
+                .iter()
+                .map(|c| CandJson {
+                    mark: mark_json(c.mark),
+                    v: c.value,
+                })
+                .collect(),
+            static_pick,
+            search_mark: mark_json(search_mark),
+            search_pick,
+            seed: context_seed(state, opps, dice),
+            disagree: search_pick != static_pick,
+        });
+    }
+}
+
+impl Strategy for ShadowPair {
+    fn active_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+        self.turn += 1;
+        let (decision, sim_opp) = active_phase1_choices(&self.static_bot, state, opp_states, dice);
+        let plans = match decision {
+            Decision::Forced(m) => return m,
+            Decision::Choices(c) => c,
+        };
+        let states: Vec<State> = plans.iter().map(|(_, s)| *s).collect();
+        let values = self.static_bot.evaluate_batch(&states, &sim_opp);
+        // Production-identical static play: eval_decision == argmax over plans.
+        let static_mark = plans[argmax(&values)].0;
+        let cands = collapse_plans(&plans, &values);
+        if cands.len() < 2 || opp_states.is_empty() {
+            return static_mark;
+        }
+        let search_mark = self.search.active_phase1(state, opp_states, dice);
+        self.log(1, None, state, opp_states, dice, &cands, static_mark, search_mark);
+        static_mark
+    }
+
+    fn active_phase2(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Option<Mark> {
+        let choices = match active_phase2_choices(state, opp_states, dice, has_marked) {
+            Decision::Forced(m) => return m,
+            Decision::Choices(c) => c,
+        };
+        let states: Vec<State> = choices.iter().map(|(_, s)| *s).collect();
+        let values = self.static_bot.evaluate_batch(&states, opp_states);
+        let static_mark = choices[argmax(&values)].0;
+        let mut cands: Vec<Cand> = choices
+            .iter()
+            .zip(&values)
+            .map(|((m, s), &v)| Cand {
+                mark: *m,
+                value: v,
+                post: *s,
+            })
+            .collect();
+        cands.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap());
+        if cands.len() < 2 || opp_states.is_empty() {
+            return static_mark;
+        }
+        let search_mark = self.search.active_phase2(state, opp_states, dice, has_marked);
+        self.log(2, Some(has_marked), state, opp_states, dice, &cands, static_mark, search_mark);
+        static_mark
+    }
+
+    fn passive_phase1(
+        &mut self,
+        state: &State,
+        opp_states: &[State],
+        dice: [u8; 6],
+        active_player: usize,
+    ) -> Option<Mark> {
+        // Search never applies passively; static pass-through.
+        self.static_bot.passive_phase1(state, opp_states, dice, active_player)
+    }
+}
+
+// ---- run mode ----
+
+fn play_one(pair_template: &PairStrategy, champion: &DNA, game_idx: usize, base_seed: u64) -> (GameEvent, Vec<DecisionEvent>) {
+    let pairing = game_idx / 2;
+    let rotation = game_idx % 2;
+    // Mirrors run_bench: seat j hosts bot (j + 2 - rotation) % 2, bots = [GA, PAIR].
+    let pair_seat = (1 + rotation) % 2;
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let players: Vec<Player> = (0..2)
+        .map(|j| {
+            let dice = Box::new(SmallRng::seed_from_u64(seat_dice_seed(base_seed, pairing, j)));
+            let strategy: Box<dyn Strategy> = if j == pair_seat {
+                Box::new(ShadowPair::new(pair_template, events.clone()))
+            } else {
+                Box::new(champion.clone())
+            };
+            Player::new(strategy, dice)
+        })
+        .collect();
+    let mut game = Game::new(players);
+    game.play();
+    let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+    drop(game); // release the ShadowPair's Rc clone
+    let max = *scores.iter().max().unwrap();
+    let unique_winner = scores.iter().filter(|&&s| s == max).count() == 1;
+    let mut evs = Rc::try_unwrap(events)
+        .unwrap_or_else(|_| panic!("events Rc still shared"))
+        .into_inner();
+    for e in &mut evs {
+        e.game = game_idx;
+    }
+    let pair_won = scores[pair_seat] == max && unique_winner;
+    (
+        GameEvent {
+            t: "g".into(),
+            game: game_idx,
+            pair_seat,
+            scores,
+            pair_won,
+        },
+        evs,
+    )
+}
+
+fn cmd_run(n: usize, seed: u64, out: &str) {
+    use rayon::prelude::*;
+    let num_games = n.div_ceil(2) * 2;
+    eprintln!("divergence run: {num_games} games, seed {seed} -> {out}");
+    let results: Vec<(GameEvent, Vec<DecisionEvent>)> = (0..num_games)
+        .into_par_iter()
+        .map_init(
+            || {
+                (
+                    PairStrategy::load("pair_model"),
+                    DNA::load_weights("champion.txt", Arc::new(default_genes()))
+                        .expect("champion.txt missing — run `train ga` first"),
+                )
+            },
+            |(pair, champ), i| play_one(pair, champ, i, seed),
+        )
+        .collect();
+
+    let mut f = std::io::BufWriter::new(std::fs::File::create(out).unwrap());
+    for (g, evs) in &results {
+        for e in evs {
+            writeln!(f, "{}", serde_json::to_string(e).unwrap()).unwrap();
+        }
+        writeln!(f, "{}", serde_json::to_string(g).unwrap()).unwrap();
+    }
+    f.flush().unwrap();
+
+    let all: Vec<&DecisionEvent> = results.iter().flat_map(|(_, e)| e).collect();
+    let eligible = all.len();
+    let gated = all.iter().filter(|e| e.gate_close || e.gate_endgame).count();
+    let close = all.iter().filter(|e| e.gate_close).count();
+    let dis = all.iter().filter(|e| e.disagree).count();
+    let dis_gated = all.iter().filter(|e| e.disagree && (e.gate_close || e.gate_endgame)).count();
+    let wins = results.iter().filter(|(g, _)| g.pair_won).count();
+    println!("{num_games} games ({:.1}% pair wins), {eligible} eligible decisions", wins as f64 / num_games as f64 * 100.0);
+    println!(
+        "gates: close {:.1}%, any {:.1}% of eligible",
+        close as f64 / eligible as f64 * 100.0,
+        gated as f64 / eligible as f64 * 100.0
+    );
+    println!(
+        "disagreements: {dis} ({:.2}% of eligible, {:.2}% of gate-fired; {dis_gated} inside gates)",
+        dis as f64 / eligible as f64 * 100.0,
+        dis as f64 / gated as f64 * 100.0
+    );
+}
+
 fn main() {
     match Cli::parse().cmd {
         Cmd::Run {
@@ -214,7 +442,7 @@ fn main() {
             force_overwrite,
         } => {
             refuse_overwrite(&out, force_overwrite);
-            todo!("run mode (Task 3)");
+            cmd_run(n, seed, &out);
         }
         Cmd::Relabel {
             input,
