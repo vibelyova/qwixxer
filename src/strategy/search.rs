@@ -14,7 +14,7 @@ use rand::SeedableRng;
 /// Candidates searched per decision (top by static value).
 pub const K_CANDIDATES: usize = 2;
 /// Sampled futures per candidate (CRN: dice shared across candidates).
-pub const K_SAMPLES: usize = 64;
+pub const K_SAMPLES: usize = 128;
 /// Top-2 static value gap (bot's evaluate units) below which search triggers.
 pub const GATE_MARGIN: f32 = 0.15;
 /// Full turns simulated after completing the current turn, as a multiple of
