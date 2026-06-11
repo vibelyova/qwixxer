@@ -256,6 +256,14 @@ head-to-head vs the static pair bot +1.6-1.7% win margin, replicated on two
 seeds. Cost: ~100x the static bot (~27 games/s on 8 cores); optimization
 deferred until needed (see EXPERIMENTS.md Phase 13).
 
+**Expert iteration** (`pair-train --search`): training games are generated with
+the search bot as every player's policy (the e-coin fires before search, so
+exploring moves skip it); recording, TD targets, and losses are unchanged — the
+net distills search-improved trajectories. Recommended run (executed on a
+dedicated machine): 5k games/iter, 5 epochs, 500k-game per-iteration static
+benchmark (the primary metric; paired SE ~0.05%). Design doc:
+docs/superpowers/specs/2026-06-11-expert-iteration-design.md.
+
 ### Monte Carlo Tree Search (`mcts.rs`)
 
 **`MonteCarlo`** runs `N` rollout simulations per candidate move (default 500). For each move:

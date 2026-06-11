@@ -29,6 +29,7 @@ cargo run --release -- dqn-selfplay -i 40 -b 100000  # Self-play RL (40 iters, 1
 
 # Train the pair network (experimental)
 cargo run --release -- pair-train -i 40 -b 100000 -c   # Train the pair network
+cargo run --release -- pair-train --search -g 5000 -e 5 -b 500000 -c --start-iteration 20   # Expert iteration
 cargo run --release -- bench pair dqn -n 100000        # Head-to-head vs old DQN
 ```
 

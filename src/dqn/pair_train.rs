@@ -533,7 +533,10 @@ pub fn self_play_train(
         });
 
     if search {
-        println!("Expert iteration: generation uses the search bot (K=128) for all players");
+        println!(
+            "Expert iteration: generation uses the search bot (K={}) for all players",
+            crate::strategy::search::K_SAMPLES
+        );
     }
 
     for iteration in 0..num_iterations {

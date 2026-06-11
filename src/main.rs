@@ -203,6 +203,10 @@ enum Commands {
         /// Starting iteration offset (for epsilon schedule when resuming)
         #[arg(long, default_value = "0")]
         start_iteration: usize,
+        /// Generate games with the search bot as every player's policy
+        /// (expert iteration)
+        #[arg(long)]
+        search: bool,
     },
 }
 
@@ -599,6 +603,7 @@ fn main() {
             bench,
             checkpoints,
             start_iteration,
+            search,
         }) => dqn::pair_train::self_play_train(
             "pair_model",
             iterations,
@@ -607,7 +612,7 @@ fn main() {
             bench,
             checkpoints,
             start_iteration,
-            false,
+            search,
         ),
         None => {
             // Default: play against MCTS
