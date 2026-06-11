@@ -433,6 +433,314 @@ fn cmd_run(n: usize, seed: u64, out: &str) {
     );
 }
 
+// ---- relabel mode ----
+
+/// Deterministic completion of our phase-1 turn per shortlisted candidate.
+/// Mirrors the entries closure in SearchBot::active_phase1.
+fn phase1_entries(
+    bot: &PairStrategy,
+    state: &State,
+    sim_opp: &[State],
+    dice: [u8; 6],
+    shortlist: &[Cand],
+) -> Vec<(Vec<State>, bool)> {
+    shortlist
+        .iter()
+        .map(|c| {
+            let mut our = *state;
+            if let Some(m) = c.mark {
+                our.apply_mark(m);
+            }
+            let mut all: Vec<State> = std::iter::once(our).chain(sim_opp.iter().copied()).collect();
+            SimGame::propagate_locks(&mut all);
+            if SimGame::game_over(&all) {
+                return (all, true);
+            }
+            let view = SimGame::opp_view(&all, 0);
+            let d = active_phase2_choices(&all[0], &view, dice, c.mark.is_some());
+            match eval_decision(bot, d, &view) {
+                Some(m) => all[0].apply_mark(m),
+                None if c.mark.is_none() => all[0].apply_strike(),
+                None => {}
+            }
+            SimGame::propagate_locks(&mut all);
+            let ended = SimGame::game_over(&all);
+            (all, ended)
+        })
+        .collect()
+}
+
+/// Mirrors the entries closure in SearchBot::active_phase2.
+fn phase2_entries(opps: &[State], shortlist: &[Cand]) -> Vec<(Vec<State>, bool)> {
+    shortlist
+        .iter()
+        .map(|c| {
+            let mut all: Vec<State> = std::iter::once(c.post).chain(opps.iter().copied()).collect();
+            SimGame::propagate_locks(&mut all);
+            let ended = SimGame::game_over(&all);
+            (all, ended)
+        })
+        .collect()
+}
+
+/// Per-entry rollout scores, one per sample (ended entries: one deterministic
+/// outcome). Mirrors SearchBot::search_pick but keeps per-sample values and
+/// takes K as a parameter. CRN streams extend production's: samples
+/// 0..K_SAMPLES are bit-identical to what search saw at collection time.
+fn rollout_scores(bot: &PairStrategy, entries: &[(Vec<State>, bool)], seed: u64, k: usize) -> Vec<Vec<f32>> {
+    let n = entries[0].0.len();
+    let mut sims: Vec<SimGame> = Vec::new();
+    let mut sim_owner: Vec<usize> = Vec::new();
+    for (ei, (states, ended)) in entries.iter().enumerate() {
+        if *ended {
+            continue;
+        }
+        for s in 0..k {
+            sims.push(SimGame {
+                states: states.clone(),
+                active: 1 % n,
+                rngs: (0..n)
+                    .map(|p| SmallRng::seed_from_u64(sample_player_seed(seed, s, p)))
+                    .collect(),
+                over: false,
+            });
+            sim_owner.push(ei);
+        }
+    }
+    let mut driver = BatchedRollouts::new(bot, sims);
+    for _ in 0..(HORIZON_ROUNDS * n) {
+        if driver.all_over() {
+            break;
+        }
+        driver.step_turn();
+    }
+    let survivor_idx: Vec<usize> = (0..driver.sims.len()).filter(|&i| !driver.sims[i].over).collect();
+    let survivor_views: Vec<Vec<State>> = survivor_idx
+        .iter()
+        .map(|&i| SimGame::opp_view(&driver.sims[i].states, 0))
+        .collect();
+    let groups: Vec<(&State, &[State])> = survivor_idx
+        .iter()
+        .zip(&survivor_views)
+        .map(|(&i, v)| (&driver.sims[i].states[0], v.as_slice()))
+        .collect();
+    let probs = bot.win_prob_multi(&groups);
+    let mut prob_iter = probs.into_iter();
+    let mut out: Vec<Vec<f32>> = entries
+        .iter()
+        .map(|(states, ended)| {
+            if *ended {
+                vec![SimGame::outcome(states)]
+            } else {
+                Vec::with_capacity(k)
+            }
+        })
+        .collect();
+    for (i, sim) in driver.sims.iter().enumerate() {
+        let p = if sim.over {
+            SimGame::outcome(&sim.states)
+        } else {
+            prob_iter.next().unwrap()
+        };
+        out[sim_owner[i]].push(p);
+    }
+    out
+}
+
+/// Production pick semantics: highest mean wins, ties keep the lower index.
+/// `limit` truncates each entry's samples (sum order matches production, so
+/// limit = K_SAMPLES reproduces the collection-time pick bit-for-bit).
+fn pick_by_mean(per_sample: &[Vec<f32>], limit: usize) -> usize {
+    let mean = |v: &Vec<f32>| {
+        let m = v.len().min(limit);
+        v[..m].iter().sum::<f32>() / m as f32
+    };
+    let mut best = 0;
+    let mut best_score = mean(&per_sample[0]);
+    for (ei, v) in per_sample.iter().enumerate().skip(1) {
+        let s = mean(v);
+        if s > best_score {
+            best = ei;
+            best_score = s;
+        }
+    }
+    best
+}
+
+/// Paired (mean, SE) of b − a; a length-1 side broadcasts (ended entry's
+/// deterministic outcome). n == 1 → SE 0.
+fn paired_stats(a: &[f32], b: &[f32]) -> (f32, f32) {
+    let n = a.len().max(b.len());
+    let get = |v: &[f32], i: usize| (if v.len() == 1 { v[0] } else { v[i] }) as f64;
+    let diffs: Vec<f64> = (0..n).map(|i| get(b, i) - get(a, i)).collect();
+    let mean = diffs.iter().sum::<f64>() / n as f64;
+    if n == 1 {
+        return (mean as f32, 0.0);
+    }
+    let var = diffs.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0);
+    (mean as f32, (var / n as f64).sqrt() as f32)
+}
+
+struct HighK {
+    scores: (f32, f32),
+    gap_mean: f32,
+    gap_se: f32,
+    verdict: &'static str,
+}
+
+/// Rebuild the logged decision, run high-K rollouts, verdict on cand1 vs
+/// cand0. Hard-fails on any drift from the collection run.
+fn relabel_event(ev: &DecisionEvent, bot: &PairStrategy, k: usize, lineno: usize) -> HighK {
+    let our = ev.our.to_state();
+    let opps: Vec<State> = ev.opps.iter().map(|o| o.to_state()).collect();
+    let seed = context_seed(&our, &opps, ev.dice);
+    assert_eq!(seed, ev.seed, "line {lineno}: context seed mismatch — schema/serialization drift");
+
+    let (cands, entries) = match ev.phase {
+        1 => {
+            let (decision, sim_opp) = active_phase1_choices(bot, &our, &opps, ev.dice);
+            let plans = match decision {
+                Decision::Choices(c) => c,
+                Decision::Forced(_) => panic!("line {lineno}: logged decision is now meta-forced — drift"),
+            };
+            let states: Vec<State> = plans.iter().map(|(_, s)| *s).collect();
+            let values = bot.evaluate_batch(&states, &sim_opp);
+            let cands = collapse_plans(&plans, &values);
+            let entries = phase1_entries(bot, &our, &sim_opp, ev.dice, &cands[..cands.len().min(K_CANDIDATES)]);
+            (cands, entries)
+        }
+        2 => {
+            let choices = match active_phase2_choices(&our, &opps, ev.dice, ev.has_marked.unwrap()) {
+                Decision::Choices(c) => c,
+                Decision::Forced(_) => panic!("line {lineno}: logged decision is now meta-forced — drift"),
+            };
+            let states: Vec<State> = choices.iter().map(|(_, s)| *s).collect();
+            let values = bot.evaluate_batch(&states, &opps);
+            let mut cands: Vec<Cand> = choices
+                .iter()
+                .zip(&values)
+                .map(|((m, s), &v)| Cand {
+                    mark: *m,
+                    value: v,
+                    post: *s,
+                })
+                .collect();
+            cands.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap());
+            let entries = phase2_entries(&opps, &cands[..cands.len().min(K_CANDIDATES)]);
+            (cands, entries)
+        }
+        p => panic!("line {lineno}: bad phase {p}"),
+    };
+
+    // Guard: rebuilt candidates must match the log.
+    assert_eq!(cands.len(), ev.cands.len(), "line {lineno}: candidate count drift");
+    for (c, l) in cands.iter().zip(&ev.cands) {
+        assert_eq!(mark_json(c.mark), l.mark, "line {lineno}: candidate order drift");
+        assert!((c.value - l.v).abs() < 1e-4, "line {lineno}: static value drift");
+    }
+
+    let per_sample = rollout_scores(bot, &entries, seed, k);
+
+    // Guard: first K_SAMPLES samples must reproduce the logged search pick.
+    let pick128 = pick_by_mean(&per_sample, K_SAMPLES);
+    assert_eq!(
+        mark_json(cands[pick128].mark),
+        ev.search_mark,
+        "line {lineno}: K=128 pick not reproduced — search.rs/example drift"
+    );
+
+    let full = |v: &Vec<f32>| v.iter().sum::<f32>() / v.len() as f32;
+    let (gap, se) = paired_stats(&per_sample[0], &per_sample[1]);
+    let z = if se > 0.0 {
+        gap / se
+    } else {
+        match gap.partial_cmp(&0.0).unwrap() {
+            std::cmp::Ordering::Greater => f32::INFINITY,
+            std::cmp::Ordering::Less => f32::NEG_INFINITY,
+            std::cmp::Ordering::Equal => 0.0,
+        }
+    };
+    // flip: cands[1] confidently better than cands[0]; keep: the reverse.
+    // (search_right in Python: flip & search_pick==1, or keep & search_pick==0.)
+    let verdict = if z > 2.0 {
+        "flip"
+    } else if z < -2.0 {
+        "keep"
+    } else {
+        "coinflip"
+    };
+    HighK {
+        scores: (full(&per_sample[0]), full(&per_sample[1])),
+        gap_mean: gap,
+        gap_se: se,
+        verdict,
+    }
+}
+
+fn cmd_relabel(input: &str, out: &str, k: usize, agree_sample: f64, seed: u64) {
+    use rayon::prelude::*;
+    assert!(k >= K_SAMPLES, "-k must be >= {K_SAMPLES} (pick-reproduction guard needs the first {K_SAMPLES} samples)");
+    let text = std::fs::read_to_string(input).expect("cannot read input");
+    let lines: Vec<&str> = text.lines().collect();
+
+    // Sequential selection pass (deterministic given the file + seed).
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let parsed: Vec<(usize, Option<DecisionEvent>, bool)> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let v: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("line {}: bad JSON: {e}", i + 1));
+            if v["t"] != "d" {
+                return (i, None, false);
+            }
+            let ev: DecisionEvent =
+                serde_json::from_value(v).unwrap_or_else(|e| panic!("line {}: bad event: {e}", i + 1));
+            let selected = ev.disagree || rng.gen_bool(agree_sample);
+            (i, Some(ev), selected)
+        })
+        .collect();
+
+    let todo: Vec<(usize, &DecisionEvent)> = parsed
+        .iter()
+        .filter_map(|(i, ev, sel)| ev.as_ref().filter(|_| *sel).map(|e| (*i, e)))
+        .collect();
+    eprintln!(
+        "relabeling {} of {} events at K={k}",
+        todo.len(),
+        parsed.iter().filter(|(_, e, _)| e.is_some()).count()
+    );
+
+    let results: Vec<(usize, HighK)> = todo
+        .par_iter()
+        .map_init(
+            || PairStrategy::load("pair_model"),
+            |bot, (i, ev)| (*i, relabel_event(ev, bot, k, *i + 1)),
+        )
+        .collect();
+    let by_line: std::collections::HashMap<usize, HighK> = results.into_iter().collect();
+
+    let mut f = std::io::BufWriter::new(std::fs::File::create(out).unwrap());
+    let mut counts = std::collections::HashMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        match by_line.get(&i) {
+            None => writeln!(f, "{line}").unwrap(),
+            Some(hk) => {
+                let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+                v["hk_k"] = k.into();
+                v["hk_scores"] = serde_json::json!([hk.scores.0, hk.scores.1]);
+                v["hk_gap_mean"] = hk.gap_mean.into();
+                v["hk_gap_se"] = hk.gap_se.into();
+                v["verdict"] = hk.verdict.into();
+                writeln!(f, "{}", serde_json::to_string(&v).unwrap()).unwrap();
+                *counts.entry(hk.verdict).or_insert(0u32) += 1;
+            }
+        }
+    }
+    f.flush().unwrap();
+    println!("verdicts: {counts:?}");
+}
+
 fn main() {
     match Cli::parse().cmd {
         Cmd::Run {
@@ -453,7 +761,7 @@ fn main() {
             force_overwrite,
         } => {
             refuse_overwrite(&out, force_overwrite);
-            todo!("relabel mode (Task 4)");
+            cmd_relabel(&input, &out, k, agree_sample, seed);
         }
     }
 }
