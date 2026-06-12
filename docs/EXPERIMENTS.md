@@ -980,3 +980,188 @@ which targets the *value calibration* that produces these near-ties rather than
 trying to name them. The structural-ceiling hypothesis (shared-dice luck
 dominating beyond ~60–62%) again survives: search wins by sampling, not by
 knowing something nameable that the net doesn't.
+
+## Phase 16: Safe-Lock Adjudication (when is the "always force a safe lock" meta-rule wrong?)
+
+The `find_safe_lock` meta-rule forces a non-game-ending lock whenever one is
+available — a hard, unconditional override sitting in front of the value net.
+Phase 15 showed search's edge is diffuse and unnameable; this phase asks the
+inverse for an *existing* named rule: on production trajectories, how often does
+forcing the safe lock cost win-probability, and is the failure mode crisp enough
+to gate the rule on a board feature?
+
+### Setup
+
+Shadow collection on **10,000 games of static-PAIR vs GA**, rotating seats,
+paired dice, seed 0, **rule ON** (the bot plays exactly as in production). On
+the static bot's own trajectory, every time `find_safe_lock` fired we logged the
+forced lock, the full candidate list with static `v`, and the picked
+alternative/runner-up indices (force detection + value-equivalence guards decide
+whether the rule actually changed the move; equivalence-tie firings are kept).
+Each event was then **rebuilt rule-free** and adjudicated with **K=2048
+FULL-GAME CRN-paired rollouts** (no truncation, no win-prob bootstrap — terminal
+outcomes only) comparing the forced lock against the best non-lock alternative
+(and, when present, the runner-up lock as `alt2`). The reported quantity is
+**gap = alternative − lock in win-probability units** (positive ⇒ the rule is
+wrong); verdicts at |z|>2. Files (git-ignored): `lock-events.jsonl` 3.0 MB /
+15,472 lines (5,472 events + 10,000 game records), collected in **0.7 s**;
+`lock-events.adj.jsonl` adjudicated in **3 m 20 s** wall / 25 m user, **zero
+drift-guard panics**.
+
+### Firing statistics
+
+`find_safe_lock` fired on **5,535 total decisions; 63 (1.1%) were skipped**
+(lock_pruned 58, forced_lock_itself 3, lt2_cands 2), leaving **5,472 adjudicated
+events = 0.55/game**. Context split: **ap2 3,180 / pp1 1,205 / ap1 1,087**
+(ap = our active-player mark, pp = passive/white-die mark). Multi-lock states
+(a runner-up lock present): **365**. `rule_free_forced` (the rule-free rebuild
+still independently picks the lock): only **4** — i.e. the rule is genuinely
+overriding the net almost every time.
+
+**Structural fact: `locks_on_board == 0` for all 5,472 events.** Safe locks are
+by construction the *first* lock of the game — any *second* lock would end the
+game and so is never a "safe" (non-terminal) lock. This means the whole dataset
+is "first lock now vs. don't," never "stack a second lock."
+
+### Verdict split
+
+Best-non-lock alternative (alternative − lock):
+
+| verdict | n | share |
+|---|---|---|
+| lock_right | 4,683 | 85.6% |
+| coinflip | 305 | 5.6% |
+| **lock_wrong** | **484** | **8.8%** |
+
+Effect-size-floored (|gap| ≥ 0.02 wp): **lock_wrong 438** (46 negligible-gap
+events dropped). Per context the wrong rate is wildly uneven: **ap1 231/1,087 =
+21.3%**, **pp1 169/1,205 = 14.0%**, **ap2 84/3,180 = 2.6%** — ap2 (the larger,
+"mark the active-roll number" context) is where the rule is almost always right.
+
+Gap-magnitude distributions (|gap| wp): lock_wrong (n=484) median **0.102**, p90
+0.41, p99 0.63, max 0.81; lock_right (n=4,683) median **0.157**, p90 0.39, p99
+0.77, max 1.0. **Both directions carry large gaps** — when the rule is right it
+is often very right, and when wrong it is sometimes catastrophically wrong, so
+this is not a "tiny-margin" rule like Phase 15's coinflips.
+
+Determinism diagnostics: 96 events have `alt_gap_se == 0` (both arms terminate
+deterministically — exact outcomes); 91 lock_wrong events have se < 0.005. These
+low-variance wrongs are treated separately and are not z-inflation artifacts.
+
+Runner-up lock (`alt2`, the "did the rule pick the *wrong lock*?" check, 365
+multi-lock events): **lock_right 169 / coinflip 119 / lock_wrong 77** — so even
+when forcing a lock is correct, the rule picks a sub-optimal lock about 1 time in
+5 among multi-lock states.
+
+### The signal: game-shortening when behind
+
+The wrong-verdict rate is governed almost entirely by the score margin
+`cdiff = our_points − opp_points` at the decision:
+
+| cdiff bin | n | lock_right | coinflip | **lock_wrong** |
+|---|---|---|---|---|
+| ≤ −10 (far behind) | 913 | 71.3% | 7.4% | **21.2%** |
+| −9 .. −1 (behind) | 1,498 | 77.2% | 6.9% | **16.0%** |
+| 0 (tied) | 219 | 84.0% | 9.6% | **6.4%** |
+| 1 .. 9 (ahead) | 1,620 | 94.0% | 3.9% | **2.2%** |
+| ≥ +10 (far ahead) | 1,222 | 95.7% | 4.1% | **0.16%** |
+
+The knee is at **cdiff = 0**: behind (cdiff<0) the wrong rate is **18.0%**
+(433/2,411, mean positive gap +0.152 wp); ahead-or-tied it is **1.7%** (51/3,061,
+mean positive gap +0.070 wp). The mechanism is **game-shortening**: a lock
+removes a whole row from play and accelerates the end of the game; when you are
+behind you *want* more turns to catch up, so forcing the lock locks in your
+deficit. Of the 484 wrong events, **323 (66.7%)** have the better alternative
+being **skip/defer** (don't lock, keep the row alive), and **28** are static
+near-ties (|v_lock − v_alt| < 0.02) where the net itself was indifferent and the
+rule broke the tie the wrong way — the exact pattern flagged in the rehearsal.
+
+Secondary conditioners are weak by comparison: `alt_is_defer` True 10.4% vs
+False 6.8%; `lock_row` 0 (red) 10.9% highest / row 1 (yellow) 7.2% lowest; stage
+(turn) shows no clean cut independent of cdiff. **cdiff is the rule.**
+
+### Candidate rule variant, held out
+
+Candidate: **suppress the forced lock when `cdiff < threshold` and let the value
+net decide.** Split games <5000 (train) / ≥5000 (test). Sweeping the threshold
+on train, the natural operating point is **cdiff < 0 (suppress when behind)**.
+Held-out (test, 2,757 events, base lock_wrong rate 7.94%):
+
+| threshold | fired | true wrong | precision | lift | coverage | UB wp/game |
+|---|---|---|---|---|---|---|
+| cdiff < 0 | 1,244 | 199 | 16.0% | 2.0× | **90.9%** | 0.00693 |
+| cdiff < −5 | 774 | 141 | 18.2% | 2.3× | 64.4% | 0.00398 |
+| cdiff < −10 | 415 | 75 | 18.1% | 2.3× | 34.2% | 0.00156 |
+
+The cdiff<0 cut **generalizes cleanly** to the held-out split (test bin rates:
+≥+10 → **0.0%** wrong, 1..9 → 2.1%, behind → 14.7–18.2%), capturing **91%** of
+all wrong verdicts. But precision peaks at ~18%: because lock_wrong is rare,
+even the best cut still suppresses ~4–5 *correct* locks for every wrong one it
+catches. The **wp/game upper bound** from acting on this rule is the sum of
+positive gaps over rule-matched lock_wrong events ÷ games: **≈0.0069 wp/game**
+at cdiff<0 (vs a full removable ceiling of ~0.0074 wp/game if *all* wrongs were
+fixed). **This is explicitly an upper bound under perfect substitution** — it
+assumes suppression always lands on the adjudicated alternative, which is not
+measurable here: suppressing the rule hands the decision back to the value net,
+which (per `rule_free_forced` being tiny) usually still avoids the lock but is
+not guaranteed to pick the *best* alternative.
+
+### Rendered examples (abridged)
+
+- **game 9221, turn 7, ap1, cdiff −1, gap +0.79 wp (z=89):** behind by 1, forced
+  G2 terminal lock (v=+0.42); the net's own runner-up was **skip** (v=+0.61).
+  Rollouts favor skip by 0.79 wp — locking the green row away when nearly even
+  throws the game.
+- **game 9423, turn 9, pp1, cdiff −5, gap +0.60 wp (z=56):** forced R12 lock
+  (static v=+2.36, the net *loves* it) over skip (v=+1.07); rollouts say skip is
+  +0.60 wp better. A textbook static-value-vs-rollout disagreement where
+  game-shortening while behind is the hidden cost the net underweights.
+- **game 1768, turn 10, pp1, cdiff 0 (tied), gap +0.61 wp (z=57):** dead-even,
+  forced R12 (v=+1.43) vs skip (v=+0.91); rollouts prefer skip — even at a tie
+  the lock prematurely ends a winnable game.
+
+### Estimator caveats
+
+- **(a) Rollout-policy circularity.** The pair value net (trained rule-ON) drives
+  every rollout move *and* models the GA opponent inside entries/rollouts. This
+  almost certainly **flatters the rule** (the rollout policy shares the net's
+  blind spots), so the true cost of the rule is plausibly larger than measured.
+  It cannot be removed without an independent rollout policy.
+- **(b) pp1 sequential-completion approximation.** On passive (white-die) marks
+  the opponent completes its turn after seeing our mark; this is identical across
+  candidates, so CRN-paired *gaps* remain valid even though the absolute states
+  are an approximation.
+- **(c) No CRN-selection bias.** Unlike Phase 15, the rule is **unconditional** —
+  no K=128 pre-pick selected which events to adjudicate, so there is no
+  winner's-curse inflation in the estimator. The estimator is clean in that
+  respect.
+- **(d) z>2 alone fires on negligible gaps** (46 of the 484 wrongs are <0.02 wp);
+  hence the 0.02 wp effect-size floor on all headline magnitude claims.
+- **(e) Deterministic-arm events (se==0)** are exact terminal outcomes, not
+  stochastic estimates, and are reported separately (96 events / 91 low-var
+  wrongs).
+
+### Verdict and recommendation
+
+`find_safe_lock` is **net-positive but miscalibrated when behind**: right 85.6%
+of the time and very right in ap2, but wrong ~18% of the time once cdiff<0, where
+the game-shortening cost of locking dominates. The failure mode is **crisp**
+(cdiff<0, alt usually = skip) — crisper than anything Phase 15 found — and
+generalizes out-of-sample. The realized headline cost is modest (the 484 wrongs
+sum to **0.0080 wp/game** over all 10k games; the removable upper bound is
+~0.0074 wp/game), but it is concentrated exactly where games are close, i.e. the
+games most likely to be decided by it.
+
+**Recommendation: A/B a conditional variant**, not a keep-as-is and not a
+src rewrite. Per the adjudication spec §5, implement the gate **example-side**
+(a `Strategy` that suppresses the forced lock when `cdiff < 0` and defers to the
+value net, with **zero `src/` contamination**) and evaluate head-to-head: the
+conditional bot vs the untouched rule-ON bot, **and** both vs the untouched GA,
+paired dice. The held-out numbers justify the test (91% wrong-coverage at the
+cdiff<0 cut, clean generalization, the close-game concentration) while the
+~18% precision and the perfect-substitution caveat (b/a) mean the *measured*
+upper bound (~0.007 wp/game) is small and possibly optimistic — so the A/B, not
+the analysis, must decide. If the A/B is flat or negative (plausible, given the
+circularity caveat flatters the current rule), **keep the rule as-is**; the
+multi-lock `alt2` finding (sub-optimal lock chosen 21% of the time) is a separate,
+smaller lever not addressed by this gate.
