@@ -828,6 +828,8 @@ fn build_distill_samples(boot: &PairStrategy, ctxs: &[DistillCtx], cfg: DistillC
                         ((e), (active_player + 2) % n, n)
                     }
                 };
+                // `n` is intentionally unused here: it is bound per match arm only to
+                // compute first_active; the outer tuple takes first_active directly.
                 let _ = n;
                 (compared, entries, first_active, context_seed(state, opps, *dice))
             }
@@ -892,9 +894,14 @@ fn build_distill_samples(boot: &PairStrategy, ctxs: &[DistillCtx], cfg: DistillC
                 }
             }
         }
+        // `compared` is intentionally unused after building entries: candidate
+        // identity is implicit in entry order; sample emission reads entry states.
         let _ = compared;
     }
 
+    // `seed` is intentionally unused: rollouts reseed per-ctx via context_seed
+    // (roll_seed) so each decision's CRN rollouts are deterministic on its own
+    // board, independent of the per-game seed.
     let _ = seed;
     samples
 }
