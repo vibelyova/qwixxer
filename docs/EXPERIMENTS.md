@@ -1267,7 +1267,8 @@ every genuinely-wrong lock the rule catches, suppression also hands ~4–5
 correct locks back to the value net — and the net, freed of the override, does
 **not** re-pick the good locks reliably enough (the 84%-precision gap, `lock_right`
 85.6%) to net any gain. Suppressing trades the rule's wrong locks for the net's
-own mistakes on the locks the rule was right about, and the two roughly cancel.
-The circularity caveat (Phase 16 §a) — the rollout policy shares the net's blind
-spots and flatters the rule — predicted exactly this: a flat-or-negative A/B was
-called the plausible outcome, and that is what landed.
+own mistakes on the locks the rule was right about, and the two *nearly*
+cancel — the residual is the measured +0.03..+0.06pp. The circularity caveat
+(Phase 16 §a) — the rollout policy shares the net's blind spots and flatters
+the rule — called a near-null A/B the plausible outcome, and a small positive
+residual an order of magnitude under the ceiling is what landed.
