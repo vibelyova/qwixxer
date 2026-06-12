@@ -277,6 +277,7 @@ fn run_bench(bots: Vec<BotType>, num_games: usize, seed: u64) {
         "Benchmarking {} ({num_games} games, rotating seats, paired dice, seed {seed}):\n",
         bots.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(" vs ")
     );
+    let bench_start = std::time::Instant::now();
 
     #[cfg(feature = "parallel")]
     use rayon::prelude::*;
@@ -491,7 +492,52 @@ fn run_bench(bots: Vec<BotType>, num_games: usize, seed: u64) {
                 se_paired * 100.0
             );
         }
+
+        // Dice-pairing attribution: the games of one pairing share per-seat
+        // dice, so a pairing SWEPT by one strategy (it wins every rotation)
+        // is a skill signal, while a SPLIT pairing (each strategy wins at
+        // least once) was decided by seat/dice. The split share is a direct
+        // read on how much of the matchup is dice-dominated.
+        let mut swept = [0usize; 2];
+        let mut split = 0usize;
+        let mut with_ties = 0usize;
+        for chunk in game_winners.chunks(num_players) {
+            let w0 = chunk.iter().filter(|w| w.as_deref() == Some(s0.as_str())).count();
+            let w1 = chunk.iter().filter(|w| w.as_deref() == Some(s1.as_str())).count();
+            if w0 == chunk.len() {
+                swept[0] += 1;
+            } else if w1 == chunk.len() {
+                swept[1] += 1;
+            } else if w0 > 0 && w1 > 0 {
+                split += 1;
+            } else {
+                with_ties += 1; // no sweep, no split: at least one tie involved
+            }
+        }
+        let np = game_winners.chunks(num_players).len() as f64;
+        println!(
+            "  Dice pairings ({:.0}): swept by {} {} ({:.1}%), by {} {} ({:.1}%), split {} ({:.1}%), with ties {} ({:.1}%)",
+            np,
+            s0,
+            swept[0],
+            swept[0] as f64 / np * 100.0,
+            s1,
+            swept[1],
+            swept[1] as f64 / np * 100.0,
+            split,
+            split as f64 / np * 100.0,
+            with_ties,
+            with_ties as f64 / np * 100.0
+        );
     }
+
+    let elapsed = bench_start.elapsed();
+    println!(
+        "\n  Elapsed: {}m{:02}s ({:.0} games/s)",
+        elapsed.as_secs() / 60,
+        elapsed.as_secs() % 60,
+        num_games as f64 / elapsed.as_secs_f64()
+    );
 }
 
 fn run_solo(num_games: usize) {
