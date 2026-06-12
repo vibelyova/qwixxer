@@ -470,6 +470,7 @@ fn build_lock_cands(
     bot: &PairStrategy,
     state: &State,
     eval_opps: &[State],
+    baseline: State,
     rule_free: Decision,
     lock: Mark,
     collapse: bool,
@@ -502,15 +503,14 @@ fn build_lock_cands(
             if alt == Some(lock) {
                 return None;
             }
-            let mk = |m: Option<Mark>| {
-                let mut s = *state;
-                match m {
-                    Some(m) => s.apply_mark(m),
-                    None => {} // baseline semantics differ per ctx; post only
-                               // feeds entries, and for the skip/strike case
-                               // the entry builders re-derive the turn anyway.
+            let mk = |m: Option<Mark>| match m {
+                Some(m) => {
+                    let mut s = *state;
+                    s.apply_mark(m);
+                    s
                 }
-                s
+                // None's post is the ctx-correct baseline (strike for ap2 has_marked=false).
+                None => baseline,
             };
             let states = [mk(alt), mk(Some(lock))];
             let values = bot.evaluate_batch(&states, eval_opps);

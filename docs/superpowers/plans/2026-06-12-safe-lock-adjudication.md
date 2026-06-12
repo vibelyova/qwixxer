@@ -353,6 +353,7 @@ fn build_lock_cands(
     bot: &PairStrategy,
     state: &State,
     eval_opps: &[State],
+    baseline: State,
     rule_free: Decision,
     lock: Mark,
     collapse: bool,
@@ -385,15 +386,14 @@ fn build_lock_cands(
             if alt == Some(lock) {
                 return None;
             }
-            let mk = |m: Option<Mark>| {
-                let mut s = *state;
-                match m {
-                    Some(m) => s.apply_mark(m),
-                    None => {} // baseline semantics differ per ctx; post only
-                               // feeds entries, and for the skip/strike case
-                               // the entry builders re-derive the turn anyway.
+            let mk = |m: Option<Mark>| match m {
+                Some(m) => {
+                    let mut s = *state;
+                    s.apply_mark(m);
+                    s
                 }
-                s
+                // None's post is the ctx-correct baseline (strike for ap2 has_marked=false).
+                None => baseline,
             };
             let states = [mk(alt), mk(Some(lock))];
             let values = bot.evaluate_batch(&states, eval_opps);
@@ -532,7 +532,7 @@ impl Strategy for LockShadowPair {
                 Some(Some(lock)),
                 "ap1 lock-force mismatch (mirror drift): mirror {lock:?}, production {forced:?}"
             );
-            if let Some(lc) = build_lock_cands(&self.static_bot, state, &sim_opp, rule_free, lock, true) {
+            if let Some(lc) = build_lock_cands(&self.static_bot, state, &sim_opp, *state, rule_free, lock, true) {
                 self.log("ap1", None, state, opp_states, dice, lock, lc);
             }
         }
@@ -563,7 +563,7 @@ impl Strategy for LockShadowPair {
             };
             let opp_best = opp_states.iter().map(|s| s.count_points()).max().unwrap_or(0);
             let rule_free = mark_choices_nolock(state, &marks, baseline, opp_best);
-            if let Some(lc) = build_lock_cands(&self.static_bot, state, opp_states, rule_free, lock, false) {
+            if let Some(lc) = build_lock_cands(&self.static_bot, state, opp_states, baseline, rule_free, lock, false) {
                 self.log("ap2", Some(has_marked), state, opp_states, dice, lock, lc);
             }
         }
@@ -588,7 +588,7 @@ impl Strategy for LockShadowPair {
             );
             let opp_best = opp_best_phase1_score(opp_states, white_sum);
             let rule_free = mark_choices_nolock(state, &marks, *state, opp_best);
-            if let Some(lc) = build_lock_cands(&self.static_bot, state, opp_states, rule_free, lock, false) {
+            if let Some(lc) = build_lock_cands(&self.static_bot, state, opp_states, *state, rule_free, lock, false) {
                 self.log("pp1", None, state, opp_states, dice, lock, lc);
             }
         }
@@ -889,7 +889,7 @@ fn adjudicate_event(ev: &LockEvent, bot: &PairStrategy, k: usize, lineno: usize)
             sim_opp_holder = sim_opp;
             let (scan_lock, rule_free) = phase1_plans_mirror(&our, &sim_opp_holder, ev.dice);
             assert_eq!(scan_lock, Some(lock), "line {lineno}: ap1 lock rebuild mismatch");
-            build_lock_cands(bot, &our, &sim_opp_holder, rule_free, lock, true)
+            build_lock_cands(bot, &our, &sim_opp_holder, our, rule_free, lock, true)
         }
         "ap2" => {
             let marks = our.generate_color_moves(ev.dice);
@@ -903,7 +903,7 @@ fn adjudicate_event(ev: &LockEvent, bot: &PairStrategy, k: usize, lineno: usize)
             };
             let opp_best = opps.iter().map(|s| s.count_points()).max().unwrap_or(0);
             let rule_free = mark_choices_nolock(&our, &marks, baseline, opp_best);
-            build_lock_cands(bot, &our, &opps, rule_free, lock, false)
+            build_lock_cands(bot, &our, &opps, baseline, rule_free, lock, false)
         }
         "pp1" => {
             let white_sum = ev.dice[0] + ev.dice[1];
@@ -911,7 +911,7 @@ fn adjudicate_event(ev: &LockEvent, bot: &PairStrategy, k: usize, lineno: usize)
             assert_eq!(find_safe_lock(&our, &marks), Some(lock), "line {lineno}: pp1 lock rebuild mismatch");
             let opp_best = opp_best_phase1_score(&opps, white_sum);
             let rule_free = mark_choices_nolock(&our, &marks, our, opp_best);
-            build_lock_cands(bot, &our, &opps, rule_free, lock, false)
+            build_lock_cands(bot, &our, &opps, our, rule_free, lock, false)
         }
         c => panic!("line {lineno}: bad ctx {c}"),
     }
