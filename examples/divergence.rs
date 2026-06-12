@@ -1072,6 +1072,112 @@ fn rollout_scores(bot: &PairStrategy, entries: &[(Vec<State>, bool)], seed: u64,
     out
 }
 
+/// pp1 entries: our passive mark applied, then the active player's turn
+/// (1v1: opps[0]) completed deterministically from their perspective via the
+/// same public pipeline. Approximation: the real opponent decided phase 1
+/// simultaneously with us, not after seeing our mark — but the completion is
+/// identical across compared candidates, so CRN-paired gaps remain valid.
+/// Takes `&[Cand]` (normalized to match phase1_entries/phase2_entries; the
+/// caller builds one owned Vec<Cand> for all three ctx arms).
+fn passive_entries(
+    bot: &PairStrategy,
+    state: &State,
+    opps: &[State],
+    dice: [u8; 6],
+    shortlist: &[Cand],
+) -> Vec<(Vec<State>, bool)> {
+    shortlist
+        .iter()
+        .map(|c| {
+            let mut our = *state;
+            if let Some(m) = c.mark {
+                our.apply_mark(m);
+            }
+            let mut all: Vec<State> = std::iter::once(our).chain(opps.iter().copied()).collect();
+            SimGame::propagate_locks(&mut all);
+            if SimGame::game_over(&all) {
+                return (all, true);
+            }
+            // Active player's phase 1 (index 1).
+            let view = SimGame::opp_view(&all, 1);
+            let (d, _) = active_phase1_choices(bot, &all[1], &view, dice);
+            let p1 = eval_decision(bot, d, &view);
+            if let Some(m) = p1 {
+                all[1].apply_mark(m);
+            }
+            SimGame::propagate_locks(&mut all);
+            if SimGame::game_over(&all) {
+                return (all, true);
+            }
+            // Active player's phase 2.
+            let view = SimGame::opp_view(&all, 1);
+            let d = active_phase2_choices(&all[1], &view, dice, p1.is_some());
+            match eval_decision(bot, d, &view) {
+                Some(m) => all[1].apply_mark(m),
+                None if p1.is_none() => all[1].apply_strike(),
+                None => {}
+            }
+            SimGame::propagate_locks(&mut all);
+            let ended = SimGame::game_over(&all);
+            (all, ended)
+        })
+        .collect()
+}
+
+/// Full-game rollout scores: like rollout_scores but rolls every sim to
+/// completion and scores exact outcomes only (no truncation, no win-prob
+/// bootstrap). `first_active` = player to act first in the rollout
+/// (ap1/ap2: 1 % n — the player after us; pp1: 0 — us, after the active
+/// player's completed turn).
+fn rollout_scores_full(
+    bot: &PairStrategy,
+    entries: &[(Vec<State>, bool)],
+    seed: u64,
+    k: usize,
+    first_active: usize,
+) -> Vec<Vec<f32>> {
+    let n = entries[0].0.len();
+    let mut sims: Vec<SimGame> = Vec::new();
+    let mut sim_owner: Vec<usize> = Vec::new();
+    for (ei, (states, ended)) in entries.iter().enumerate() {
+        if *ended {
+            continue;
+        }
+        for s in 0..k {
+            sims.push(SimGame {
+                states: states.clone(),
+                active: first_active,
+                rngs: (0..n)
+                    .map(|p| SmallRng::seed_from_u64(sample_player_seed(seed, s, p)))
+                    .collect(),
+                over: false,
+            });
+            sim_owner.push(ei);
+        }
+    }
+    let mut driver = BatchedRollouts::new(bot, sims);
+    let mut turns = 0;
+    while !driver.all_over() {
+        driver.step_turn();
+        turns += 1;
+        assert!(turns <= 200, "rollout exceeded 200 turns — game-end invariant violated");
+    }
+    let mut out: Vec<Vec<f32>> = entries
+        .iter()
+        .map(|(states, ended)| {
+            if *ended {
+                vec![SimGame::outcome(states)]
+            } else {
+                Vec::with_capacity(k)
+            }
+        })
+        .collect();
+    for (i, sim) in driver.sims.iter().enumerate() {
+        out[sim_owner[i]].push(SimGame::outcome(&sim.states));
+    }
+    out
+}
+
 /// Production pick semantics: highest mean wins, ties keep the lower index.
 /// `limit` truncates each entry's samples (sum order matches production, so
 /// limit = K_SAMPLES reproduces the collection-time pick bit-for-bit).
@@ -1421,6 +1527,181 @@ fn cmd_lock_run(n: usize, seed: u64, out: &str) {
     );
 }
 
-fn cmd_lock_adjudicate(_input: &str, _out: &str, _k: usize) {
-    todo!("Task 3")
+struct PairAdj {
+    gap_mean: f32,
+    gap_se: f32,
+    z: f32,
+    verdict: &'static str,
+}
+
+fn pair_adj(lock_scores: &[f32], alt_scores: &[f32]) -> PairAdj {
+    // Oriented alternative − lock: positive = the rule is wrong.
+    let (gap, se) = paired_stats(lock_scores, alt_scores);
+    let z = if se > 0.0 {
+        gap / se
+    } else {
+        match gap.partial_cmp(&0.0).unwrap() {
+            std::cmp::Ordering::Greater => f32::INFINITY,
+            std::cmp::Ordering::Less => f32::NEG_INFINITY,
+            std::cmp::Ordering::Equal => 0.0,
+        }
+    };
+    let verdict = if z > 2.0 {
+        "lock_wrong"
+    } else if z < -2.0 {
+        "lock_right"
+    } else {
+        "coinflip"
+    };
+    PairAdj {
+        gap_mean: gap,
+        gap_se: se,
+        z,
+        verdict,
+    }
+}
+
+/// Rebuild the logged firing, run full-game rollouts, adjudicate lock vs
+/// alternatives. Hard-fails on drift from the collection run.
+fn adjudicate_event(ev: &LockEvent, bot: &PairStrategy, k: usize, lineno: usize) -> (PairAdj, Option<PairAdj>) {
+    let our = ev.our.to_state();
+    let opps: Vec<State> = ev.opps.iter().map(|o| o.to_state()).collect();
+    let seed = context_seed(&our, &opps, ev.dice);
+    assert_eq!(seed, ev.seed, "line {lineno}: context seed mismatch — schema drift");
+    let lock = Mark {
+        row: ev.lock_mark.0,
+        number: ev.lock_mark.1,
+    };
+
+    let mut sim_opp_holder: Vec<State> = Vec::new();
+    let lc = match ev.ctx.as_str() {
+        "ap1" => {
+            let (_, sim_opp) = active_phase1_choices(bot, &our, &opps, ev.dice);
+            sim_opp_holder = sim_opp;
+            let (scan_lock, rule_free) = phase1_plans_mirror(&our, &sim_opp_holder, ev.dice);
+            assert_eq!(scan_lock, Some(lock), "line {lineno}: ap1 lock rebuild mismatch");
+            build_lock_cands(bot, &our, &sim_opp_holder, our, rule_free, lock, true)
+        }
+        "ap2" => {
+            let marks = our.generate_color_moves(ev.dice);
+            assert_eq!(find_safe_lock(&our, &marks), Some(lock), "line {lineno}: ap2 lock rebuild mismatch");
+            let baseline = if ev.has_marked.unwrap() {
+                our
+            } else {
+                let mut s = our;
+                s.apply_strike();
+                s
+            };
+            let opp_best = opps.iter().map(|s| s.count_points()).max().unwrap_or(0);
+            let rule_free = mark_choices_nolock(&our, &marks, baseline, opp_best);
+            build_lock_cands(bot, &our, &opps, baseline, rule_free, lock, false)
+        }
+        "pp1" => {
+            let white_sum = ev.dice[0] + ev.dice[1];
+            let marks = our.generate_white_moves(white_sum);
+            assert_eq!(find_safe_lock(&our, &marks), Some(lock), "line {lineno}: pp1 lock rebuild mismatch");
+            let opp_best = opp_best_phase1_score(&opps, white_sum);
+            let rule_free = mark_choices_nolock(&our, &marks, our, opp_best);
+            build_lock_cands(bot, &our, &opps, our, rule_free, lock, false)
+        }
+        c => panic!("line {lineno}: bad ctx {c}"),
+    }
+    .unwrap_or_else(|r| panic!("line {lineno}: candidate rebuild skipped ({r}) — drift"));
+
+    // Guard: rebuilt candidates and indices must match the log.
+    assert_eq!(lc.cands.len(), ev.cands.len(), "line {lineno}: candidate count drift");
+    for (c, l) in lc.cands.iter().zip(&ev.cands) {
+        assert_eq!(mark_json(c.mark), l.mark, "line {lineno}: candidate order drift");
+        assert!((c.value - l.v).abs() < 1e-4, "line {lineno}: static value drift");
+    }
+    assert_eq!(
+        (lc.lock_idx, lc.alt_idx, lc.alt2_idx),
+        (ev.lock_idx, ev.alt_idx, ev.alt2_idx),
+        "line {lineno}: comparison index drift"
+    );
+
+    // Entries for [lock, alt, alt2?] in that order.
+    let mut compared: Vec<&Cand> = vec![&lc.cands[lc.lock_idx], &lc.cands[lc.alt_idx]];
+    if let Some(i2) = lc.alt2_idx {
+        compared.push(&lc.cands[i2]);
+    }
+    let owned: Vec<Cand> = compared.iter().map(|c| (*c).clone()).collect();
+    let (entries, first_active) = match ev.ctx.as_str() {
+        "ap1" => (
+            phase1_entries(bot, &our, &sim_opp_holder, ev.dice, &owned),
+            1 % (1 + opps.len()),
+        ),
+        "ap2" => (phase2_entries(&opps, &owned), 1 % (1 + opps.len())),
+        "pp1" => (passive_entries(bot, &our, &opps, ev.dice, &owned), 0),
+        _ => unreachable!(),
+    };
+
+    let scores = rollout_scores_full(bot, &entries, seed, k, first_active);
+    let alt = pair_adj(&scores[0], &scores[1]);
+    let alt2 = lc.alt2_idx.map(|_| pair_adj(&scores[0], &scores[2]));
+    (alt, alt2)
+}
+
+fn cmd_lock_adjudicate(input: &str, out: &str, k: usize) {
+    use rayon::prelude::*;
+    let text = std::fs::read_to_string(input).expect("cannot read input");
+    let lines: Vec<&str> = text.lines().collect();
+    let events: Vec<(usize, LockEvent)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let v: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("line {}: bad JSON: {e}", i + 1));
+            if v["t"] != "l" {
+                return None;
+            }
+            Some((
+                i,
+                serde_json::from_value(v).unwrap_or_else(|e| panic!("line {}: bad event: {e}", i + 1)),
+            ))
+        })
+        .collect();
+    eprintln!("adjudicating {} lock events at K={k} (full-game)", events.len());
+
+    let results: Vec<(usize, PairAdj, Option<PairAdj>)> = events
+        .par_iter()
+        .map_init(
+            || PairStrategy::load("pair_model"),
+            |bot, (i, ev)| {
+                let (a, a2) = adjudicate_event(ev, bot, k, *i + 1);
+                (*i, a, a2)
+            },
+        )
+        .collect();
+    let by_line: std::collections::HashMap<usize, (PairAdj, Option<PairAdj>)> =
+        results.into_iter().map(|(i, a, a2)| (i, (a, a2))).collect();
+
+    let mut f = std::io::BufWriter::new(std::fs::File::create(out).unwrap());
+    let mut counts = std::collections::HashMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        match by_line.get(&i) {
+            None => writeln!(f, "{line}").unwrap(),
+            Some((a, a2)) => {
+                let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+                v["adj_k"] = k.into();
+                v["alt_gap_mean"] = a.gap_mean.into();
+                v["alt_gap_se"] = a.gap_se.into();
+                // f32::INFINITY (gap_se == 0) serializes to JSON null, not a panic
+                // (serde_json::Value::from(f32::INFINITY) is Null); the analysis
+                // loader reconstructs z from gap/se sign.
+                v["alt_z"] = a.z.into();
+                v["alt_verdict"] = a.verdict.into();
+                if let Some(a2) = a2 {
+                    v["alt2_gap_mean"] = a2.gap_mean.into();
+                    v["alt2_gap_se"] = a2.gap_se.into();
+                    v["alt2_z"] = a2.z.into();
+                    v["alt2_verdict"] = a2.verdict.into();
+                }
+                writeln!(f, "{}", serde_json::to_string(&v).unwrap()).unwrap();
+                *counts.entry(a.verdict).or_insert(0u32) += 1;
+            }
+        }
+    }
+    f.flush().unwrap();
+    println!("alt verdicts: {counts:?}");
 }
