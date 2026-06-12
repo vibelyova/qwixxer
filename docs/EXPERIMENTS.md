@@ -851,9 +851,10 @@ gate-fired, 57.6% pair wins) closely.
 ### Disagreement survival at high K: search is a tie-breaker, not a fixer
 
 Among the 18,644 disagreements, the K=2048 verdict split is **flip 39.3%
-(7,325) / keep 10.7% (2,001) / coinflip 50.0% (9,318)**. So search's pick is
-confirmed (`search_right`) on **39.3%** of disagreements, refuted on 10.7%, and
-**half are statistical ties even at 16× the search budget.**
+(7,325) / keep 10.7% (2,001) / coinflip 50.0% (9,318)**. Search's pick is
+confirmed (`search_right`) on **7,326 = 39.3%** of disagreements (the 7,325
+flips plus one keep-verdict event where search had picked cands[0]), refuted
+on 10.7%, and **half are statistical ties even at 16× the search budget.**
 
 Agreement-control noise floor (verdict present, `disagree==False`, n=17,283):
 **keep 96.3% / coinflip 3.2% / flip 0.6%.** Here "keep" is the expected null
@@ -908,13 +909,13 @@ small." Best variant, **`0 < static_gap ≤ 0.074`**, held-out:
 - **Precision** (rule-matched disagreements where search is confirmed): **53.8%**
 - **False-fire** (rule-matched relabeled agreements that aren't "keep"): 12.4%
 - **Estimated value** (Σ|hk_gap_mean| over rule-matched confirmed disagreements
-  / 10,000 games): **+0.0072 win-prob points/game**
+  / 5,000 held-out games): **+0.0072 win-prob points/game**
 
 Tightening to `≤ 0.035` lifts precision only to 55.3% while coverage drops to
 70% and false-fire climbs to 21.4%. Even **"adopt search on every
 disagreement"** has precision just 39.5% and a net realized value of **+0.0072
-wpp/game** (sign-checked: Σ of signed hk_gap over all disagreements, oriented to
-search's pick / 10,000). The upper bound — Σ|hk| over confirmed only — is
+wpp/game** (sign-checked: Σ of signed hk_gap over held-out disagreements,
+oriented to search's pick / 5,000). The upper bound — Σ|hk| over confirmed only — is
 **+0.0085 wpp/game**.
 
 ### Two estimator caveats
