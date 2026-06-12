@@ -1165,3 +1165,93 @@ the analysis, must decide. If the A/B is flat or negative (plausible, given the
 circularity caveat flatters the current rule), **keep the rule as-is**; the
 multi-lock `alt2` finding (sub-optimal lock chosen 21% of the time) is a separate,
 smaller lever not addressed by this gate.
+
+## Phase 17: Safe-Lock Suppression A/B (does gating the rule on cdiff actually pay?)
+
+Phase 16's adjudication recommended an **A/B**, not a rewrite: implement the
+`cdiff`-gated suppression of `find_safe_lock` **example-side** (zero `src/`
+contamination) and measure head-to-head against the untouched rule-ON bot, plus
+both vs GA. This phase runs that A/B at 1M games/arm.
+
+### Suppression semantics
+
+`VariantPair(suppress_below = t)` is the baseline static-PAIR bot with one
+change: when `find_safe_lock` would fire and the score margin
+`cdiff = our_points − opp_points` satisfies `cdiff < t`, the forced lock is
+**suppressed** — the safe lock is demoted from a hard override to an ordinary
+value candidate and competes in the normal value-net argmax (it may still be
+picked if the net actually prefers it). Arms: `t=0` (suppress when strictly
+behind, `cdiff<0`), `t=1` (suppress when behind-or-tied, `cdiff<=0`), `t=-5`
+(suppress only when far behind, `cdiff<-5`). `suppress_below = None` is the
+untouched production bot. Reported metric is **tie-inclusive score**
+(win=1, tie=0.5, loss=0) with paired SE and z vs an exact 50% null; ties are
+explicitly scored 0.5 so the null is exact, not approximate.
+
+### Setup and gates
+
+Equivalence gate (cheap insurance, seed 3, 1000 games): `VariantPair(None)`
+replays the baseline move-for-move — **holds**. All benches 1M games, rotating
+seats, paired dice, seed 0. Reference 10k smokes (seed 1) put arm 0 essentially
+flat head-to-head (49.94%, z −0.94) and 59.90% vs GA. The suppression branch's
+correctness is fenced by the Phase-16 mirror guards (force detection +
+value-equivalence) plus this `VariantPair(None)` equivalence gate.
+
+### Head-to-head: VariantPair(t) vs untouched rule-ON pair (1M, seed 0)
+
+| arm | score | strict wins | ties | paired SE | z vs 50% |
+|---|---|---|---|---|---|
+| cdiff<0   (t=0)  | 50.06% | 49.10% | 1.93% | 0.007pp | **+9.70** |
+| cdiff<=0  (t=1)  | 50.06% | 49.11% | 1.91% | 0.007pp | **+9.18** |
+| cdiff<-5  (t=-5) | 50.03% | 49.06% | 1.93% | 0.005pp | **+5.08** |
+
+The z-scores clear the spec's z>2 bar, but the **effect is +0.03..+0.06pp** —
+trivially small. It sits well inside Phase 16's perfect-substitution ceiling
+(≤ +0.7pp) and is not robust to the sampling scale: the seed-1 10k smoke gave
+arm 0 at −0.06pp (z −0.94, opposite sign), i.e. the estimate straddles zero and
+the 1M point estimate differs from the smoke by ~1.7 SE of the smoke (< the 4-SE
+abort bar — no contradiction, just noise around the null at 10k). A statistically
+detectable but practically negligible nudge.
+
+### vs GA, per arm (1M, seed 0) — against the baseline yardstick
+
+Baseline untouched pair vs GA, 1M, seed 42 (`bench ga pair`): **PAIR 59.1%
+strict wins** (avg 74.6 vs 66.5 pts), 99% paired CI **58.97%–59.20%**, paired SE
+0.044pp.
+
+| arm | score (tie-incl.) | strict wins | paired SE | z vs 50% |
+|---|---|---|---|---|
+| cdiff<0   (t=0)  | 60.13% | 59.25% | 0.044pp | +231.64 |
+| cdiff<=0  (t=1)  | 60.13% | 59.26% | 0.044pp | +231.71 |
+| cdiff<-5  (t=-5) | 60.05% | 59.17% | 0.044pp | +229.81 |
+
+On the comparable strict-win basis the arms (59.17–59.26%) sit on top of the
+baseline yardstick (59.1%, CI upper 59.20%) — **no regression vs GA**; arm 0/1
+are marginally at/above the CI top, arm t=-5 is squarely inside it.
+
+### Verdict
+
+Decision rule (spec `docs/superpowers/specs/2026-06-12-lock-ab-design.md`):
+adopt requires head-to-head z>2 above 50% **and** no regression vs GA; a flat
+result keeps the unconditional rule. The arms technically clear z>2 and do not
+regress vs GA, but the head-to-head magnitude (+0.03..+0.06pp) is a rounding
+error — not the meaningful improvement the rule is meant to gate. Treating this
+as **flat: keep the unconditional `find_safe_lock` rule as-is.** No arm separates
+itself enough to justify shipping a conditional gate; the cdiff<0 and cdiff<=0
+arms are indistinguishable from each other, and widening to cdiff<-5 only shrinks
+the (already negligible) edge.
+
+### Interpretation — consistent with Phase 16, not a contradiction
+
+A flat A/B does **not** refute Phase 16. The rule's measured ~0.0080 wp/game
+cost is real, but Phase 16 already flagged that figure as an *upper bound under
+perfect substitution* (≈0.0069–0.0074 wp/game removable). The realized A/B
+recovers essentially none of it because the precision gap Phase 16 measured is
+the binding constraint: at the cdiff<0 cut precision peaks at ~16–18%, i.e. for
+every genuinely-wrong lock the rule catches, suppression also hands ~4–5
+correct locks back to the value net — and the net, freed of the override, does
+**not** re-pick the good locks reliably enough (the 84%-precision gap, `lock_right`
+85.6%) to net any gain. Suppressing trades the rule's wrong locks for the net's
+own mistakes on the locks the rule was right about, and the two roughly cancel.
+The circularity caveat (Phase 16 §a) — the rollout policy shares the net's blind
+spots and flatters the rule — predicted exactly this: a flat-or-negative A/B was
+called the plausible outcome, and that is what landed.
