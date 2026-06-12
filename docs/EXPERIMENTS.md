@@ -1490,4 +1490,51 @@ cargo run --release -- bench ga pair -n 1000000
   && ./target/release/examples/divergence lock-ab -n 1000000 --seed 0 --suppress-below=0
 ```
 
-All Phase 19 results are **pending user run.**
+### Results
+
+**Run** (user-executed, 40 iterations, global 21–60): fixed-set curve hovered
+59.5–59.9%, **max 59.88% at iterations 57 and 39** (vs leg 1's 59.7 peak).
+The user benched iterations 35/55/57 independently; **iteration 57 selected:
+59.85% vs GA confirmed at 1M, and 50.14% head-to-head vs the old DQN bot.**
+`training_scores.csv` logged correctly this time (the `9930f0a` fix).
+
+**Acceptance:**
+
+| metric | pre-registered | measured | verdict |
+|---|---|---|---|
+| static guard (1M vs GA) | hold 59.6% | **59.85%** | passed — improved |
+| lock-ab suppression edge (t=0, 1M) | success ≥ +0.3pp; kill < +0.15pp | **+0.01pp (z +0.78)** | **KILL** |
+
+(Equivalence gate held over 2,000 games before the edge bench.)
+
+**Verdict: the lock pool is CLOSED — representation-limited, not
+data-limited.** At ~9% of the buffer (10× leg 1) plus doubled ε-decline, the
+freed net still cannot distinguish good locks from bad at firing states: the
+suppression edge is statistically zero (it *fell* from +0.04pp — if anything
+the heavier lock training taught the net the value *under the rule* even more
+faithfully). Per the pre-registration, no further lock-targeted training is
+warranted; the residual ~0.7pp lock ceiling would require a representation
+change (e.g. explicit features for lock-while-behind interactions) or a
+policy head — both out of scope. The Phase 17 decision stands: keep the
+unconditional `find_safe_lock` rule.
+
+**Checkpoint iteration 57 is ADOPTED** (`pair_model/model.mpk` updated, real
+file): the static guard improved, so leg 2's gated-pool refinement banked
+another ~+0.25pp. **Final campaign headline: pair (static) 59.85% vs GA**
+(from 59.1% pre-distillation; pair-search was 60.4% on the leg-1 net, not
+re-benched on iter-57).
+
+### Campaign conclusion (Phases 15–19)
+
+The arc that began with "when does search disagree with the static net"
+ends here: the diffuse calibration pool was real and distillable (+0.75pp
+static across two legs — the first material gain since Phase 12, achieved
+after Phase 14's expert iteration plateaued); the lock blind spot was real,
+measurable, and ultimately **not fixable by data alone** under the current
+representation. Every claim along the way was adjudicated by harnesses that
+remain in the tree (divergence, lock-adjudicate, lock-ab) and were reused
+across phases as regression guards — including catching nothing-burgers
+(unchanged production behavior through two production refactors) and real
+bugs (CSV resume, tie-null bias). Remaining ideas, none pre-committed:
+representation work for lock/endgame interactions, a third distillation leg
+on fresh rollouts (flywheel), or accepting the ~60% structural ceiling.
