@@ -1899,10 +1899,16 @@ fn cmd_lock_ab(n: usize, seed: u64, suppress_below: Option<isize>, opponent: &st
     let ties = results.iter().filter(|(v, o)| v == o).count();
     let win_rate = wins as f64 / n_games as f64;
     // Paired SE: per rotation pair (2 games, same dice), the mean of the two
-    // win indicators; SE over pair means.
+    // tie-inclusive scores (win=1.0, tie=0.5, loss=0.0); SE over pair means.
+    // Scoring ties as 0.5 makes the symmetric head-to-head null exactly 0.5.
     let pair_means: Vec<f64> = results
         .chunks(2)
-        .map(|c| c.iter().map(|(v, o)| if v > o { 1.0 } else { 0.0 }).sum::<f64>() / c.len() as f64)
+        .map(|c| {
+            c.iter()
+                .map(|(v, o)| if v > o { 1.0 } else if v == o { 0.5 } else { 0.0 })
+                .sum::<f64>()
+                / c.len() as f64
+        })
         .collect();
     let m = pair_means.len() as f64;
     let mean = pair_means.iter().sum::<f64>() / m;
@@ -1910,7 +1916,8 @@ fn cmd_lock_ab(n: usize, seed: u64, suppress_below: Option<isize>, opponent: &st
     let se = (var / m).sqrt();
     let z = (mean - 0.5) / se;
     println!(
-        "variant wins {:.3}% (ties {:.2}%), paired SE {:.3}pp, z vs 50%: {:+.2}",
+        "variant score {:.2}% (strict wins {:.2}%, ties {:.2}%), paired SE {:.3}pp, z vs 50%: {:+.2}",
+        mean * 100.0,
         win_rate * 100.0,
         ties as f64 / n_games as f64 * 100.0,
         se * 100.0,
