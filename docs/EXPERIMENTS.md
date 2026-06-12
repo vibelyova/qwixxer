@@ -1272,3 +1272,112 @@ cancel — the residual is the measured +0.03..+0.06pp. The circularity caveat
 (Phase 16 §a) — the rollout policy shares the net's blind spots and flatters
 the rule — called a near-null A/B the plausible outcome, and a small positive
 residual an order of magnitude under the ceiling is what landed.
+
+---
+
+## Phase 18: Search-Value Distillation (rollout targets at gated & lock-forced decisions)
+
+**Status: run pending user execution.** This stub records the mechanism, the
+local smoke, the run recipe, and the post-run acceptance commands. The full
+generation/training run and its results are deferred to the user.
+
+### Setup
+
+Phases 13–17 established that decision-time search beats static pair play but
+its edge is diffuse and that hand-named rule fixes (safe-lock suppression)
+recover almost none of it. This phase takes the opposite tack: instead of
+naming the fix, distill search's *value judgements* directly into the static
+net's training signal. `pair-train --distill` emits extra `PairSample`s whose
+targets are **full-game CRN rollout future-diffs**, computed at exactly the
+decisions where search disagrees with static play:
+
+- **Gated decisions** (close/endgame, active phase 1 and phase 2): the top-2
+  static candidates are each completed deterministically and rolled out; both
+  candidates are emitted, so the net learns the *relative* value of the
+  decision tail, not just the chosen branch.
+- **Safe-lock firings** (active p1/p2 and passive p1): the forced lock, the
+  best non-lock alternative, and the runner-up safe lock (a trio) are each
+  rolled out and emitted — this is the Phase 16 adjudication signal turned into
+  a supervised target rather than a runtime gate.
+
+Targets flow through the **unchanged decoupled loss** (μ-MSE / σ-NLL, μ
+detached) in diff-space: `value` = mean rollout future-diff over K rollouts,
+`final_diff` = an individual rollout's future-diff; each sample is swap-doubled
+with negated targets exactly as `build_pair_samples` does. Generation also adds
+**targeted ε-decline of forced safe locks** (`--epsilon-lock`, player-0 only,
+firing at every safe-lock decision incl. passive p1) so the buffer is not
+starved of the alternative-to-lock branch that the net otherwise never sees.
+
+Generation is **static-policy** (no `--search`; the flags are independent and
+the recipe omits `--search`) — the rollout *targets* carry the search signal,
+while move selection during generation stays cheap.
+
+**K=32, m=2 rationale.** K=32 full-game rollouts per candidate balances target
+variance against generation cost. m=2 (samples per candidate×opponent pairing)
+was chosen over the plan's default m=4 after measuring concentration: at m=4 the
+distill samples are ~40% of the buffer (≈217 distill vs 325 TD per game) — too
+aggressive given Phase 14's dilution/saturation history, where over-weighting a
+narrow signal stalled the curve. m=2 lands distill at ~25% of the buffer
+(measured below: ~106/game distill), the first-run setting; m=4 is the
+escalation lever if the curve is healthy and not over-fitting the decision tail.
+
+### Smoke (local, m=2)
+
+`cargo run --release -- pair-train -i 2 -g 300 -e 2 -b 20000 --distill --distill-m 2 --epsilon-lock 0.05`
+
+- Distill counts: iter 1 = 31,824 distill of 126,990 total (~106/game, ~25% of
+  buffer); iter 2 = 32,094 distill of 125,344 total (~107/game). Plausible and
+  on target for m=2.
+- Both iterations completed; no NaN, no panic.
+- Bench (20k buffer, noisy): iter 1 = 57.6%, iter 2 = 58.2% — sane (56–60%).
+- Train loss: iter 1 min 76.95, iter 2 min 76.78 (valid 67–70, noisy across
+  buffer growth) — still descending at iter 2.
+- Generation wall time ~6s/iter for 300 games (~50 games/s) ⇒ 5000 games ≈
+  ~100s/iter, consistent with the ~2 min/5k extrapolation.
+
+**K diagnostic note.** The per-iteration output does **not** split TD-MSE vs
+distill-MSE; the proper K diagnostic (loss split) was **not instrumented** (this
+task stayed doc-only after the param-comment cleanup). The cheap proxy —
+aggregate burn train-loss trend — is readable and still declining at iter 2.
+The run-watcher should escalate `--distill-k` to 64 **only if** the curve
+flatlines from iteration ~3 while Phase 14's curve at the same point was still
+climbing.
+
+**Rayon count-variance note.** Enabled-loop per-iteration sample counts vary
+slightly run-to-run (pre-existing rayon reduction nondeterminism, also present
+with distill off) — not a regression signal.
+
+### Run recipe (pending user run)
+
+```bash
+rm -f pair_model/iter-*.mpk
+cargo run --release -- pair-train --distill --distill-m 2 --epsilon-lock 0.05 -g 5000 -e 5 -b 500000 -c --start-iteration 20
+```
+
+(`--start-iteration 20` keeps ε at its floor and the checkpoint numbering
+distinct, as in Phase 14.)
+
+**What to watch.** The winrate-vs-GA curve against the **+0.5% bar over the
+re-baseline** (re-bench the starting checkpoint, don't compare to a stale
+headline). Escalation levers if the curve underperforms: `--distill-k 64`
+(only on a iter-~3 flatline per the diagnostic above) and `--distill-m 4` (the
+concentration escalation, only if healthy and not over-fitting the tail).
+Expect the rayon count-variance noted above; it is not signal.
+
+### Post-run acceptance (run on the selected checkpoint; results pending)
+
+```bash
+# Static headline vs GA
+cargo run --release -- bench ga pair -n 1000000
+# Search-on
+cargo run --release -- bench ga pair-search -n 200000
+# Lock-wrong rate vs Phase 16's 8.8% (18.0% behind)
+./target/release/examples/divergence lock-run -n 10000 --seed 0 --out lock-retrained.jsonl \
+  && ./target/release/examples/divergence lock-adjudicate --input lock-retrained.jsonl --out lock-retrained.adj.jsonl -k 2048 \
+  && analysis/.venv/bin/python analysis/lock_analysis.py lock-retrained.adj.jsonl 10
+# Suppression edge vs Phase 17's +0.06pp
+./target/release/examples/divergence lock-ab --equivalence-check 2000 \
+  && ./target/release/examples/divergence lock-ab -n 1000000 --seed 0 --suppress-below=0
+```
+
+All Phase 18 results are **pending user run.**
