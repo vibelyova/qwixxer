@@ -1102,7 +1102,10 @@ pub fn self_play_train(
     let mut replay_buffer: std::collections::VecDeque<Vec<PairSample>> = std::collections::VecDeque::new();
 
     let scores_log_path = format!("{artifact_dir}/training_scores.csv");
-    if start_iteration == 0 {
+    // Fresh runs reset the log; resumed runs (--start-iteration) keep an
+    // existing one but must still create it when absent — the appends below
+    // would otherwise fail silently for the whole run.
+    if start_iteration == 0 || !std::path::Path::new(&scores_log_path).exists() {
         std::fs::write(&scores_log_path, "iteration,avg_score,winrate\n").ok();
     }
 
@@ -1211,7 +1214,7 @@ pub fn self_play_train(
                 mins,
                 secs,
             );
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&scores_log_path) {
                 writeln!(f, "{},{avg_score:.2},{:.2}", global_iter + 1, winrate * 100.0).ok();
             }
             Some(winrate)
@@ -1223,7 +1226,7 @@ pub fn self_play_train(
                 mins,
                 secs,
             );
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&scores_log_path) {
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&scores_log_path) {
                 writeln!(f, "{},{avg_score:.2}", global_iter + 1).ok();
             }
             None
