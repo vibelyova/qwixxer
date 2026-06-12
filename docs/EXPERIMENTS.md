@@ -1277,9 +1277,10 @@ residual an order of magnitude under the ceiling is what landed.
 
 ## Phase 18: Search-Value Distillation (rollout targets at gated & lock-forced decisions)
 
-**Status: run pending user execution.** This stub records the mechanism, the
-local smoke, the run recipe, and the post-run acceptance commands. The full
-generation/training run and its results are deferred to the user.
+**Status: run complete, checkpoint ADOPTED.** The user executed the recipe
+(40 iterations, separate machine); iteration 35 was selected and passed the
+pre-registered +0.5% bar on the independent acceptance bench. Results at the
+end of this section.
 
 ### Setup
 
@@ -1380,4 +1381,58 @@ cargo run --release -- bench ga pair-search -n 200000
   && ./target/release/examples/divergence lock-ab -n 1000000 --seed 0 --suppress-below=0
 ```
 
-All Phase 18 results are **pending user run.**
+### Results
+
+**Run** (user-executed, 40 iterations at the recipe settings): the fixed-set
+curve climbed from the 58.3% re-baseline to **~59.6% by iteration ~20** and
+**59.7% at iteration 35** (the selected checkpoint) — +1.4% on the
+per-iteration bench, vs Phase 14's +0.4% plateau on the same set. (The
+`training_scores.csv` was lost to a resume-path bug — header only written at
+`start_iteration == 0` and appends lacked `.create(true)` — fixed in
+`9930f0a`; curve numbers above are from the run log.)
+
+**Acceptance on the selected checkpoint (iteration 35):**
+
+| test | old net (Phases 14–17) | retrained | verdict |
+|---|---|---|---|
+| static 1M vs GA, seed 42 | 59.1% (CI 58.97–59.20) | **59.6% (CI 59.53–59.76)** | **+0.5pp, CIs separated — bar met** |
+| search-on 50k vs GA, seed 42 | 60.1% | **60.4% (CI 59.85–60.86)** | no regression (+0.3pp, ~1σ) |
+| lock-adjudicate: lock_wrong | 8.8% (484/5,472) | **8.8%** (480/5,459; ap1 20.5% / pp1 14.5% / ap2 2.5%) | unchanged |
+| lock-ab suppression edge (t=0, 1M) | +0.06pp (z 9.7) | **+0.04pp (z 5.0)** | unchanged |
+
+**The checkpoint is adopted** (`pair_model/model.mpk` updated): the
+pre-registered +0.5% static-V bar is met on the independent seed-42 set, with
+no search-on regression. New headline numbers: **pair (static) 59.6%,
+pair-search 60.4% vs GA.** The static-vs-search gap narrowed 1.0pp → 0.8pp —
+consistent with distillation moving part of search's knowledge into the
+static net.
+
+**Lock secondaries: the lock-pool mechanism did NOT land.** Two corrections
+to the pre-registration first: (a) `lock-adjudicate`'s lock_wrong rate
+measures the *rule* against rollouts, and the rule didn't change — an
+unchanged 8.8% was the expected outcome, not a failure signal; the spec
+should not have listed it as "expect a drop". (b) The spec's lock-ab
+direction was **backwards**: a net that had truly learned lock valuation
+would make the suppression edge *grow* toward the ~0.7pp ceiling (the freed
+net finally chooses well), not shrink. With the corrected reading, both
+secondaries agree: the edge stayed at +0.04pp (vs +0.06pp), so when freed
+from the rule the retrained net still cannot choose better at lock firings.
+The +0.5pp came from the **diffuse gated pool**; the lock blind spot is
+intact.
+
+**Why the lock targets likely failed: volume.** Lock firings are
+~0.55/game vs ~8 gated decisions/game; at the shared m=2 the lock trio was
+~1% of the buffer, against 1.5M TD samples whose values all embed
+"the lock always happens" (declined-lock continuations exist only in the ~3%
+of games where ε-decline fired). The direct supervision was present but
+outvoted.
+
+**Follow-up (pre-scoped, not run):** a second distillation leg from the
+adopted checkpoint with **per-pool emission weights** (e.g. `m_gated=2`,
+`m_lock=16` — lock samples to ~10–15% of buffer; small `DistillCfg` change)
+and `--epsilon-lock 0.10–0.15`, pre-registering the **lock-ab edge with the
+corrected direction** as the primary lock metric (success = edge grows toward
+~0.7pp, then the conditional-rule adoption decision converts it to win rate
+via the Phase 17 harness). If 10× lock-sample weight doesn't move the
+lock-ab needle, the lock pool should be declared closed (representation
+limit, not data) and the campaign banked.
