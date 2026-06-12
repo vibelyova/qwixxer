@@ -31,7 +31,7 @@ fn prune_dominated<T>(items: &mut Vec<T>, state_of: impl Fn(&T) -> &State) {
     });
 }
 
-fn opp_best_phase1_score(opp_states: &[State], white_sum: u8) -> isize {
+pub(crate) fn opp_best_phase1_score(opp_states: &[State], white_sum: u8) -> isize {
     opp_states
         .iter()
         .map(|opp| {
@@ -52,7 +52,7 @@ fn opp_best_phase1_score(opp_states: &[State], white_sum: u8) -> isize {
 }
 
 /// If any mark locks a row without ending the game, force it.
-fn find_safe_lock(state: &State, marks: &[Mark]) -> Option<Mark> {
+pub(crate) fn find_safe_lock(state: &State, marks: &[Mark]) -> Option<Mark> {
     marks
         .iter()
         .copied()
@@ -107,12 +107,27 @@ pub fn eval_decision(bot: &impl Bot, decision: Decision, eval_opps: &[State]) ->
 /// for phase2), applies meta-rules and returns either a forced move or a
 /// filtered+pruned candidate list for value-based selection.
 pub(crate) fn mark_choices(state: &State, marks: &[Mark], baseline: State, opp_best: isize) -> Decision {
+    mark_choices_with(state, marks, baseline, opp_best, true)
+}
+
+/// `mark_choices` with the safe-lock force gated by `force_lock`. With
+/// `force_lock = false` the lock becomes an ordinary candidate (rule-free
+/// pipeline used by search-value distillation); `true` reproduces production.
+pub(crate) fn mark_choices_with(
+    state: &State,
+    marks: &[Mark],
+    baseline: State,
+    opp_best: isize,
+    force_lock: bool,
+) -> Decision {
     if marks.is_empty() {
         return Decision::Forced(None);
     }
 
-    if let Some(m) = find_safe_lock(state, marks) {
-        return Decision::Forced(Some(m));
+    if force_lock {
+        if let Some(m) = find_safe_lock(state, marks) {
+            return Decision::Forced(Some(m));
+        }
     }
     // TODO: smart strike
 
@@ -239,6 +254,18 @@ fn simulate_opp_phase1(bot: &impl Bot, state: &State, opp_states: &[State], dice
 /// `Choices` carry (phase1 mark, plan end-state); the phase-2 part of each
 /// plan is internal (the chooser only commits phase 1).
 pub(crate) fn phase1_plan_choices(state: &State, comparison_opps: &[State], dice: [u8; 6]) -> Decision {
+    phase1_plan_choices_with(state, comparison_opps, dice, true)
+}
+
+/// `phase1_plan_choices` with the safe-lock force gated by `force_lock`. With
+/// `force_lock = false` the lock stays an ordinary candidate (rule-free
+/// pipeline used by search-value distillation); `true` reproduces production.
+pub(crate) fn phase1_plan_choices_with(
+    state: &State,
+    comparison_opps: &[State],
+    dice: [u8; 6],
+    force_lock: bool,
+) -> Decision {
     let white_sum = dice[0] + dice[1];
     let opp_best = comparison_opps.iter().map(|s| s.count_points()).max().unwrap_or(0);
 
@@ -299,14 +326,16 @@ pub(crate) fn phase1_plan_choices(state: &State, comparison_opps: &[State], dice
     }
 
     // Force safe lock
-    for (phase1, _, _) in &plans {
-        if let Some(m) = phase1 {
-            if state.would_lock_row(*m) && {
-                let mut s = *state;
-                s.apply_mark(*m);
-                !s.would_end_game()
-            } {
-                return Decision::Forced(Some(*m));
+    if force_lock {
+        for (phase1, _, _) in &plans {
+            if let Some(m) = phase1 {
+                if state.would_lock_row(*m) && {
+                    let mut s = *state;
+                    s.apply_mark(*m);
+                    !s.would_end_game()
+                } {
+                    return Decision::Forced(Some(*m));
+                }
             }
         }
     }
@@ -358,5 +387,59 @@ impl<T: Bot + std::fmt::Debug> super::Strategy for T {
         _active_player: usize,
     ) -> Option<Mark> {
         passive_phase1_impl(self, state, opp_states, dice)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::Mark;
+
+    /// A state with a safe lock available: red 2..6 marked, white sum 12
+    /// completes it (first lock, does not end the game).
+    fn lockable_state() -> State {
+        let mut s = State::default();
+        for n in 2..=6 {
+            s.apply_mark(Mark { row: 0, number: n });
+        }
+        s
+    }
+
+    #[test]
+    fn mark_choices_with_force_matches_production_and_without_skips_lock() {
+        let s = lockable_state();
+        let marks = vec![Mark { row: 0, number: 12 }, Mark { row: 1, number: 5 }];
+        // Forced path: identical to mark_choices.
+        match mark_choices_with(&s, &marks, s, 0, true) {
+            Decision::Forced(Some(m)) => assert_eq!(m, Mark { row: 0, number: 12 }),
+            d => panic!("expected forced lock, got {:?}", matches!(d, Decision::Choices(_))),
+        }
+        // Rule-free path: the lock is a candidate, not forced.
+        match mark_choices_with(&s, &marks, s, 0, false) {
+            Decision::Choices(c) => {
+                assert!(c.iter().any(|(m, _)| *m == Some(Mark { row: 0, number: 12 })));
+                assert!(c.len() >= 2);
+            }
+            Decision::Forced(_) => panic!("rule-free pipeline must not force here"),
+        }
+        // find_safe_lock is exposed and agrees.
+        assert_eq!(find_safe_lock(&s, &marks), Some(Mark { row: 0, number: 12 }));
+    }
+
+    #[test]
+    fn phase1_plan_choices_with_force_matches_production() {
+        let s = lockable_state();
+        let opps = [State::default()];
+        let dice = [6, 6, 1, 1, 1, 1]; // white sum 12 completes the red lock
+        match phase1_plan_choices_with(&s, &opps, dice, true) {
+            Decision::Forced(Some(m)) => assert_eq!(m, Mark { row: 0, number: 12 }),
+            _ => panic!("expected forced phase-1 lock"),
+        }
+        match phase1_plan_choices_with(&s, &opps, dice, false) {
+            Decision::Choices(c) => {
+                assert!(c.iter().any(|(m, _)| *m == Some(Mark { row: 0, number: 12 })))
+            }
+            Decision::Forced(_) => panic!("rule-free phase-1 pipeline must not force here"),
+        }
     }
 }
