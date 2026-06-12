@@ -1520,9 +1520,11 @@ unconditional `find_safe_lock` rule.
 
 **Checkpoint iteration 57 is ADOPTED** (`pair_model/model.mpk` updated, real
 file): the static guard improved, so leg 2's gated-pool refinement banked
-another ~+0.25pp. **Final campaign headline: pair (static) 59.85% vs GA**
-(from 59.1% pre-distillation; pair-search was 60.4% on the leg-1 net, not
-re-benched on iter-57).
+another ~+0.25pp. **Final campaign headline: pair (static) 59.85% vs GA,
+pair-search 60.7%** (user bench on iter-57; from 59.1%/60.1%
+pre-distillation). 60.7 is the first move past the 60.1% line that stood
+through Phases 13–14 and motivated the structural-ceiling hypothesis — the
+ceiling, if it exists, is higher than where we'd drawn it.
 
 ### Campaign conclusion (Phases 15–19)
 
