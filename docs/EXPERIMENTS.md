@@ -1204,13 +1204,20 @@ value-equivalence) plus this `VariantPair(None)` equivalence gate.
 | cdiff<=0  (t=1)  | 50.06% | 49.11% | 1.91% | 0.007pp | **+9.18** |
 | cdiff<-5  (t=-5) | 50.03% | 49.06% | 1.93% | 0.005pp | **+5.08** |
 
-The z-scores clear the spec's z>2 bar, but the **effect is +0.03..+0.06pp** —
-trivially small. It sits well inside Phase 16's perfect-substitution ceiling
-(≤ +0.7pp) and is not robust to the sampling scale: the seed-1 10k smoke gave
-arm 0 at −0.06pp (z −0.94, opposite sign), i.e. the estimate straddles zero and
-the 1M point estimate differs from the smoke by ~1.7 SE of the smoke (< the 4-SE
-abort bar — no contradiction, just noise around the null at 10k). A statistically
-detectable but practically negligible nudge.
+All three arms are **statistically, decisively positive** (z +5.08 to +9.70 at
+1M) — this is **not** a flat result in the spec's sense. The effect is real but
+**tiny: +0.03..+0.06pp**, about 0.7% of the bot's 9.1pp edge over GA and ~1/10
+of Phase 16's +0.7pp perfect-substitution ceiling. The seed-1 10k smoke (arm 0
+at −0.06pp, z −0.94) does **not** contradict this: its SE (~0.064pp) makes it
+fully consistent with a true +0.06pp at <1 SE — a 10k sample simply cannot
+resolve a sub-0.1pp effect, and carries no weight against the 1M measurement.
+Cross-arm ordering (t=0 ≈ t=1 > t=-5) tracks Phase 16's wrong-verdict coverage
+(cdiff<0 = 90.9% vs cdiff<-5 = 64.4%): wider suppression recovers marginally
+more, as expected. (The tiny SEs are a structural feature, not an anomaly:
+rotation-pairs where suppression never fires play bit-identically to baseline
+and contribute exactly 0.5 to the paired statistic, so all variance comes from
+suppression-affected pairs. The harness does not report the realized per-game
+suppression fire rate; Phase 16's firing stats imply ~0.24/game for t=0.)
 
 ### vs GA, per arm (1M, seed 0) — against the baseline yardstick
 
@@ -1232,17 +1239,26 @@ are marginally at/above the CI top, arm t=-5 is squarely inside it.
 
 Decision rule (spec `docs/superpowers/specs/2026-06-12-lock-ab-design.md`):
 adopt requires head-to-head z>2 above 50% **and** no regression vs GA; a flat
-result keeps the unconditional rule. The arms technically clear z>2 and do not
-regress vs GA, but the head-to-head magnitude (+0.03..+0.06pp) is a rounding
-error — not the meaningful improvement the rule is meant to gate. Treating this
-as **flat: keep the unconditional `find_safe_lock` rule as-is.** No arm separates
-itself enough to justify shipping a conditional gate; the cdiff<0 and cdiff<=0
-arms are indistinguishable from each other, and widening to cdiff<-5 only shrinks
-the (already negligible) edge.
+result keeps the unconditional rule. **The pre-registered criteria for adoption
+were met:** every arm clears z>2 (min +5.08) and none regresses vs GA (strict
+59.17–59.26% vs the 59.1% baseline yardstick, CI 58.97–59.20% — arms 0/1 sit
+at/just above the CI top, though that comparison is **unpaired** and on a
+different seed/run than the head-to-head, so the apparent edge over baseline is
+not itself decisive). **The recommendation is nonetheless to keep the
+unconditional `find_safe_lock` rule as-is, overriding the registered
+adopt-trigger on effect-size grounds:** the head-to-head win is only
++0.03..+0.06pp — ~0.7% of the bot's edge vs GA and ~1/10 of Phase 16's ceiling
+— far too small to justify shipping a conditional gate and maintaining the
+behavioral divergence it introduces. The cdiff<0 and cdiff<=0 arms are
+statistically indistinguishable from each other, and widening to cdiff<-5 only
+shrinks the edge, consistent with its lower wrong-verdict coverage (64.4% vs
+90.9%, Phase 16). This is an **explicit override of a met criterion, not a
+"flat" result** — the distinction matters for anyone re-reading the
+pre-registration. Adoption remains the user's call with these numbers in hand.
 
 ### Interpretation — consistent with Phase 16, not a contradiction
 
-A flat A/B does **not** refute Phase 16. The rule's measured ~0.0080 wp/game
+The tiny realized effect does **not** refute Phase 16. The rule's measured ~0.0080 wp/game
 cost is real, but Phase 16 already flagged that figure as an *upper bound under
 perfect substitution* (≈0.0069–0.0074 wp/game removable). The realized A/B
 recovers essentially none of it because the precision gap Phase 16 measured is
