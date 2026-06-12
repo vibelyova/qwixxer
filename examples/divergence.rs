@@ -63,6 +63,29 @@ enum Cmd {
         #[arg(long)]
         force_overwrite: bool,
     },
+    /// Play static-pair vs GA (rule ON); log every safe-lock force as JSONL.
+    LockRun {
+        /// Number of games (rounded up to a rotation pair)
+        #[arg(short)]
+        n: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        #[arg(long)]
+        out: String,
+        #[arg(long)]
+        force_overwrite: bool,
+    },
+    /// Adjudicate logged lock events: full-game CRN rollouts, lock vs alternatives.
+    LockAdjudicate {
+        #[arg(long)]
+        input: String,
+        #[arg(long)]
+        out: String,
+        #[arg(short, default_value_t = 2048)]
+        k: usize,
+        #[arg(long)]
+        force_overwrite: bool,
+    },
 }
 
 // ---- JSONL schema ----
@@ -135,6 +158,40 @@ struct GameEvent {
     pair_won: bool,
 }
 
+/// One safe-lock rule firing ("t":"l").
+#[derive(Serialize, Deserialize, Clone)]
+struct LockEvent {
+    t: String,
+    game: usize,
+    /// Our active-turn counter (pp1 events carry the count at the time of
+    /// the opponent's roll — a stage proxy, not our turn).
+    turn: u32,
+    /// "ap1" | "ap2" | "pp1".
+    ctx: String,
+    has_marked: Option<bool>,
+    dice: [u8; 6],
+    our: StateJson,
+    opps: Vec<StateJson>,
+    our_points: isize,
+    opp_points: isize,
+    /// The mark production forces.
+    lock_mark: (usize, u8),
+    /// Rule-free candidates, sorted desc by static value.
+    cands: Vec<CandJson>,
+    lock_idx: usize,
+    /// Best candidate that is not a safe lock (skip/strike count as non-lock
+    /// — deferral is a legitimate alternative).
+    alt_idx: usize,
+    /// Best safe lock other than the forced one, if any.
+    alt2_idx: Option<usize>,
+    n_safe_locks: usize,
+    /// True when the rule-free pipeline itself returned Forced (e.g. a
+    /// winning game-end the production lock force preempted) — the event
+    /// then has exactly two candidates: lock and that forced alternative.
+    rule_free_forced: bool,
+    seed: u64,
+}
+
 fn mark_json(m: Option<Mark>) -> Option<(usize, u8)> {
     m.map(|m| (m.row, m.number))
 }
@@ -184,6 +241,308 @@ fn gate_flags(cands: &[Cand], our: &State, opps: &[State]) -> (bool, bool) {
             .take(K_CANDIDATES)
             .any(|c| c.post.count_locked() > our.count_locked());
     (close, endgame)
+}
+
+// ---- Rule-pipeline mirrors (bot_impl.rs internals; the lock-run
+// equivalence guard fails loudly if these drift from production) ----
+
+/// Mirrors bot_impl::prune_dominated.
+fn prune_dominated<T>(items: &mut Vec<T>, state_of: impl Fn(&T) -> &State) {
+    let n = items.len();
+    let mut dominated = vec![false; n];
+    for i in 0..n {
+        if dominated[i] {
+            continue;
+        }
+        for j in (i + 1)..n {
+            if dominated[j] {
+                continue;
+            }
+            match state_of(&items[i]).partial_cmp(state_of(&items[j])) {
+                Some(std::cmp::Ordering::Greater) => dominated[j] = true,
+                Some(std::cmp::Ordering::Less) => {
+                    dominated[i] = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut idx = 0;
+    items.retain(|_| {
+        let keep = !dominated[idx];
+        idx += 1;
+        keep
+    });
+}
+
+/// Mirrors bot_impl::opp_best_phase1_score.
+fn opp_best_phase1_score(opp_states: &[State], white_sum: u8) -> isize {
+    opp_states
+        .iter()
+        .map(|opp| {
+            let base = opp.count_points();
+            opp.generate_white_moves(white_sum)
+                .iter()
+                .map(|&m| {
+                    let mut s = *opp;
+                    s.apply_mark(m);
+                    s.count_points()
+                })
+                .max()
+                .unwrap_or(base)
+                .max(base)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Mirrors bot_impl::find_safe_lock (max-points among non-ending locks).
+fn find_safe_lock(state: &State, marks: &[Mark]) -> Option<Mark> {
+    marks
+        .iter()
+        .copied()
+        .filter(|&m| state.would_lock_row(m))
+        .filter(|&m| {
+            let mut s = *state;
+            s.apply_mark(m);
+            !s.would_end_game()
+        })
+        .max_by_key(|&m| {
+            let mut s = *state;
+            s.apply_mark(m);
+            s.count_points()
+        })
+}
+
+/// Mirrors bot_impl::mark_choices with the find_safe_lock force REMOVED
+/// (production forces it before anything else). Everything downstream —
+/// winning-end force, losing-end filter, collapses, domination pruning —
+/// is byte-faithful.
+fn mark_choices_nolock(state: &State, marks: &[Mark], baseline: State, opp_best: isize) -> Decision {
+    if marks.is_empty() {
+        return Decision::Forced(None);
+    }
+    let mark_states: Vec<State> = marks
+        .iter()
+        .map(|&m| {
+            let mut s = *state;
+            s.apply_mark(m);
+            s
+        })
+        .collect();
+    if let Some((mark, _)) = mark_states
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (Some(marks[i]), s))
+        .chain(std::iter::once((None, baseline)))
+        .filter(|(_, post)| post.would_end_game() && post.count_points() > opp_best)
+        .max_by_key(|(_, post)| post.count_points())
+    {
+        return Decision::Forced(mark);
+    }
+    let mut cands: Vec<(Option<Mark>, State)> = mark_states
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (Some(marks[i]), s))
+        .chain(std::iter::once((None, baseline)))
+        .filter(|(_, s)| !(s.would_end_game() && s.count_points() < opp_best))
+        .collect();
+    if cands.is_empty() {
+        return Decision::Forced(None);
+    }
+    if cands.len() == 1 {
+        return Decision::Forced(cands[0].0);
+    }
+    prune_dominated(&mut cands, |(_, s)| s);
+    if cands.is_empty() {
+        return Decision::Forced(None);
+    }
+    if cands.len() == 1 {
+        return Decision::Forced(cands[0].0);
+    }
+    Decision::Choices(cands)
+}
+
+/// Mirrors bot_impl::phase1_plan_choices, returning BOTH what production's
+/// safe-lock scan would force and the rule-free decision. The scan runs at
+/// the exact pipeline point production runs it (after the losing-end retain,
+/// BEFORE pruning) and uses production's semantics: the FIRST safe-locking
+/// phase-1 mark in plan order — not max-points like find_safe_lock.
+fn phase1_plans_mirror(state: &State, comparison_opps: &[State], dice: [u8; 6]) -> (Option<Mark>, Decision) {
+    let white_sum = dice[0] + dice[1];
+    let opp_best = comparison_opps.iter().map(|s| s.count_points()).max().unwrap_or(0);
+    let white_marks = state.generate_white_moves(white_sum);
+    let color_marks = state.generate_color_moves(dice);
+
+    let mut plans: Vec<(Option<Mark>, Option<Mark>, State)> = Vec::new();
+    {
+        let mut s = *state;
+        s.apply_strike();
+        plans.push((None, None, s));
+    }
+    for &cm in &color_marks {
+        let mut s = *state;
+        s.apply_mark(cm);
+        plans.push((None, Some(cm), s));
+    }
+    for &wm in &white_marks {
+        let mut s = *state;
+        s.apply_mark(wm);
+        plans.push((Some(wm), None, s));
+    }
+    for &wm in &white_marks {
+        let mut post_white = *state;
+        post_white.apply_mark(wm);
+        for &cm in &post_white.generate_color_moves(dice) {
+            let mut s = post_white;
+            s.apply_mark(cm);
+            plans.push((Some(wm), Some(cm), s));
+        }
+    }
+
+    if plans.is_empty() {
+        return (None, Decision::Forced(None));
+    }
+    let winning = plans
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, post))| post.would_end_game() && post.count_points() > opp_best)
+        .max_by_key(|(_, (_, _, post))| post.count_points());
+    if let Some((i, _)) = winning {
+        return (None, Decision::Forced(plans[i].0));
+    }
+    plans.retain(|(_, _, post)| !(post.would_end_game() && post.count_points() < opp_best));
+    if plans.is_empty() {
+        let mut s = *state;
+        s.apply_strike();
+        plans.push((None, None, s));
+    }
+
+    // Production's lock scan happens HERE.
+    let mut scan_lock = None;
+    for (phase1, _, _) in &plans {
+        if let Some(m) = phase1 {
+            if state.would_lock_row(*m) && {
+                let mut s = *state;
+                s.apply_mark(*m);
+                !s.would_end_game()
+            } {
+                scan_lock = Some(*m);
+                break;
+            }
+        }
+    }
+
+    prune_dominated(&mut plans, |(_, _, s)| s);
+    (
+        scan_lock,
+        Decision::Choices(plans.into_iter().map(|(p1, _, s)| (p1, s)).collect()),
+    )
+}
+
+/// Is this candidate's mark a safe lock from `state`?
+fn is_safe_lock(state: &State, mark: Option<Mark>) -> bool {
+    match mark {
+        Some(m) if state.would_lock_row(m) => {
+            let mut s = *state;
+            s.apply_mark(m);
+            !s.would_end_game()
+        }
+        _ => false,
+    }
+}
+
+/// Built once per firing: rule-free candidates (sorted desc by static value)
+/// plus the comparison indices. Returns None when there is no real decision
+/// to adjudicate (fewer than 2 rule-free options, or the rule-free pipeline
+/// forces the lock itself).
+struct LockCands {
+    cands: Vec<Cand>,
+    lock_idx: usize,
+    alt_idx: usize,
+    alt2_idx: Option<usize>,
+    n_safe_locks: usize,
+    rule_free_forced: bool,
+}
+
+fn build_lock_cands(
+    bot: &PairStrategy,
+    state: &State,
+    eval_opps: &[State],
+    rule_free: Decision,
+    lock: Mark,
+    collapse: bool,
+) -> Option<LockCands> {
+    let (cands, rule_free_forced) = match rule_free {
+        Decision::Choices(plans) => {
+            let states: Vec<State> = plans.iter().map(|(_, s)| *s).collect();
+            let values = bot.evaluate_batch(&states, eval_opps);
+            let cands = if collapse {
+                collapse_plans(&plans, &values)
+            } else {
+                let mut c: Vec<Cand> = plans
+                    .iter()
+                    .zip(&values)
+                    .map(|((m, s), &v)| Cand {
+                        mark: *m,
+                        value: v,
+                        post: *s,
+                    })
+                    .collect();
+                c.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap());
+                c
+            };
+            (cands, false)
+        }
+        Decision::Forced(alt) => {
+            // Rule-free pipeline forces something on its own. If it's the
+            // lock there is nothing to compare; otherwise adjudicate the
+            // 2-candidate decision {forced alternative, lock}.
+            if alt == Some(lock) {
+                return None;
+            }
+            let mk = |m: Option<Mark>| {
+                let mut s = *state;
+                match m {
+                    Some(m) => s.apply_mark(m),
+                    None => {} // baseline semantics differ per ctx; post only
+                               // feeds entries, and for the skip/strike case
+                               // the entry builders re-derive the turn anyway.
+                }
+                s
+            };
+            let states = [mk(alt), mk(Some(lock))];
+            let values = bot.evaluate_batch(&states, eval_opps);
+            let mut c: Vec<Cand> = [(alt, states[0], values[0]), (Some(lock), states[1], values[1])]
+                .into_iter()
+                .map(|(m, s, v)| Cand {
+                    mark: m,
+                    value: v,
+                    post: s,
+                })
+                .collect();
+            c.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap());
+            (c, true)
+        }
+    };
+    if cands.len() < 2 {
+        return None;
+    }
+    let lock_idx = cands.iter().position(|c| c.mark == Some(lock))?;
+    let safe: Vec<usize> = (0..cands.len())
+        .filter(|&i| is_safe_lock(state, cands[i].mark))
+        .collect();
+    let alt_idx = (0..cands.len()).find(|i| !safe.contains(i))?;
+    let alt2_idx = safe.iter().copied().find(|&i| i != lock_idx);
+    Some(LockCands {
+        n_safe_locks: safe.len(),
+        cands,
+        lock_idx,
+        alt_idx,
+        alt2_idx,
+        rule_free_forced,
+    })
 }
 
 /// Mirrors main.rs (private there).
@@ -763,5 +1122,31 @@ fn main() {
             refuse_overwrite(&out, force_overwrite);
             cmd_relabel(&input, &out, k, agree_sample, seed);
         }
+        Cmd::LockRun {
+            n,
+            seed,
+            out,
+            force_overwrite,
+        } => {
+            refuse_overwrite(&out, force_overwrite);
+            cmd_lock_run(n, seed, &out);
+        }
+        Cmd::LockAdjudicate {
+            input,
+            out,
+            k,
+            force_overwrite,
+        } => {
+            refuse_overwrite(&out, force_overwrite);
+            cmd_lock_adjudicate(&input, &out, k);
+        }
     }
+}
+
+fn cmd_lock_run(_n: usize, _seed: u64, _out: &str) {
+    todo!("Task 2")
+}
+
+fn cmd_lock_adjudicate(_input: &str, _out: &str, _k: usize) {
+    todo!("Task 3")
 }
