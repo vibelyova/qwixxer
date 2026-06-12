@@ -214,9 +214,13 @@ enum Commands {
         /// Full-game rollouts per distill candidate
         #[arg(long, default_value = "32")]
         distill_k: usize,
-        /// Distill samples per (candidate, opponent)
-        #[arg(long, default_value = "4")]
+        /// Distill samples per (candidate, opponent) at gated decisions
+        #[arg(long, default_value = "2")]
         distill_m: usize,
+        /// Distill samples per (candidate, opponent) at lock firings
+        /// (weighted higher: firings are ~15x rarer than gated decisions)
+        #[arg(long, default_value = "16")]
+        distill_m_lock: usize,
         /// Probability of declining a forced safe lock during generation
         /// (0 = current behavior; the run recipe uses 0.05)
         #[arg(long, default_value = "0.0")]
@@ -619,6 +623,7 @@ fn main() {
             distill,
             distill_k,
             distill_m,
+            distill_m_lock,
             epsilon_lock,
         }) => dqn::pair_train::self_play_train(
             "pair_model",
@@ -632,7 +637,8 @@ fn main() {
             dqn::pair_train::DistillCfg {
                 enabled: distill,
                 k: distill_k,
-                m: distill_m,
+                m_gated: distill_m,
+                m_lock: distill_m_lock,
                 epsilon_lock,
             },
         ),

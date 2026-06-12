@@ -42,8 +42,14 @@ pub struct DistillCfg {
     pub enabled: bool,
     /// Full-game rollouts per candidate.
     pub k: usize,
-    /// Samples emitted per (candidate, opponent) pair.
-    pub m: usize,
+    /// Samples emitted per (candidate, opponent) pair at GATED decisions.
+    pub m_gated: usize,
+    /// Samples emitted per (candidate, opponent) pair at LOCK firings.
+    /// Weighted separately from the gated pool: lock firings are ~15x rarer
+    /// (~0.55/game vs ~8/game), so a shared m drowns the lock signal —
+    /// Phase 18 measured the lock pool at ~1% of the buffer and saw no
+    /// lock-calibration effect (lock-ab edge unchanged).
+    pub m_lock: usize,
     /// Probability of declining a forced safe lock during generation
     /// (player 0 only, like uniform ε).
     pub epsilon_lock: f32,
@@ -55,7 +61,8 @@ impl DistillCfg {
         DistillCfg {
             enabled: false,
             k: 32,
-            m: 4,
+            m_gated: 2,
+            m_lock: 16,
             epsilon_lock: 0.0,
         }
     }
@@ -731,13 +738,25 @@ fn pp1_entry(
 
 /// Emit distill samples for one game's captured contexts. Per candidate:
 /// complete the turn deterministically (entries), run K full-game CRN
-/// rollouts, and emit `m` samples per opponent pairing — value = mean
-/// future-diff, final_diff = an individual rollout's future-diff — plus the
-/// swap-doubled negated sample, matching `build_pair_samples`' conventions.
-fn build_distill_samples(boot: &PairStrategy, ctxs: &[DistillCtx], cfg: DistillCfg, seed: u64) -> Vec<PairSample> {
+/// rollouts, and emit `m_gated`/`m_lock` samples per opponent pairing —
+/// value = mean future-diff, final_diff = an individual rollout's future-diff
+/// — plus the swap-doubled negated sample, matching `build_pair_samples`'
+/// conventions. Returns `(samples, lock_pool_sample_count)`.
+fn build_distill_samples(
+    boot: &PairStrategy,
+    ctxs: &[DistillCtx],
+    cfg: DistillCfg,
+    seed: u64,
+) -> (Vec<PairSample>, usize) {
     let mut samples = Vec::new();
+    let mut lock_samples = 0usize;
 
     for ctx in ctxs {
+        let (m, is_lock_ctx) = match ctx {
+            DistillCtx::Gated { .. } => (cfg.m_gated, false),
+            DistillCtx::Lock { .. } => (cfg.m_lock, true),
+        };
+        let before = samples.len();
         // (compared candidate marks+posts, entries, first_active, rollout seed)
         let (compared, entries, first_active, roll_seed): (
             Vec<(Option<Mark>, State)>,
@@ -878,7 +897,7 @@ fn build_distill_samples(boot: &PairStrategy, ctxs: &[DistillCtx], cfg: DistillC
                         final_diff: -fdiff,
                     });
                 } else {
-                    for r in 0..cfg.m {
+                    for r in 0..m {
                         let fdiff = diffs[r % diffs.len()];
                         samples.push(PairSample {
                             features: feats,
@@ -897,13 +916,16 @@ fn build_distill_samples(boot: &PairStrategy, ctxs: &[DistillCtx], cfg: DistillC
         // `compared` is intentionally unused after building entries: candidate
         // identity is implicit in entry order; sample emission reads entry states.
         let _ = compared;
+        if is_lock_ctx {
+            lock_samples += samples.len() - before;
+        }
     }
 
     // `seed` is intentionally unused: rollouts reseed per-ctx via context_seed
     // (roll_seed) so each decision's CRN rollouts are deterministic on its own
     // board, independent of the per-game seed.
     let _ = seed;
-    samples
+    (samples, lock_samples)
 }
 
 /// Build training samples from one player's trajectory: one TD(λ) chain per
@@ -973,7 +995,7 @@ fn play_training_game(
     epsilon: f32,
     seed: u64,
     distill: DistillCfg,
-) -> (Vec<PairSample>, f32, usize) {
+) -> (Vec<PairSample>, f32, usize, usize) {
     use crate::game::{Game, Player};
 
     let n = num_opponents + 1;
@@ -1028,18 +1050,20 @@ fn play_training_game(
 
     // Post-game distill emission for player 0's captured contexts.
     let mut distill_count = 0;
+    let mut lock_count = 0;
     if let Some(buf) = &distill_buf {
         let ctxs = std::mem::take(&mut *buf.borrow_mut());
         if !ctxs.is_empty() {
             // The boot net (player 0's net) drives rollouts and value re-eval.
             let boot = PairStrategy::from_model(model.clone(), device.clone());
-            let ds = build_distill_samples(&boot, &ctxs, distill, seed);
+            let (ds, locks) = build_distill_samples(&boot, &ctxs, distill, seed);
             distill_count = ds.len();
+            lock_count = locks;
             all_samples.extend(ds);
         }
     }
 
-    (all_samples, finals[0], distill_count)
+    (all_samples, finals[0], distill_count, lock_count)
 }
 
 /// Same fixed-game-set paired benchmark as `train::benchmark_vs_ga`, for the
@@ -1131,8 +1155,8 @@ pub fn self_play_train(
     }
     if distill.enabled {
         println!(
-            "Distillation: emitting rollout-value targets (K={}, m={}, epsilon_lock={:.3})",
-            distill.k, distill.m, distill.epsilon_lock
+            "Distillation: emitting rollout-value targets (K={}, m_gated={}, m_lock={}, epsilon_lock={:.3})",
+            distill.k, distill.m_gated, distill.m_lock, distill.epsilon_lock
         );
     }
 
@@ -1150,7 +1174,7 @@ pub fn self_play_train(
 
         let models: Vec<PairModel<MyBackend>> = (0..game_configs.len()).map(|_| model.clone()).collect();
 
-        let game_results: Vec<(Vec<PairSample>, f32, usize)> = game_configs
+        let game_results: Vec<(Vec<PairSample>, f32, usize, usize)> = game_configs
             .into_par_iter()
             .zip(models.into_par_iter())
             .enumerate()
@@ -1160,9 +1184,10 @@ pub fn self_play_train(
             })
             .collect();
 
-        let game_scores: Vec<f32> = game_results.iter().map(|(_, score, _)| *score).collect();
-        let distill_samples: usize = game_results.iter().map(|(_, _, d)| *d).sum();
-        let new_samples: Vec<PairSample> = game_results.into_iter().flat_map(|(s, _, _)| s).collect();
+        let game_scores: Vec<f32> = game_results.iter().map(|(_, score, _, _)| *score).collect();
+        let distill_samples: usize = game_results.iter().map(|(_, _, d, _)| *d).sum();
+        let lock_pool_samples: usize = game_results.iter().map(|(_, _, _, l)| *l).sum();
+        let new_samples: Vec<PairSample> = game_results.into_iter().flat_map(|(s, _, _, _)| s).collect();
         let avg_score = if game_scores.is_empty() {
             0.0
         } else {
@@ -1177,9 +1202,10 @@ pub fn self_play_train(
         let all_samples: Vec<PairSample> = replay_buffer.iter().flatten().copied().collect();
         if distill.enabled {
             println!(
-                "  Generated {} new samples (avg score: {avg_score:.1}), of which {} distill, replay buffer: {} total",
+                "  Generated {} new samples (avg score: {avg_score:.1}), of which {} distill ({} lock-pool), replay buffer: {} total",
                 replay_buffer.back().unwrap().len(),
                 distill_samples,
+                lock_pool_samples,
                 all_samples.len()
             );
         } else {
@@ -1513,8 +1539,8 @@ mod tests {
         let model = PairModelConfig::new().init::<MyBackend>(&device);
 
         let run = || play_training_game(&model, &device, 1, true, 0.07, 4242, DistillCfg::off());
-        let (s1, f1, _) = run();
-        let (s2, f2, _) = run();
+        let (s1, f1, _, _) = run();
+        let (s2, f2, _, _) = run();
         assert_eq!(f1, f2);
         assert_eq!(s1.len(), s2.len());
         for (a, b) in s1.iter().zip(&s2) {
@@ -1545,7 +1571,8 @@ mod tests {
         let cfg = DistillCfg {
             enabled: true,
             k: 8,
-            m: 4,
+            m_gated: 4,
+            m_lock: 16,
             epsilon_lock: 0.0,
         };
 
@@ -1566,7 +1593,8 @@ mod tests {
             cands: vec![(Some(Mark { row: 0, number: 5 }), post_a), (Some(Mark { row: 1, number: 6 }), post_b)],
         };
 
-        let samples = build_distill_samples(&boot, std::slice::from_ref(&ctx), cfg, 0);
+        let (samples, lock_samples) = build_distill_samples(&boot, std::slice::from_ref(&ctx), cfg, 0);
+        assert_eq!(lock_samples, 0, "a gated ctx contributes no lock-pool samples");
 
         // Count = #candidates(2) × #opponents(1) × m(4) × 2 (swap) = 16.
         assert_eq!(samples.len(), 16, "emission count must match candidates×opp×m×swap");
@@ -1600,8 +1628,8 @@ mod tests {
             let exp_value = diffs.iter().sum::<f32>() / diffs.len() as f32;
 
             // candidate ci's forward samples are at indices ci*m*2, +2, +4, ...
-            let base = ci * cfg.m * 2;
-            let fwds: Vec<&PairSample> = (0..cfg.m).map(|r| &samples[base + r * 2]).collect();
+            let base = ci * cfg.m_gated * 2;
+            let fwds: Vec<&PairSample> = (0..cfg.m_gated).map(|r| &samples[base + r * 2]).collect();
             for f in &fwds {
                 assert!((f.value - exp_value).abs() < 1e-5, "all m samples share the mean value");
             }
@@ -1614,6 +1642,48 @@ mod tests {
                 "final_diffs must vary around the mean (σ reference)"
             );
         }
+    }
+
+    #[test]
+    fn lock_ctx_uses_m_lock_and_is_counted() {
+        let boot = distill_boot();
+        let cfg = DistillCfg {
+            enabled: true,
+            k: 8,
+            m_gated: 2,
+            m_lock: 5,
+            epsilon_lock: 0.0,
+        };
+
+        // ap2 firing on the lockable state: red die pair gives red 12.
+        let state = lockable();
+        let opp = State::default();
+        let dice = [6u8, 6, 6, 1, 1, 1];
+        let marks = state.generate_color_moves(dice);
+        let lock = crate::strategy::bot_impl::find_safe_lock(&state, &marks).expect("fixture must have a safe lock");
+        let rule_free =
+            match crate::strategy::bot_impl::mark_choices_with(&state, &marks, state, 0, false) {
+                crate::strategy::bot_impl::Decision::Choices(c) => c,
+                _ => panic!("rule-free fixture must yield choices"),
+            };
+        let ctx = DistillCtx::Lock {
+            ctx: LockCtx::Ap2,
+            state,
+            opps: vec![opp],
+            sim_opp: vec![],
+            dice,
+            active_player: 0,
+            cands: rule_free,
+            lock,
+        };
+
+        let (samples, lock_samples) = build_distill_samples(&boot, std::slice::from_ref(&ctx), cfg, 0);
+        // Compared set = lock + best non-lock (no runner-up lock on this
+        // board); neither entry ends the game (first lock). Count =
+        // 2 cands × 1 opp × m_lock(5) × 2 swap = 20 — m_gated(2) must NOT
+        // apply here.
+        assert_eq!(samples.len(), 20, "lock ctx must emit with m_lock");
+        assert_eq!(lock_samples, samples.len(), "all samples from a lock ctx count as lock-pool");
     }
 
     #[test]
@@ -1678,8 +1748,8 @@ mod tests {
         // capture path is fully bypassed). The existing suite staying green is
         // the true pre-change equivalence; this pins determinism.
         let run = || play_training_game(&model, &device, 1, false, 0.1, 7777, DistillCfg::off());
-        let (s1, f1, d1) = run();
-        let (s2, f2, d2) = run();
+        let (s1, f1, d1, _) = run();
+        let (s2, f2, d2, _) = run();
         assert_eq!(d1, 0, "disabled distill emits zero distill samples");
         assert_eq!(d2, 0);
         assert_eq!(f1, f2);
@@ -1694,8 +1764,8 @@ mod tests {
         // epsilon_lock=0 but enabled=false — i.e. the enabled flag gates all of
         // it. (Run with enabled but k=m=0 would change nothing only if no ctx;
         // we assert the off path equals a second off path above.)
-        let (s3, _, _) = play_training_game(&model, &device, 2, false, 0.1, 7777, DistillCfg::off());
-        let (s4, _, _) = play_training_game(&model, &device, 2, false, 0.1, 7777, DistillCfg::off());
+        let (s3, _, _, _) = play_training_game(&model, &device, 2, false, 0.1, 7777, DistillCfg::off());
+        let (s4, _, _, _) = play_training_game(&model, &device, 2, false, 0.1, 7777, DistillCfg::off());
         assert_eq!(s3.len(), s4.len());
     }
 }
