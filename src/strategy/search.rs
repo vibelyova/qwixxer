@@ -127,19 +127,117 @@ struct Candidate {
     post: State,
 }
 
-/// Gate predicate. `our` is the pre-decision state (lock comparisons are
-/// relative to it).
-fn gates(cands: &[Candidate], our: &State, opps: &[State]) -> (bool, bool) {
-    let close = cands[0].value - cands[1].value < GATE_MARGIN;
+/// Gate predicate over (static value, post-move state) pairs sorted desc by
+/// value. `our` is the pre-decision state (lock comparisons are relative to
+/// it). `pub(crate)` so training-time distillation can reuse the exact gate
+/// semantics; the (value, post) signature avoids exposing the private
+/// `Candidate` type.
+pub(crate) fn gates(values: &[(f32, State)], our: &State, opps: &[State]) -> (bool, bool) {
+    let close = values[0].0 - values[1].0 < GATE_MARGIN;
     let endgame = our.count_locked() >= 1
         || opps.iter().any(|s| s.count_locked() >= 1)
         || our.strikes >= 3
         || opps.iter().any(|s| s.strikes >= 3)
-        || cands
+        || values
             .iter()
             .take(K_CANDIDATES)
-            .any(|c| c.post.count_locked() > our.count_locked());
+            .any(|(_, post)| post.count_locked() > our.count_locked());
     (close, endgame)
+}
+
+/// Deterministic completion of our turn after a phase-1 mark choice:
+/// opponents' (simultaneous) phase-1 marks are `sim_opp` and our phase 2 is
+/// re-decided. Returns (all-player states, game-ended). Extracted from
+/// `SearchBot::active_phase1` for reuse by training-time distillation.
+pub(crate) fn phase1_entry(
+    bot: &impl Bot,
+    state: &State,
+    sim_opp: &[State],
+    dice: [u8; 6],
+    mark: Option<Mark>,
+) -> (Vec<State>, bool) {
+    let mut our = *state;
+    if let Some(m) = mark {
+        our.apply_mark(m);
+    }
+    let mut all: Vec<State> = std::iter::once(our).chain(sim_opp.iter().copied()).collect();
+    SimGame::propagate_locks(&mut all);
+    if SimGame::game_over(&all) {
+        return (all, true);
+    }
+    let view = SimGame::opp_view(&all, 0);
+    let d = active_phase2_choices(&all[0], &view, dice, mark.is_some());
+    match eval_decision(bot, d, &view) {
+        Some(m) => all[0].apply_mark(m),
+        None if mark.is_none() => all[0].apply_strike(),
+        None => {}
+    }
+    SimGame::propagate_locks(&mut all);
+    let ended = SimGame::game_over(&all);
+    (all, ended)
+}
+
+/// Post-phase-2 entry: candidate post-state + current opponents.
+/// Extracted from `SearchBot::active_phase2`.
+pub(crate) fn phase2_entry(post: State, opps: &[State]) -> (Vec<State>, bool) {
+    let mut all: Vec<State> = std::iter::once(post).chain(opps.iter().copied()).collect();
+    SimGame::propagate_locks(&mut all);
+    let ended = SimGame::game_over(&all);
+    (all, ended)
+}
+
+/// Full-game CRN rollouts: every sample rolled to completion; returns the
+/// final all-player states per entry per sample (ended entries: one element,
+/// the entry itself). `first_active` = first player to act in the rollout.
+/// Used by training-time distillation; the truncated production scorer in
+/// `search_pick` is unaffected.
+pub(crate) fn rollout_final_states(
+    bot: &impl Bot,
+    entries: &[(Vec<State>, bool)],
+    seed: u64,
+    k: usize,
+    first_active: usize,
+) -> Vec<Vec<Vec<State>>> {
+    let n = entries[0].0.len();
+    let mut sims: Vec<SimGame> = Vec::new();
+    let mut sim_owner: Vec<usize> = Vec::new();
+    for (ei, (states, ended)) in entries.iter().enumerate() {
+        if *ended {
+            continue;
+        }
+        for s in 0..k {
+            sims.push(SimGame {
+                states: states.clone(),
+                active: first_active,
+                rngs: (0..n)
+                    .map(|p| SmallRng::seed_from_u64(sample_player_seed(seed, s, p)))
+                    .collect(),
+                over: false,
+            });
+            sim_owner.push(ei);
+        }
+    }
+    let mut driver = BatchedRollouts::new(bot, sims);
+    let mut turns = 0;
+    while !driver.all_over() {
+        driver.step_turn();
+        turns += 1;
+        assert!(turns <= 200, "rollout exceeded 200 turns — game-end invariant violated");
+    }
+    let mut out: Vec<Vec<Vec<State>>> = entries
+        .iter()
+        .map(|(states, ended)| {
+            if *ended {
+                vec![states.clone()]
+            } else {
+                Vec::with_capacity(k)
+            }
+        })
+        .collect();
+    for (i, sim) in driver.sims.iter().enumerate() {
+        out[sim_owner[i]].push(sim.states.clone());
+    }
+    out
 }
 
 impl<B: WinProb> SearchBot<B> {
@@ -236,7 +334,8 @@ impl<B: WinProb> SearchBot<B> {
             stats.borrow_mut().eligible += 1;
             stats.borrow_mut().gaps.push(cands[0].value - cands[1].value);
         }
-        let (close, endgame) = gates(cands, our, opps);
+        let value_posts: Vec<(f32, State)> = cands.iter().map(|c| (c.value, c.post)).collect();
+        let (close, endgame) = gates(&value_posts, our, opps);
         if let Some(stats) = &self.stats {
             let mut s = stats.borrow_mut();
             if close {
@@ -313,28 +412,7 @@ impl<B: WinProb> Strategy for SearchBot<B> {
         let shortlist = &cands[..cands.len().min(K_CANDIDATES)];
         let entries: Vec<(Vec<State>, bool)> = shortlist
             .iter()
-            .map(|c| {
-                let mut our = *state;
-                if let Some(m) = c.mark {
-                    our.apply_mark(m);
-                }
-                let mut all: Vec<State> = std::iter::once(our).chain(sim_opp.iter().copied()).collect();
-                SimGame::propagate_locks(&mut all);
-                if SimGame::game_over(&all) {
-                    return (all, true);
-                }
-                // Phase 2, re-decided exactly like real play would follow up.
-                let view = SimGame::opp_view(&all, 0);
-                let d = active_phase2_choices(&all[0], &view, dice, c.mark.is_some());
-                match eval_decision(&self.bot, d, &view) {
-                    Some(m) => all[0].apply_mark(m),
-                    None if c.mark.is_none() => all[0].apply_strike(),
-                    None => {}
-                }
-                SimGame::propagate_locks(&mut all);
-                let ended = SimGame::game_over(&all);
-                (all, ended)
-            })
+            .map(|c| phase1_entry(&self.bot, state, &sim_opp, dice, c.mark))
             .collect();
 
         let seed = context_seed(state, opp_states, dice);
@@ -376,12 +454,7 @@ impl<B: WinProb> Strategy for SearchBot<B> {
         let shortlist = &cands[..cands.len().min(K_CANDIDATES)];
         let entries: Vec<(Vec<State>, bool)> = shortlist
             .iter()
-            .map(|c| {
-                let mut all: Vec<State> = std::iter::once(c.post).chain(opp_states.iter().copied()).collect();
-                SimGame::propagate_locks(&mut all);
-                let ended = SimGame::game_over(&all);
-                (all, ended)
-            })
+            .map(|c| phase2_entry(c.post, opp_states))
             .collect();
 
         let seed = context_seed(state, opp_states, dice);
@@ -459,11 +532,7 @@ mod tests {
 
     #[test]
     fn gate_predicate_truth_table() {
-        let mk = |value, post: State| Candidate {
-            mark: None,
-            value,
-            post,
-        };
+        let mk = |value: f32, post: State| (value, post);
         let fresh = State::default();
         let mut locked_one = State::default();
         for n in 2..=6 {
@@ -517,6 +586,35 @@ mod tests {
         let m1 = bot.active_phase2(&state, &opps, [3, 4, 2, 3, 5, 1], true);
         let m2 = bot.active_phase2(&state, &opps, [3, 4, 2, 3, 5, 1], true);
         assert_eq!(m1, m2);
+    }
+
+    #[test]
+    fn rollout_final_states_full_games_deterministic() {
+        let bot = test_bot();
+        let a = State::default();
+        let b = State::default();
+        let entries = vec![
+            phase2_entry(a, &[b]),
+            {
+                let mut marked = a;
+                marked.apply_mark(Mark { row: 0, number: 5 });
+                phase2_entry(marked, &[b])
+            },
+        ];
+        let r1 = rollout_final_states(&bot, &entries, 7, 8, 1 % 2);
+        let r2 = rollout_final_states(&bot, &entries, 7, 8, 1 % 2);
+        assert_eq!(r1.len(), 2);
+        assert_eq!(r1[0].len(), 8);
+        // Every rollout reached a real game end and is reproducible.
+        for (e1, e2) in r1.iter().zip(&r2) {
+            for (s1, s2) in e1.iter().zip(e2) {
+                assert!(SimGame::game_over(s1));
+                assert_eq!(
+                    s1.iter().map(|s| s.count_points()).collect::<Vec<_>>(),
+                    s2.iter().map(|s| s.count_points()).collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[test]
