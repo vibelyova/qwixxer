@@ -454,9 +454,11 @@ fn is_safe_lock(state: &State, mark: Option<Mark>) -> bool {
 }
 
 /// Built once per firing: rule-free candidates (sorted desc by static value)
-/// plus the comparison indices. Returns None when there is no real decision
-/// to adjudicate (fewer than 2 rule-free options, or the rule-free pipeline
-/// forces the lock itself).
+/// plus the comparison indices. Returns Err(reason) when there is no real
+/// decision to adjudicate: `forced_lock_itself` (rule-free pipeline forces
+/// the lock), `lt2_cands` (fewer than 2 rule-free options), `lock_pruned`
+/// (lock not in the rebuilt candidate set), `all_safe_locks` (no non-lock
+/// candidate). These skips are tallied rather than silently dropped.
 struct LockCands {
     cands: Vec<Cand>,
     lock_idx: usize,
@@ -474,7 +476,7 @@ fn build_lock_cands(
     rule_free: Decision,
     lock: Mark,
     collapse: bool,
-) -> Option<LockCands> {
+) -> Result<LockCands, &'static str> {
     let (cands, rule_free_forced) = match rule_free {
         Decision::Choices(plans) => {
             let states: Vec<State> = plans.iter().map(|(_, s)| *s).collect();
@@ -501,7 +503,7 @@ fn build_lock_cands(
             // lock there is nothing to compare; otherwise adjudicate the
             // 2-candidate decision {forced alternative, lock}.
             if alt == Some(lock) {
-                return None;
+                return Err("forced_lock_itself");
             }
             let mk = |m: Option<Mark>| match m {
                 Some(m) => {
@@ -527,15 +529,18 @@ fn build_lock_cands(
         }
     };
     if cands.len() < 2 {
-        return None;
+        return Err("lt2_cands");
     }
-    let lock_idx = cands.iter().position(|c| c.mark == Some(lock))?;
+    let lock_idx = cands
+        .iter()
+        .position(|c| c.mark == Some(lock))
+        .ok_or("lock_pruned")?;
     let safe: Vec<usize> = (0..cands.len())
         .filter(|&i| is_safe_lock(state, cands[i].mark))
         .collect();
-    let alt_idx = (0..cands.len()).find(|i| !safe.contains(i))?;
+    let alt_idx = (0..cands.len()).find(|i| !safe.contains(i)).ok_or("all_safe_locks")?;
     let alt2_idx = safe.iter().copied().find(|&i| i != lock_idx);
-    Some(LockCands {
+    Ok(LockCands {
         n_safe_locks: safe.len(),
         cands,
         lock_idx,
@@ -706,6 +711,7 @@ impl Strategy for ShadowPair {
 struct LockShadowPair {
     static_bot: PairStrategy,
     events: Rc<RefCell<Vec<LockEvent>>>,
+    skips: Rc<RefCell<Vec<&'static str>>>,
     turn: u32,
 }
 
@@ -716,10 +722,15 @@ impl std::fmt::Debug for LockShadowPair {
 }
 
 impl LockShadowPair {
-    fn new(template: &PairStrategy, events: Rc<RefCell<Vec<LockEvent>>>) -> Self {
+    fn new(
+        template: &PairStrategy,
+        events: Rc<RefCell<Vec<LockEvent>>>,
+        skips: Rc<RefCell<Vec<&'static str>>>,
+    ) -> Self {
         LockShadowPair {
             static_bot: PairStrategy::from_shared(template.model.clone(), template.device),
             events,
+            skips,
             turn: 0,
         }
     }
@@ -781,10 +792,13 @@ impl Strategy for LockShadowPair {
             assert_eq!(
                 forced,
                 Some(Some(lock)),
-                "ap1 lock-force mismatch (mirror drift): mirror {lock:?}, production {forced:?}"
+                "ap1 lock-force mismatch (mirror drift) at turn {} seed {}: mirror {lock:?}, production {forced:?}",
+                self.turn,
+                context_seed(state, &sim_opp, dice)
             );
-            if let Some(lc) = build_lock_cands(&self.static_bot, state, &sim_opp, *state, rule_free, lock, true) {
-                self.log("ap1", None, state, opp_states, dice, lock, lc);
+            match build_lock_cands(&self.static_bot, state, &sim_opp, *state, rule_free, lock, true) {
+                Ok(lc) => self.log("ap1", None, state, opp_states, dice, lock, lc),
+                Err(reason) => self.skips.borrow_mut().push(reason),
             }
         }
         prod_move
@@ -803,7 +817,9 @@ impl Strategy for LockShadowPair {
             assert_eq!(
                 forced,
                 Some(Some(lock)),
-                "ap2 lock-force mismatch (mirror drift): mirror {lock:?}, production {forced:?}"
+                "ap2 lock-force mismatch (mirror drift) at turn {} seed {}: mirror {lock:?}, production {forced:?}",
+                self.turn,
+                context_seed(state, opp_states, dice)
             );
             let baseline = if has_marked {
                 *state
@@ -814,8 +830,9 @@ impl Strategy for LockShadowPair {
             };
             let opp_best = opp_states.iter().map(|s| s.count_points()).max().unwrap_or(0);
             let rule_free = mark_choices_nolock(state, &marks, baseline, opp_best);
-            if let Some(lc) = build_lock_cands(&self.static_bot, state, opp_states, baseline, rule_free, lock, false) {
-                self.log("ap2", Some(has_marked), state, opp_states, dice, lock, lc);
+            match build_lock_cands(&self.static_bot, state, opp_states, baseline, rule_free, lock, false) {
+                Ok(lc) => self.log("ap2", Some(has_marked), state, opp_states, dice, lock, lc),
+                Err(reason) => self.skips.borrow_mut().push(reason),
             }
         }
         prod_move
@@ -835,12 +852,15 @@ impl Strategy for LockShadowPair {
             assert_eq!(
                 prod_move,
                 Some(lock),
-                "pp1 lock-force mismatch (mirror drift): mirror {lock:?}, production {prod_move:?}"
+                "pp1 lock-force mismatch (mirror drift) at turn {} seed {}: mirror {lock:?}, production {prod_move:?}",
+                self.turn,
+                context_seed(state, opp_states, dice)
             );
             let opp_best = opp_best_phase1_score(opp_states, white_sum);
             let rule_free = mark_choices_nolock(state, &marks, *state, opp_best);
-            if let Some(lc) = build_lock_cands(&self.static_bot, state, opp_states, *state, rule_free, lock, false) {
-                self.log("pp1", None, state, opp_states, dice, lock, lc);
+            match build_lock_cands(&self.static_bot, state, opp_states, *state, rule_free, lock, false) {
+                Ok(lc) => self.log("pp1", None, state, opp_states, dice, lock, lc),
+                Err(reason) => self.skips.borrow_mut().push(reason),
             }
         }
         prod_move
@@ -1294,16 +1314,17 @@ fn lock_play_one(
     champion: &DNA,
     game_idx: usize,
     base_seed: u64,
-) -> (GameEvent, Vec<LockEvent>) {
+) -> (GameEvent, Vec<LockEvent>, Vec<&'static str>) {
     let pairing = game_idx / 2;
     let rotation = game_idx % 2;
     let pair_seat = (1 + rotation) % 2;
     let events = Rc::new(RefCell::new(Vec::new()));
+    let skips = Rc::new(RefCell::new(Vec::new()));
     let players: Vec<Player> = (0..2)
         .map(|j| {
             let dice = Box::new(SmallRng::seed_from_u64(seat_dice_seed(base_seed, pairing, j)));
             let strategy: Box<dyn Strategy> = if j == pair_seat {
-                Box::new(LockShadowPair::new(pair_template, events.clone()))
+                Box::new(LockShadowPair::new(pair_template, events.clone(), skips.clone()))
             } else {
                 Box::new(champion.clone())
             };
@@ -1322,6 +1343,9 @@ fn lock_play_one(
     for e in &mut evs {
         e.game = game_idx;
     }
+    let skips = Rc::try_unwrap(skips)
+        .unwrap_or_else(|_| panic!("skips Rc still shared"))
+        .into_inner();
     let pair_won = scores[pair_seat] == max && unique_winner;
     (
         GameEvent {
@@ -1332,6 +1356,7 @@ fn lock_play_one(
             pair_won,
         },
         evs,
+        skips,
     )
 }
 
@@ -1339,7 +1364,7 @@ fn cmd_lock_run(n: usize, seed: u64, out: &str) {
     use rayon::prelude::*;
     let num_games = n.div_ceil(2) * 2;
     eprintln!("lock-run: {num_games} games, seed {seed} -> {out}");
-    let results: Vec<(GameEvent, Vec<LockEvent>)> = (0..num_games)
+    let results: Vec<(GameEvent, Vec<LockEvent>, Vec<&'static str>)> = (0..num_games)
         .into_par_iter()
         .map_init(
             || {
@@ -1354,7 +1379,7 @@ fn cmd_lock_run(n: usize, seed: u64, out: &str) {
         .collect();
 
     let mut f = std::io::BufWriter::new(std::fs::File::create(out).unwrap());
-    for (g, evs) in &results {
+    for (g, evs, _) in &results {
         for e in evs {
             writeln!(f, "{}", serde_json::to_string(e).unwrap()).unwrap();
         }
@@ -1362,7 +1387,7 @@ fn cmd_lock_run(n: usize, seed: u64, out: &str) {
     }
     f.flush().unwrap();
 
-    let all: Vec<&LockEvent> = results.iter().flat_map(|(_, e)| e).collect();
+    let all: Vec<&LockEvent> = results.iter().flat_map(|(_, e, _)| e).collect();
     let per_ctx = |c: &str| all.iter().filter(|e| e.ctx == c).count();
     println!(
         "{num_games} games, {} lock events ({:.2}/game): ap1 {} / ap2 {} / pp1 {}",
@@ -1376,6 +1401,23 @@ fn cmd_lock_run(n: usize, seed: u64, out: &str) {
         "multi-lock states: {}, rule-free-forced: {}",
         all.iter().filter(|e| e.n_safe_locks > 1).count(),
         all.iter().filter(|e| e.rule_free_forced).count()
+    );
+
+    let skips: Vec<&'static str> = results.iter().flat_map(|(_, _, s)| s.iter().copied()).collect();
+    let total = all.len() + skips.len();
+    let count = |r: &str| skips.iter().filter(|&&s| s == r).count();
+    let breakdown: Vec<String> = ["lock_pruned", "forced_lock_itself", "all_safe_locks", "lt2_cands"]
+        .iter()
+        .filter_map(|r| {
+            let n = count(r);
+            (n > 0).then(|| format!("{r} {n}"))
+        })
+        .collect();
+    println!(
+        "skipped firings: {} of {} total ({})",
+        skips.len(),
+        total,
+        breakdown.join(", ")
     );
 }
 
