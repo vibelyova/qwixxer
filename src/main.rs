@@ -207,6 +207,20 @@ enum Commands {
         /// (expert iteration)
         #[arg(long)]
         search: bool,
+        /// Emit rollout-derived value targets at gated and lock-forced
+        /// decisions (search-value distillation)
+        #[arg(long)]
+        distill: bool,
+        /// Full-game rollouts per distill candidate
+        #[arg(long, default_value = "32")]
+        distill_k: usize,
+        /// Distill samples per (candidate, opponent)
+        #[arg(long, default_value = "4")]
+        distill_m: usize,
+        /// Probability of declining a forced safe lock during generation
+        /// (0 = current behavior; the run recipe uses 0.05)
+        #[arg(long, default_value = "0.0")]
+        epsilon_lock: f32,
     },
 }
 
@@ -602,6 +616,10 @@ fn main() {
             checkpoints,
             start_iteration,
             search,
+            distill,
+            distill_k,
+            distill_m,
+            epsilon_lock,
         }) => dqn::pair_train::self_play_train(
             "pair_model",
             iterations,
@@ -611,6 +629,12 @@ fn main() {
             checkpoints,
             start_iteration,
             search,
+            dqn::pair_train::DistillCfg {
+                enabled: distill,
+                k: distill_k,
+                m: distill_m,
+                epsilon_lock,
+            },
         ),
         None => {
             // Default: play against MCTS

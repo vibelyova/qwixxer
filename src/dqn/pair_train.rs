@@ -7,8 +7,15 @@ use crate::bot::{self, DNA};
 use crate::dqn::pair::{pair_features, PairModel, PairModelConfig, PairStrategy, BOARD_FEATURES, PAIR_FEATURES};
 use crate::dqn::{MyBackend, LOG_VAR_MAX, LOG_VAR_MIN, TRAIN_SEED};
 use crate::state::{Mark, State};
-use crate::strategy::search::SearchBot;
-use crate::strategy::Strategy;
+use crate::strategy::bot_impl::{
+    active_phase1_choices, active_phase2_choices, eval_decision, find_safe_lock, mark_choices_with,
+    opp_best_phase1_score, passive_phase1_impl, phase1_plan_choices_with, Decision,
+};
+use crate::strategy::search::{
+    context_seed, gates, phase1_entry, phase2_entry, rollout_final_states, SearchBot,
+};
+use crate::strategy::sim::SimGame;
+use crate::strategy::{Bot, Strategy};
 use burn::{
     backend::Autodiff,
     data::{
@@ -28,6 +35,31 @@ use std::sync::Arc;
 type MyAutodiffBackend = Autodiff<MyBackend>;
 
 const LAMBDA: f32 = 0.8;
+
+/// Distillation configuration (all off ⇒ behavior identical to before).
+#[derive(Clone, Copy)]
+pub struct DistillCfg {
+    pub enabled: bool,
+    /// Full-game rollouts per candidate.
+    pub k: usize,
+    /// Samples emitted per (candidate, opponent) pair.
+    pub m: usize,
+    /// Probability of declining a forced safe lock during generation
+    /// (player 0 only, like uniform ε).
+    pub epsilon_lock: f32,
+}
+
+impl DistillCfg {
+    /// The disabled config used by every non-distilling caller.
+    pub fn off() -> Self {
+        DistillCfg {
+            enabled: false,
+            k: 32,
+            m: 4,
+            epsilon_lock: 0.0,
+        }
+    }
+}
 
 /// Absolute-space TD(λ) targets over one diff chain.
 ///
@@ -246,11 +278,50 @@ impl PairPolicy {
 /// after every real decision — including skips, which the old recorder
 /// dropped (skip afterstates are evaluated at inference, so they belong in
 /// the training distribution).
+/// A decision worth distilling, captured during play; rollouts happen
+/// post-game.
+enum DistillCtx {
+    /// Gated (close/endgame) active decision: top-2 candidates by static value.
+    /// `sim_opp` is the evaluation context (ap1: simulated post-phase1 opps;
+    /// ap2: current opps). `cands` = (mark, post/end state) sorted desc by value.
+    Gated {
+        phase: u8,
+        state: State,
+        opps: Vec<State>,
+        sim_opp: Vec<State>,
+        dice: [u8; 6],
+        cands: Vec<(Option<Mark>, State)>,
+    },
+    /// Safe-lock firing: the rule-free candidate list (lock + alternatives);
+    /// the lock / best-non-lock / runner-up-lock trio is selected at emission.
+    Lock {
+        ctx: LockCtx,
+        state: State,
+        opps: Vec<State>,
+        sim_opp: Vec<State>,  // ap1 only; empty otherwise
+        dice: [u8; 6],
+        active_player: usize, // pp1 only (opp-relative index of the active player); 0 otherwise
+        cands: Vec<(Option<Mark>, State)>,
+        lock: Mark,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LockCtx {
+    Ap1,
+    Ap2,
+    Pp1,
+}
+
 struct RecordingPair {
     policy: PairPolicy,
     epsilon: f32,
     rng: SmallRng,
     recorded: std::rc::Rc<std::cell::RefCell<Vec<Snapshot>>>,
+    /// Player-0-only distill capture buffer (None ⇒ no capture).
+    distill: Option<std::rc::Rc<std::cell::RefCell<Vec<DistillCtx>>>>,
+    /// Probability of declining a forced safe lock (player 0 only).
+    epsilon_lock: f32,
 }
 
 impl std::fmt::Debug for RecordingPair {
@@ -259,22 +330,133 @@ impl std::fmt::Debug for RecordingPair {
     }
 }
 
+/// Collapse phase-1 plans to distinct phase-1 marks (best static value per
+/// mark wins, keeping that plan's end-state), then sort descending by value.
+/// Mirrors the collapse loop in `SearchBot::active_phase1`.
+fn collapse_plans(plans: &[(Option<Mark>, State)], values: &[f32]) -> Vec<(Option<Mark>, State, f32)> {
+    let mut cands: Vec<(Option<Mark>, State, f32)> = Vec::new();
+    for (i, (m, s)) in plans.iter().enumerate() {
+        match cands.iter_mut().find(|c| c.0 == *m) {
+            Some(c) if values[i] > c.2 => {
+                c.1 = *s;
+                c.2 = values[i];
+            }
+            Some(_) => {}
+            None => cands.push((*m, *s, values[i])),
+        }
+    }
+    cands.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    cands
+}
+
+/// Pair each choice with its static value and sort descending (no collapse;
+/// for ap2/pp1 where each choice is already a distinct mark).
+fn value_sort(choices: &[(Option<Mark>, State)], values: &[f32]) -> Vec<(Option<Mark>, State, f32)> {
+    let mut cands: Vec<(Option<Mark>, State, f32)> = choices
+        .iter()
+        .zip(values)
+        .map(|((m, s), &v)| (*m, *s, v))
+        .collect();
+    cands.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    cands
+}
+
+impl RecordingPair {
+    /// True with probability `epsilon_lock` — decline a forced safe lock.
+    fn decline_lock(&mut self) -> bool {
+        self.epsilon_lock > 0.0 && self.rng.gen::<f32>() < self.epsilon_lock
+    }
+}
+
 impl Strategy for RecordingPair {
     fn active_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+        // ε-uniform branch bypasses both search and distill capture (as today).
         if self.rng.gen::<f32>() < self.epsilon {
             let white_marks = state.generate_white_moves(dice[0] + dice[1]);
             if white_marks.is_empty() {
                 return None;
             }
             let idx = self.rng.gen_range(0..=white_marks.len());
-            if idx < white_marks.len() {
+            return if idx < white_marks.len() {
                 Some(white_marks[idx])
             } else {
                 None
-            }
-        } else {
-            self.policy.active_phase1(state, opp_states, dice)
+            };
         }
+
+        // Distill detection (player 0 only). Uses the static pipeline directly
+        // so capture is independent of the configured move policy. On a lock
+        // firing, may stage a rule-free candidate set for ε-decline (resolved
+        // after the immutable `bot` borrow ends).
+        let mut decline_rf: Option<(Vec<(Option<Mark>, State)>, Vec<State>)> = None;
+        if self.distill.is_some() {
+            let bot = self.policy.bot();
+            let (decision, sim_opp) = active_phase1_choices(bot, state, opp_states, dice);
+            match decision {
+                Decision::Choices(plans) => {
+                    // Gated capture: collapse to distinct phase-1 marks, top-2.
+                    let states: Vec<State> = plans.iter().map(|(_, s)| *s).collect();
+                    let values = bot.evaluate_batch(&states, &sim_opp);
+                    let cands = collapse_plans(&plans, &values);
+                    if cands.len() >= 2 {
+                        let value_posts: Vec<(f32, State)> = cands.iter().map(|c| (c.2, c.1)).collect();
+                        let (close, endgame) = gates(&value_posts, state, opp_states);
+                        if (close || endgame) && !opp_states.is_empty() {
+                            self.distill.as_ref().unwrap().borrow_mut().push(DistillCtx::Gated {
+                                phase: 1,
+                                state: *state,
+                                opps: opp_states.to_vec(),
+                                sim_opp: sim_opp.clone(),
+                                dice,
+                                cands: cands[..2].iter().map(|c| (c.0, c.1)).collect(),
+                            });
+                        }
+                    }
+                }
+                Decision::Forced(Some(m)) => {
+                    // Lock firing: production forces a safe lock that doesn't end
+                    // the game. Capture the rule-free candidate set for emission.
+                    let locks_safe = state.would_lock_row(m) && {
+                        let mut s = *state;
+                        s.apply_mark(m);
+                        !s.would_end_game()
+                    };
+                    if locks_safe && !opp_states.is_empty() {
+                        if let Decision::Choices(plans) = phase1_plan_choices_with(state, &sim_opp, dice, false) {
+                            let states: Vec<State> = plans.iter().map(|(_, s)| *s).collect();
+                            let values = bot.evaluate_batch(&states, &sim_opp);
+                            let cands = collapse_plans(&plans, &values);
+                            // Need the lock plus at least one distinct alternative.
+                            if cands.len() >= 2 && cands.iter().any(|c| c.0 == Some(m)) {
+                                let rf: Vec<(Option<Mark>, State)> = cands.iter().map(|c| (c.0, c.1)).collect();
+                                self.distill.as_ref().unwrap().borrow_mut().push(DistillCtx::Lock {
+                                    ctx: LockCtx::Ap1,
+                                    state: *state,
+                                    opps: opp_states.to_vec(),
+                                    sim_opp: sim_opp.clone(),
+                                    dice,
+                                    active_player: 0,
+                                    cands: rf.clone(),
+                                    lock: m,
+                                });
+                                decline_rf = Some((rf, sim_opp));
+                            }
+                        }
+                    }
+                }
+                Decision::Forced(None) => {}
+            }
+        }
+
+        // ε-decline: at a captured firing, play the value-best rule-free move.
+        if let Some((rf, sim_opp)) = decline_rf {
+            if self.decline_lock() {
+                let bot = self.policy.bot();
+                return eval_decision(bot, Decision::Choices(rf), &sim_opp);
+            }
+        }
+
+        self.policy.active_phase1(state, opp_states, dice)
     }
 
     fn active_phase2(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Option<Mark> {
@@ -292,15 +474,89 @@ impl Strategy for RecordingPair {
             return None;
         }
 
-        let mark = if self.rng.gen::<f32>() < self.epsilon {
+        // ε-uniform branch: bypass distill capture (matches search bypass).
+        if self.rng.gen::<f32>() < self.epsilon {
             let idx = self.rng.gen_range(0..=marks.len());
-            if idx < marks.len() {
-                Some(marks[idx])
-            } else {
-                None
+            let mark = if idx < marks.len() { Some(marks[idx]) } else { None };
+            let chosen_state = match mark {
+                Some(m) => {
+                    let mut s = *state;
+                    s.apply_mark(m);
+                    s
+                }
+                None => no_mark_state,
+            };
+            self.recorded.borrow_mut().push((chosen_state, opp_states.to_vec()));
+            return mark;
+        }
+
+        // Distill detection (player 0 only); sim_opp = current opps for ap2.
+        let mut decline_rf: Option<Vec<(Option<Mark>, State)>> = None;
+        if self.distill.is_some() {
+            let bot = self.policy.bot();
+            match active_phase2_choices(state, opp_states, dice, has_marked) {
+                Decision::Choices(choices) => {
+                    let states: Vec<State> = choices.iter().map(|(_, s)| *s).collect();
+                    let values = bot.evaluate_batch(&states, opp_states);
+                    let cands = value_sort(&choices, &values);
+                    if cands.len() >= 2 {
+                        let value_posts: Vec<(f32, State)> = cands.iter().map(|c| (c.2, c.1)).collect();
+                        let (close, endgame) = gates(&value_posts, state, opp_states);
+                        if (close || endgame) && !opp_states.is_empty() {
+                            self.distill.as_ref().unwrap().borrow_mut().push(DistillCtx::Gated {
+                                phase: 2,
+                                state: *state,
+                                opps: opp_states.to_vec(),
+                                sim_opp: opp_states.to_vec(),
+                                dice,
+                                cands: cands[..2].iter().map(|c| (c.0, c.1)).collect(),
+                            });
+                        }
+                    }
+                }
+                Decision::Forced(Some(m)) => {
+                    let is_lock = find_safe_lock(state, &marks) == Some(m);
+                    if is_lock && !opp_states.is_empty() {
+                        let opp_best = opp_states.iter().map(|s| s.count_points()).max().unwrap_or(0);
+                        if let Decision::Choices(choices) =
+                            mark_choices_with(state, &marks, no_mark_state, opp_best, false)
+                        {
+                            let states: Vec<State> = choices.iter().map(|(_, s)| *s).collect();
+                            let values = bot.evaluate_batch(&states, opp_states);
+                            let cands = value_sort(&choices, &values);
+                            if cands.len() >= 2 && cands.iter().any(|c| c.0 == Some(m)) {
+                                let rf: Vec<(Option<Mark>, State)> = cands.iter().map(|c| (c.0, c.1)).collect();
+                                self.distill.as_ref().unwrap().borrow_mut().push(DistillCtx::Lock {
+                                    ctx: LockCtx::Ap2,
+                                    state: *state,
+                                    opps: opp_states.to_vec(),
+                                    sim_opp: Vec::new(),
+                                    dice,
+                                    active_player: 0,
+                                    cands: rf.clone(),
+                                    lock: m,
+                                });
+                                decline_rf = Some(rf);
+                            }
+                        }
+                    }
+                }
+                Decision::Forced(None) => {}
             }
-        } else {
-            self.policy.active_phase2(state, opp_states, dice, has_marked)
+        }
+
+        // ε-decline resolved after the `bot` borrow ends.
+        let forced_override: Option<Option<Mark>> = match decline_rf {
+            Some(rf) if self.decline_lock() => {
+                let bot = self.policy.bot();
+                Some(eval_decision(bot, Decision::Choices(rf), opp_states))
+            }
+            _ => None,
+        };
+
+        let mark = match forced_override {
+            Some(m) => m,
+            None => self.policy.active_phase2(state, opp_states, dice, has_marked),
         };
 
         let chosen_state = match mark {
@@ -320,14 +576,54 @@ impl Strategy for RecordingPair {
         state: &State,
         opp_states: &[State],
         dice: [u8; 6],
-        _active_player: usize,
+        active_player: usize,
     ) -> Option<Mark> {
-        let marks = state.generate_white_moves(dice[0] + dice[1]);
+        let white_sum = dice[0] + dice[1];
+        let marks = state.generate_white_moves(white_sum);
         if marks.is_empty() {
             return None;
         }
 
-        let mark = crate::strategy::passive_phase1_impl(self.policy.bot(), state, opp_states, dice);
+        let mut mark = passive_phase1_impl(self.policy.bot(), state, opp_states, dice);
+
+        // Distill detection (player 0 only). No Gated capture on passive
+        // decisions (search never gated them); Lock firings only.
+        let mut decline_rf: Option<Vec<(Option<Mark>, State)>> = None;
+        if self.distill.is_some() {
+            let bot = self.policy.bot();
+            let lock = find_safe_lock(state, &marks);
+            if let Some(lock) = lock.filter(|_| !opp_states.is_empty()) {
+                debug_assert_eq!(mark, Some(lock), "production must force the detected safe lock");
+                let opp_best = opp_best_phase1_score(opp_states, white_sum);
+                if let Decision::Choices(choices) = mark_choices_with(state, &marks, *state, opp_best, false) {
+                    let states: Vec<State> = choices.iter().map(|(_, s)| *s).collect();
+                    let values = bot.evaluate_batch(&states, opp_states);
+                    let cands = value_sort(&choices, &values);
+                    if cands.len() >= 2 && cands.iter().any(|c| c.0 == Some(lock)) {
+                        let rf: Vec<(Option<Mark>, State)> = cands.iter().map(|c| (c.0, c.1)).collect();
+                        self.distill.as_ref().unwrap().borrow_mut().push(DistillCtx::Lock {
+                            ctx: LockCtx::Pp1,
+                            state: *state,
+                            opps: opp_states.to_vec(),
+                            sim_opp: Vec::new(),
+                            dice,
+                            active_player,
+                            cands: rf.clone(),
+                            lock,
+                        });
+                        decline_rf = Some(rf);
+                    }
+                }
+            }
+        }
+
+        // ε-decline resolved after the `bot` borrow ends.
+        if let Some(rf) = decline_rf {
+            if self.decline_lock() {
+                let bot = self.policy.bot();
+                mark = eval_decision(bot, Decision::Choices(rf), opp_states);
+            }
+        }
 
         let post = match mark {
             Some(m) => {
@@ -340,6 +636,267 @@ impl Strategy for RecordingPair {
         self.recorded.borrow_mut().push((post, opp_states.to_vec()));
         mark
     }
+}
+
+/// Is `mark` a safe lock from `state` (locks a row without ending the game)?
+fn is_safe_lock(state: &State, mark: Option<Mark>) -> bool {
+    match mark {
+        Some(m) if state.would_lock_row(m) => {
+            let mut s = *state;
+            s.apply_mark(m);
+            !s.would_end_game()
+        }
+        _ => false,
+    }
+}
+
+/// Complete the WHOLE current turn deterministically for a passive-phase-1
+/// candidate, in the entry's `[us, opps...]` frame.
+///
+/// Frame mapping (verified against `Game::play`): the game passes player i's
+/// opponents as `opp_states = [pre_phase1[(i+1)%n], ..]` (turn-ordered from i)
+/// and `active_player` = `(active + n − i) % n − 1` = the index of the active
+/// player *within that opp_states array* (relative-to-receiver, 0-based into
+/// opps), NOT an absolute seat. So in the entry `[us, opps...]`, the active
+/// player sits at entry index `active_player + 1`, and the player who acts
+/// first in the rollout (the seat after the active one) is at entry index
+/// `(active_player + 2) % n` in our-relative frame.
+///
+/// Approximation (identical across candidates, which is all that matters for
+/// the contrast): the real phase-1 was simultaneous; here our candidate mark
+/// is applied first, then every OTHER passive player's phase 1, then the
+/// active player's phase 1 + phase 2, with lock propagation between steps.
+fn pp1_entry(
+    bot: &PairStrategy,
+    state: &State,
+    opps: &[State],
+    dice: [u8; 6],
+    active_player: usize,
+    mark: Option<Mark>,
+) -> (Vec<State>, bool) {
+    let n = opps.len() + 1;
+    // entry index of the active player (us = 0, opps start at 1).
+    let active_idx = active_player + 1;
+
+    let mut all: Vec<State> = std::iter::once(*state).chain(opps.iter().copied()).collect();
+    if let Some(m) = mark {
+        all[0].apply_mark(m);
+    }
+    SimGame::propagate_locks(&mut all);
+    if SimGame::game_over(&all) {
+        return (all, true);
+    }
+
+    // Other passive players' (simultaneous) phase 1 — every entry seat that is
+    // neither us (0) nor the active player. We apply sequentially with lock
+    // propagation; this is the same approximation search makes for sim_opp.
+    for j in 1..n {
+        if j == active_idx {
+            continue;
+        }
+        let view = SimGame::opp_view(&all, j);
+        if let Some(m) = passive_phase1_impl(bot, &all[j], &view, dice) {
+            all[j].apply_mark(m);
+        }
+    }
+    SimGame::propagate_locks(&mut all);
+    if SimGame::game_over(&all) {
+        return (all, true);
+    }
+
+    // Active player's phase 1.
+    let view = SimGame::opp_view(&all, active_idx);
+    let (d, _) = active_phase1_choices(bot, &all[active_idx], &view, dice);
+    let p1 = eval_decision(bot, d, &view);
+    if let Some(m) = p1 {
+        all[active_idx].apply_mark(m);
+    }
+    SimGame::propagate_locks(&mut all);
+    if SimGame::game_over(&all) {
+        return (all, true);
+    }
+
+    // Active player's phase 2.
+    let view = SimGame::opp_view(&all, active_idx);
+    let d = active_phase2_choices(&all[active_idx], &view, dice, p1.is_some());
+    match eval_decision(bot, d, &view) {
+        Some(m) => all[active_idx].apply_mark(m),
+        None if p1.is_none() => all[active_idx].apply_strike(),
+        None => {}
+    }
+    SimGame::propagate_locks(&mut all);
+    let ended = SimGame::game_over(&all);
+    (all, ended)
+}
+
+/// Emit distill samples for one game's captured contexts. Per candidate:
+/// complete the turn deterministically (entries), run K full-game CRN
+/// rollouts, and emit `m` samples per opponent pairing — value = mean
+/// future-diff, final_diff = an individual rollout's future-diff — plus the
+/// swap-doubled negated sample, matching `build_pair_samples`' conventions.
+fn build_distill_samples(boot: &PairStrategy, ctxs: &[DistillCtx], cfg: DistillCfg, seed: u64) -> Vec<PairSample> {
+    let mut samples = Vec::new();
+
+    for ctx in ctxs {
+        // (compared candidate marks+posts, entries, first_active, rollout seed)
+        let (compared, entries, first_active, roll_seed): (
+            Vec<(Option<Mark>, State)>,
+            Vec<(Vec<State>, bool)>,
+            usize,
+            u64,
+        ) = match ctx {
+            DistillCtx::Gated {
+                phase,
+                state,
+                opps,
+                sim_opp,
+                dice,
+                cands,
+            } => {
+                let n = opps.len() + 1;
+                let entries: Vec<(Vec<State>, bool)> = if *phase == 1 {
+                    cands
+                        .iter()
+                        .map(|(m, _)| phase1_entry(boot, state, sim_opp, *dice, *m))
+                        .collect()
+                } else {
+                    cands.iter().map(|(_, post)| phase2_entry(*post, opps)).collect()
+                };
+                (cands.clone(), entries, 1 % n, context_seed(state, opps, *dice))
+            }
+            DistillCtx::Lock {
+                ctx: lctx,
+                state,
+                opps,
+                sim_opp,
+                dice,
+                active_player,
+                cands,
+                lock,
+            } => {
+                // Re-evaluate + sort the rule-free candidates at emission time,
+                // then select the lock / best-non-lock / runner-up-lock trio
+                // (Phase 16 `build_lock_cands` semantics).
+                let eval_opps: &[State] = match lctx {
+                    LockCtx::Ap1 => sim_opp,
+                    _ => opps,
+                };
+                let states: Vec<State> = cands.iter().map(|(_, s)| *s).collect();
+                let values = boot.evaluate_batch(&states, eval_opps);
+                let sorted = value_sort(cands, &values);
+
+                let lock_i = sorted.iter().position(|c| c.0 == Some(*lock));
+                let lock_i = match lock_i {
+                    Some(i) => i,
+                    None => continue, // lock pruned out — skip
+                };
+                let alt_i = (0..sorted.len()).find(|&i| !is_safe_lock(state, sorted[i].0));
+                let alt_i = match alt_i {
+                    Some(i) => i,
+                    None => continue, // all candidates are safe locks — skip
+                };
+                let alt2_i = (0..sorted.len()).find(|&i| i != lock_i && is_safe_lock(state, sorted[i].0));
+
+                let mut compared: Vec<(Option<Mark>, State)> =
+                    vec![(sorted[lock_i].0, sorted[lock_i].1), (sorted[alt_i].0, sorted[alt_i].1)];
+                if let Some(i2) = alt2_i {
+                    compared.push((sorted[i2].0, sorted[i2].1));
+                }
+
+                let (entries, first_active, n) = match lctx {
+                    LockCtx::Ap1 => {
+                        let n = opps.len() + 1;
+                        let e: Vec<(Vec<State>, bool)> = compared
+                            .iter()
+                            .map(|(m, _)| phase1_entry(boot, state, sim_opp, *dice, *m))
+                            .collect();
+                        (e, 1 % n, n)
+                    }
+                    LockCtx::Ap2 => {
+                        let n = opps.len() + 1;
+                        let e: Vec<(Vec<State>, bool)> =
+                            compared.iter().map(|(_, post)| phase2_entry(*post, opps)).collect();
+                        (e, 1 % n, n)
+                    }
+                    LockCtx::Pp1 => {
+                        let n = opps.len() + 1;
+                        let e: Vec<(Vec<State>, bool)> = compared
+                            .iter()
+                            .map(|(m, _)| pp1_entry(boot, state, opps, *dice, *active_player, *m))
+                            .collect();
+                        // first_active = seat after the active player, our-relative.
+                        ((e), (active_player + 2) % n, n)
+                    }
+                };
+                let _ = n;
+                (compared, entries, first_active, context_seed(state, opps, *dice))
+            }
+        };
+
+        if entries.is_empty() {
+            continue;
+        }
+        let finals = rollout_final_states(boot, &entries, roll_seed, cfg.k, first_active);
+
+        for (entry, fin) in entries.iter().zip(&finals) {
+            let our = entry.0[0];
+            let e_opps: Vec<State> = entry.0[1..].to_vec();
+            let num_opps = e_opps.len();
+            let ended = entry.1;
+
+            for k in 0..num_opps {
+                let cdiff = (our.count_points() - e_opps[k].count_points()) as f32;
+                // future-diffs per rollout sample
+                let diffs: Vec<f32> = fin
+                    .iter()
+                    .map(|f| ((f[0].count_points() - f[1 + k].count_points()) as f32) - cdiff)
+                    .collect();
+                if diffs.is_empty() {
+                    continue;
+                }
+                let value = diffs.iter().sum::<f32>() / diffs.len() as f32;
+
+                let feats = pair_features(&our, &e_opps[k], &e_opps);
+                let mut swapped_opps: Vec<State> = Vec::with_capacity(num_opps);
+                swapped_opps.push(our);
+                swapped_opps.extend(e_opps.iter().enumerate().filter(|(j, _)| *j != k).map(|(_, s)| *s));
+                let swap_feats = pair_features(&e_opps[k], &our, &swapped_opps);
+
+                if ended {
+                    // Deterministic single outcome: value == final_diff.
+                    let fdiff = diffs[0];
+                    samples.push(PairSample {
+                        features: feats,
+                        value: fdiff,
+                        final_diff: fdiff,
+                    });
+                    samples.push(PairSample {
+                        features: swap_feats,
+                        value: -fdiff,
+                        final_diff: -fdiff,
+                    });
+                } else {
+                    for r in 0..cfg.m {
+                        let fdiff = diffs[r % diffs.len()];
+                        samples.push(PairSample {
+                            features: feats,
+                            value,
+                            final_diff: fdiff,
+                        });
+                        samples.push(PairSample {
+                            features: swap_feats,
+                            value: -value,
+                            final_diff: -fdiff,
+                        });
+                    }
+                }
+            }
+        }
+        let _ = compared;
+    }
+
+    let _ = seed;
+    samples
 }
 
 /// Build training samples from one player's trajectory: one TD(λ) chain per
@@ -408,7 +965,8 @@ fn play_training_game(
     search: bool,
     epsilon: f32,
     seed: u64,
-) -> (Vec<PairSample>, f32) {
+    distill: DistillCfg,
+) -> (Vec<PairSample>, f32, usize) {
     use crate::game::{Game, Player};
 
     let n = num_opponents + 1;
@@ -416,6 +974,13 @@ fn play_training_game(
         .map(|_| PairStrategy::from_model(model.clone(), device.clone()))
         .collect();
     let boot_net = strategies[0].net.clone();
+
+    // Player-0-only distill capture buffer (shared with that RecordingPair).
+    let distill_buf = if distill.enabled {
+        Some(std::rc::Rc::new(std::cell::RefCell::new(Vec::new())))
+    } else {
+        None
+    };
 
     let mut buffers = Vec::with_capacity(n);
     let mut players: Vec<Player> = Vec::with_capacity(n);
@@ -433,6 +998,8 @@ fn play_training_game(
                 epsilon: if i == 0 { epsilon } else { 0.0 },
                 rng: SmallRng::seed_from_u64(seed.wrapping_add(100 + i as u64)),
                 recorded: buf,
+                distill: if i == 0 { distill_buf.clone() } else { None },
+                epsilon_lock: if i == 0 { distill.epsilon_lock } else { 0.0 },
             }),
             Box::new(SmallRng::seed_from_u64(seed.wrapping_add(i as u64))),
         ));
@@ -452,7 +1019,20 @@ fn play_training_game(
         all_samples.extend(build_pair_samples(&boot_net, &snapshots, finals[i], &opp_finals));
     }
 
-    (all_samples, finals[0])
+    // Post-game distill emission for player 0's captured contexts.
+    let mut distill_count = 0;
+    if let Some(buf) = &distill_buf {
+        let ctxs = std::mem::take(&mut *buf.borrow_mut());
+        if !ctxs.is_empty() {
+            // The boot net (player 0's net) drives rollouts and value re-eval.
+            let boot = PairStrategy::from_model(model.clone(), device.clone());
+            let ds = build_distill_samples(&boot, &ctxs, distill, seed);
+            distill_count = ds.len();
+            all_samples.extend(ds);
+        }
+    }
+
+    (all_samples, finals[0], distill_count)
 }
 
 /// Same fixed-game-set paired benchmark as `train::benchmark_vs_ga`, for the
@@ -506,6 +1086,7 @@ pub fn self_play_train(
     checkpoints: bool,
     start_iteration: usize,
     search: bool,
+    distill: DistillCfg,
 ) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
     MyBackend::seed(&device, TRAIN_SEED);
@@ -538,6 +1119,12 @@ pub fn self_play_train(
             crate::strategy::search::K_SAMPLES
         );
     }
+    if distill.enabled {
+        println!(
+            "Distillation: emitting rollout-value targets (K={}, m={}, epsilon_lock={:.3})",
+            distill.k, distill.m, distill.epsilon_lock
+        );
+    }
 
     for iteration in 0..num_iterations {
         let global_iter = start_iteration + iteration;
@@ -553,18 +1140,19 @@ pub fn self_play_train(
 
         let models: Vec<PairModel<MyBackend>> = (0..game_configs.len()).map(|_| model.clone()).collect();
 
-        let game_results: Vec<(Vec<PairSample>, f32)> = game_configs
+        let game_results: Vec<(Vec<PairSample>, f32, usize)> = game_configs
             .into_par_iter()
             .zip(models.into_par_iter())
             .enumerate()
             .map(|(game_idx, (num_opps, thread_model))| {
                 let seed = TRAIN_SEED.wrapping_add((iteration * games_per_iteration + game_idx) as u64);
-                play_training_game(&thread_model, &device, num_opps, search, epsilon, seed)
+                play_training_game(&thread_model, &device, num_opps, search, epsilon, seed, distill)
             })
             .collect();
 
-        let game_scores: Vec<f32> = game_results.iter().map(|(_, score)| *score).collect();
-        let new_samples: Vec<PairSample> = game_results.into_iter().flat_map(|(s, _)| s).collect();
+        let game_scores: Vec<f32> = game_results.iter().map(|(_, score, _)| *score).collect();
+        let distill_samples: usize = game_results.iter().map(|(_, _, d)| *d).sum();
+        let new_samples: Vec<PairSample> = game_results.into_iter().flat_map(|(s, _, _)| s).collect();
         let avg_score = if game_scores.is_empty() {
             0.0
         } else {
@@ -577,11 +1165,20 @@ pub fn self_play_train(
         }
 
         let all_samples: Vec<PairSample> = replay_buffer.iter().flatten().copied().collect();
-        println!(
-            "  Generated {} new samples (avg score: {avg_score:.1}), replay buffer: {} total",
-            replay_buffer.back().unwrap().len(),
-            all_samples.len()
-        );
+        if distill.enabled {
+            println!(
+                "  Generated {} new samples (avg score: {avg_score:.1}), of which {} distill, replay buffer: {} total",
+                replay_buffer.back().unwrap().len(),
+                distill_samples,
+                all_samples.len()
+            );
+        } else {
+            println!(
+                "  Generated {} new samples (avg score: {avg_score:.1}), replay buffer: {} total",
+                replay_buffer.back().unwrap().len(),
+                all_samples.len()
+            );
+        }
 
         model = train_with_epochs(all_samples, artifact_dir, epochs_per_iteration, 4e-4);
 
@@ -882,6 +1479,8 @@ mod tests {
                     epsilon: 1.0, // always explore
                     rng: SmallRng::seed_from_u64(900 + i),
                     recorded: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                    distill: None,
+                    epsilon_lock: 0.0,
                 }),
                 Box::new(SmallRng::seed_from_u64(910 + i)),
             ));
@@ -903,9 +1502,9 @@ mod tests {
         let device = burn::backend::ndarray::NdArrayDevice::Cpu;
         let model = PairModelConfig::new().init::<MyBackend>(&device);
 
-        let run = || play_training_game(&model, &device, 1, true, 0.07, 4242);
-        let (s1, f1) = run();
-        let (s2, f2) = run();
+        let run = || play_training_game(&model, &device, 1, true, 0.07, 4242, DistillCfg::off());
+        let (s1, f1, _) = run();
+        let (s2, f2, _) = run();
         assert_eq!(f1, f2);
         assert_eq!(s1.len(), s2.len());
         for (a, b) in s1.iter().zip(&s2) {
@@ -913,5 +1512,180 @@ mod tests {
             assert_eq!(a.value, b.value);
             assert_eq!(a.final_diff, b.final_diff);
         }
+    }
+
+    fn distill_boot() -> PairStrategy {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        PairStrategy::from_model(PairModelConfig::new().init::<MyBackend>(&device), device)
+    }
+
+    /// Red 2..6 marked: white sum 12 (Mark{0,12}) is a safe lock (first lock,
+    /// game does not end).
+    fn lockable() -> State {
+        let mut s = State::default();
+        for n in 2..=6 {
+            s.apply_mark(Mark { row: 0, number: n });
+        }
+        s
+    }
+
+    #[test]
+    fn distill_emission_counts_and_semantics() {
+        let boot = distill_boot();
+        let cfg = DistillCfg {
+            enabled: true,
+            k: 8,
+            m: 4,
+            epsilon_lock: 0.0,
+        };
+
+        // A phase-2 gated ctx, 1 opponent, two distinct (non-ended) candidates.
+        let our = State::default();
+        let opp = State::default();
+        let mut post_a = our;
+        post_a.apply_mark(Mark { row: 0, number: 5 });
+        let mut post_b = our;
+        post_b.apply_mark(Mark { row: 1, number: 6 });
+        let dice = [3, 2, 4, 5, 1, 6];
+        let ctx = DistillCtx::Gated {
+            phase: 2,
+            state: our,
+            opps: vec![opp],
+            sim_opp: vec![opp],
+            dice,
+            cands: vec![(Some(Mark { row: 0, number: 5 }), post_a), (Some(Mark { row: 1, number: 6 }), post_b)],
+        };
+
+        let samples = build_distill_samples(&boot, std::slice::from_ref(&ctx), cfg, 0);
+
+        // Count = #candidates(2) × #opponents(1) × m(4) × 2 (swap) = 16.
+        assert_eq!(samples.len(), 16, "emission count must match candidates×opp×m×swap");
+
+        // Layout (per emission loop): for each candidate, for each opponent, for
+        // each r in 0..m: [forward, swap]. So pairs of (fwd, swap).
+        for pair in samples.chunks(2) {
+            let (fwd, swp) = (&pair[0], &pair[1]);
+            assert!(fwd.value.is_finite() && fwd.final_diff.is_finite());
+            assert_eq!(swp.value, -fwd.value, "swap value must be the negation");
+            assert_eq!(swp.final_diff, -fwd.final_diff, "swap final_diff must be the negation");
+            assert_eq!(
+                fwd.features[..BOARD_FEATURES],
+                swp.features[BOARD_FEATURES..2 * BOARD_FEATURES],
+                "swap exchanges board blocks"
+            );
+        }
+
+        // Within each candidate's m forward samples: identical value, and the
+        // final_diffs reproduce the first m rollout future-diffs exactly.
+        let entries = [phase2_entry(post_a, &[opp]), phase2_entry(post_b, &[opp])];
+        let finals = rollout_final_states(&boot, &entries, context_seed(&our, &[opp], dice), cfg.k, 1 % 2);
+        for (ci, (entry, fin)) in entries.iter().zip(&finals).enumerate() {
+            let e_our = entry.0[0];
+            let e_opp = entry.0[1];
+            let cdiff = (e_our.count_points() - e_opp.count_points()) as f32;
+            let diffs: Vec<f32> = fin
+                .iter()
+                .map(|f| ((f[0].count_points() - f[1].count_points()) as f32) - cdiff)
+                .collect();
+            let exp_value = diffs.iter().sum::<f32>() / diffs.len() as f32;
+
+            // candidate ci's forward samples are at indices ci*m*2, +2, +4, ...
+            let base = ci * cfg.m * 2;
+            let fwds: Vec<&PairSample> = (0..cfg.m).map(|r| &samples[base + r * 2]).collect();
+            for f in &fwds {
+                assert!((f.value - exp_value).abs() < 1e-5, "all m samples share the mean value");
+            }
+            for (r, f) in fwds.iter().enumerate() {
+                assert!((f.final_diff - diffs[r % diffs.len()]).abs() < 1e-5, "final_diff = individual rollout diff");
+            }
+            // The rollouts produce spread (not a degenerate single value).
+            assert!(
+                fwds.iter().any(|f| (f.final_diff - exp_value).abs() > 1e-6),
+                "final_diffs must vary around the mean (σ reference)"
+            );
+        }
+    }
+
+    #[test]
+    fn epsilon_lock_declines_only_at_firings() {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = PairModelConfig::new().init::<MyBackend>(&device);
+
+        // Build a RecordingPair with a distill buffer and a chosen epsilon_lock.
+        let make = |eps_lock: f32| RecordingPair {
+            policy: PairPolicy::Static(PairStrategy::from_model(model.clone(), device)),
+            epsilon: 0.0,
+            rng: SmallRng::seed_from_u64(12345),
+            recorded: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            distill: Some(std::rc::Rc::new(std::cell::RefCell::new(Vec::new()))),
+            epsilon_lock: eps_lock,
+        };
+
+        let s = lockable();
+        let opps = [State::default()];
+        let dice = [6, 6, 1, 1, 1, 1]; // white sum 12 completes the red lock
+
+        // At a firing: epsilon_lock=0.0 plays the forced lock; 1.0 instead
+        // value-selects over the rule-free candidate set (A/B-variant
+        // semantics) — equal to eval_decision over that set.
+        let lock = Mark { row: 0, number: 12 };
+        let mut keep = make(0.0);
+        assert_eq!(keep.passive_phase1(&s, &opps, dice, 0), Some(lock), "no decline ⇒ forced lock");
+
+        let boot = PairStrategy::from_model(model.clone(), device);
+        let white_sum = dice[0] + dice[1];
+        let marks = s.generate_white_moves(white_sum);
+        let opp_best = opp_best_phase1_score(&opps, white_sum);
+        let rule_free = mark_choices_with(&s, &marks, s, opp_best, false);
+        let expected_decline = eval_decision(&boot, rule_free, &opps);
+
+        let mut decline = make(1.0);
+        let played = decline.passive_phase1(&s, &opps, dice, 0);
+        assert_eq!(
+            played, expected_decline,
+            "epsilon_lock=1.0 ⇒ value-select over the rule-free set, not the forced lock"
+        );
+
+        // Non-firing decision: identical move under either setting, and no
+        // decline perturbation.
+        let fresh = State::default();
+        let nf_dice = [3, 4, 2, 3, 5, 1];
+        let mut a = make(0.0);
+        let mut b = make(1.0);
+        assert_eq!(
+            a.passive_phase1(&fresh, &opps, nf_dice, 0),
+            b.passive_phase1(&fresh, &opps, nf_dice, 0),
+            "non-firing decisions are unaffected by epsilon_lock"
+        );
+    }
+
+    #[test]
+    fn distill_off_is_bit_identical() {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = PairModelConfig::new().init::<MyBackend>(&device);
+
+        // Disabled distill must reproduce identical samples run-to-run (and the
+        // capture path is fully bypassed). The existing suite staying green is
+        // the true pre-change equivalence; this pins determinism.
+        let run = || play_training_game(&model, &device, 1, false, 0.1, 7777, DistillCfg::off());
+        let (s1, f1, d1) = run();
+        let (s2, f2, d2) = run();
+        assert_eq!(d1, 0, "disabled distill emits zero distill samples");
+        assert_eq!(d2, 0);
+        assert_eq!(f1, f2);
+        assert_eq!(s1.len(), s2.len());
+        for (a, b) in s1.iter().zip(&s2) {
+            assert_eq!(a.features, b.features);
+            assert_eq!(a.value, b.value);
+            assert_eq!(a.final_diff, b.final_diff);
+        }
+
+        // And: a disabled-cfg game produces the SAME sample stream as one with
+        // epsilon_lock=0 but enabled=false — i.e. the enabled flag gates all of
+        // it. (Run with enabled but k=m=0 would change nothing only if no ctx;
+        // we assert the off path equals a second off path above.)
+        let (s3, _, _) = play_training_game(&model, &device, 2, false, 0.1, 7777, DistillCfg::off());
+        let (s4, _, _) = play_training_game(&model, &device, 2, false, 0.1, 7777, DistillCfg::off());
+        assert_eq!(s3.len(), s4.len());
     }
 }
