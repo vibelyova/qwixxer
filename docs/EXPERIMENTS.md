@@ -1436,3 +1436,58 @@ corrected direction** as the primary lock metric (success = edge grows toward
 via the Phase 17 harness). If 10× lock-sample weight doesn't move the
 lock-ab needle, the lock pool should be declared closed (representation
 limit, not data) and the campaign banked.
+
+## Phase 19: Distillation leg 2 — lock-pool weighting
+
+**Status: run pending user execution.**
+
+The Phase 18 follow-up, implemented as pre-scoped: `DistillCfg` gained
+per-pool emission weights (`--distill-m` for gated decisions, new
+`--distill-m-lock` for lock firings, defaults 2/16), and the per-iteration
+summary now reports the lock-pool sample count. Mechanism otherwise unchanged
+(commit `999c666`; new test `lock_ctx_uses_m_lock_and_is_counted`).
+
+**Hypothesis under test:** Phase 18's lock-target failure was a volume
+problem — the lock trio was ~1% of the buffer at the shared m, outvoted by
+1.5M TD samples whose values embed "the lock always happens." Leg 2 raises
+the lock pool to **~9% of the buffer** (measured in a 300-game smoke:
+43,398 distill of 136,294 total, 12,446 lock-pool) and doubles ε-decline so
+declined-lock continuations appear in ~5–10% of games.
+
+### Run recipe
+
+```bash
+rm -f pair_model/iter-*.mpk
+cargo run --release -- pair-train --distill --epsilon-lock 0.10 -g 5000 -e 5 -b 500000 -c --start-iteration 20
+```
+
+(m defaults are already the leg-2 values: m_gated=2, m_lock=16. Warm start =
+the adopted Phase 18 checkpoint already in `pair_model/`.)
+
+### Pre-registration (corrected directions, learned from Phase 18)
+
+- **Primary lock metric: the lock-ab suppression edge** (t=0, 1M, seed 0) on
+  the selected checkpoint. Status quo +0.04pp; ceiling ≈ +0.7pp.
+  **Success: edge ≥ +0.3pp** (the freed net demonstrably chooses better at
+  firings — then the conditional-rule adoption decision via the Phase 17
+  harness converts it into realized win rate). **Kill: edge < +0.15pp** ⇒
+  the lock pool is representation-limited, not data-limited; declare it
+  closed and bank the campaign. Between: judgment call, lean kill.
+- **Guard: static 1M vs GA** (seed 42) must not regress from 59.6%
+  (CI overlap acceptable). Checkpoint selection stays on the per-iteration
+  static curve as before.
+- `lock-adjudicate` is NOT an acceptance metric (it measures the unchanged
+  rule; expected to stay ~8.8% regardless — Phase 18's correction).
+- Curve expectation: the gated pool is already partially harvested, so the
+  static curve may rise less than leg 1 (or plateau immediately); that alone
+  is not failure — the lock-ab edge is the point of this leg.
+
+### Post-run acceptance
+
+```bash
+cargo run --release -- bench ga pair -n 1000000
+./target/release/examples/divergence lock-ab --equivalence-check 2000 \
+  && ./target/release/examples/divergence lock-ab -n 1000000 --seed 0 --suppress-below=0
+```
+
+All Phase 19 results are **pending user run.**
