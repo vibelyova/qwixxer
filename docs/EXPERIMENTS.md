@@ -1113,7 +1113,7 @@ not guaranteed to pick the *best* alternative.
   Rollouts favor skip by 0.79 wp — locking the green row away when nearly even
   throws the game.
 - **game 9423, turn 9, pp1, cdiff −5, gap +0.60 wp (z=56):** forced R12 lock
-  (static v=+2.36, the net *loves* it) over skip (v=+1.07); rollouts say skip is
+  (static v=+2.35, the net *loves* it) over skip (v=+1.07); rollouts say skip is
   +0.60 wp better. A textbook static-value-vs-rollout disagreement where
   game-shortening while behind is the hidden cost the net underweights.
 - **game 1768, turn 10, pp1, cdiff 0 (tied), gap +0.61 wp (z=57):** dead-even,
