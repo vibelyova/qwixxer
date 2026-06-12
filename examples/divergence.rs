@@ -701,6 +701,152 @@ impl Strategy for ShadowPair {
     }
 }
 
+// ---- Lock shadow: plays production moves (rule ON), logs rule firings ----
+
+struct LockShadowPair {
+    static_bot: PairStrategy,
+    events: Rc<RefCell<Vec<LockEvent>>>,
+    turn: u32,
+}
+
+impl std::fmt::Debug for LockShadowPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "LockShadowPair")
+    }
+}
+
+impl LockShadowPair {
+    fn new(template: &PairStrategy, events: Rc<RefCell<Vec<LockEvent>>>) -> Self {
+        LockShadowPair {
+            static_bot: PairStrategy::from_shared(template.model.clone(), template.device),
+            events,
+            turn: 0,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn log(
+        &self,
+        ctx: &str,
+        has_marked: Option<bool>,
+        state: &State,
+        opps: &[State],
+        dice: [u8; 6],
+        lock: Mark,
+        lc: LockCands,
+    ) {
+        self.events.borrow_mut().push(LockEvent {
+            t: "l".into(),
+            game: 0, // stamped by the driver
+            turn: self.turn,
+            ctx: ctx.into(),
+            has_marked,
+            dice,
+            our: StateJson::of(state),
+            opps: opps.iter().map(StateJson::of).collect(),
+            our_points: state.count_points(),
+            opp_points: opps.iter().map(|s| s.count_points()).max().unwrap(),
+            lock_mark: (lock.row, lock.number),
+            cands: lc
+                .cands
+                .iter()
+                .map(|c| CandJson {
+                    mark: mark_json(c.mark),
+                    v: c.value,
+                })
+                .collect(),
+            lock_idx: lc.lock_idx,
+            alt_idx: lc.alt_idx,
+            alt2_idx: lc.alt2_idx,
+            n_safe_locks: lc.n_safe_locks,
+            rule_free_forced: lc.rule_free_forced,
+            seed: context_seed(state, opps, dice),
+        });
+    }
+}
+
+impl Strategy for LockShadowPair {
+    fn active_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+        self.turn += 1;
+        let (decision, sim_opp) = active_phase1_choices(&self.static_bot, state, opp_states, dice);
+        let forced = match &decision {
+            Decision::Forced(m) => Some(*m),
+            Decision::Choices(_) => None,
+        };
+        let prod_move = eval_decision(&self.static_bot, decision, &sim_opp);
+
+        let (scan_lock, rule_free) = phase1_plans_mirror(state, &sim_opp, dice);
+        if let Some(lock) = scan_lock {
+            // Equivalence guard: production must have forced exactly this lock.
+            assert_eq!(
+                forced,
+                Some(Some(lock)),
+                "ap1 lock-force mismatch (mirror drift): mirror {lock:?}, production {forced:?}"
+            );
+            if let Some(lc) = build_lock_cands(&self.static_bot, state, &sim_opp, *state, rule_free, lock, true) {
+                self.log("ap1", None, state, opp_states, dice, lock, lc);
+            }
+        }
+        prod_move
+    }
+
+    fn active_phase2(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Option<Mark> {
+        let decision = active_phase2_choices(state, opp_states, dice, has_marked);
+        let forced = match &decision {
+            Decision::Forced(m) => Some(*m),
+            Decision::Choices(_) => None,
+        };
+        let prod_move = eval_decision(&self.static_bot, decision, opp_states);
+
+        let marks = state.generate_color_moves(dice);
+        if let Some(lock) = find_safe_lock(state, &marks) {
+            assert_eq!(
+                forced,
+                Some(Some(lock)),
+                "ap2 lock-force mismatch (mirror drift): mirror {lock:?}, production {forced:?}"
+            );
+            let baseline = if has_marked {
+                *state
+            } else {
+                let mut s = *state;
+                s.apply_strike();
+                s
+            };
+            let opp_best = opp_states.iter().map(|s| s.count_points()).max().unwrap_or(0);
+            let rule_free = mark_choices_nolock(state, &marks, baseline, opp_best);
+            if let Some(lc) = build_lock_cands(&self.static_bot, state, opp_states, baseline, rule_free, lock, false) {
+                self.log("ap2", Some(has_marked), state, opp_states, dice, lock, lc);
+            }
+        }
+        prod_move
+    }
+
+    fn passive_phase1(
+        &mut self,
+        state: &State,
+        opp_states: &[State],
+        dice: [u8; 6],
+        active_player: usize,
+    ) -> Option<Mark> {
+        let prod_move = self.static_bot.passive_phase1(state, opp_states, dice, active_player);
+        let white_sum = dice[0] + dice[1];
+        let marks = state.generate_white_moves(white_sum);
+        if let Some(lock) = find_safe_lock(state, &marks) {
+            assert_eq!(
+                prod_move,
+                Some(lock),
+                "pp1 lock-force mismatch (mirror drift): mirror {lock:?}, production {prod_move:?}"
+            );
+            let opp_best = opp_best_phase1_score(opp_states, white_sum);
+            let rule_free = mark_choices_nolock(state, &marks, *state, opp_best);
+            if let Some(lc) = build_lock_cands(&self.static_bot, state, opp_states, *state, rule_free, lock, false) {
+                self.log("pp1", None, state, opp_states, dice, lock, lc);
+            }
+        }
+        prod_move
+    }
+}
+
 // ---- run mode ----
 
 fn play_one(pair_template: &PairStrategy, champion: &DNA, game_idx: usize, base_seed: u64) -> (GameEvent, Vec<DecisionEvent>) {
@@ -1143,8 +1289,94 @@ fn main() {
     }
 }
 
-fn cmd_lock_run(_n: usize, _seed: u64, _out: &str) {
-    todo!("Task 2")
+fn lock_play_one(
+    pair_template: &PairStrategy,
+    champion: &DNA,
+    game_idx: usize,
+    base_seed: u64,
+) -> (GameEvent, Vec<LockEvent>) {
+    let pairing = game_idx / 2;
+    let rotation = game_idx % 2;
+    let pair_seat = (1 + rotation) % 2;
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let players: Vec<Player> = (0..2)
+        .map(|j| {
+            let dice = Box::new(SmallRng::seed_from_u64(seat_dice_seed(base_seed, pairing, j)));
+            let strategy: Box<dyn Strategy> = if j == pair_seat {
+                Box::new(LockShadowPair::new(pair_template, events.clone()))
+            } else {
+                Box::new(champion.clone())
+            };
+            Player::new(strategy, dice)
+        })
+        .collect();
+    let mut game = Game::new(players);
+    game.play();
+    let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+    drop(game);
+    let max = *scores.iter().max().unwrap();
+    let unique_winner = scores.iter().filter(|&&s| s == max).count() == 1;
+    let mut evs = Rc::try_unwrap(events)
+        .unwrap_or_else(|_| panic!("events Rc still shared"))
+        .into_inner();
+    for e in &mut evs {
+        e.game = game_idx;
+    }
+    let pair_won = scores[pair_seat] == max && unique_winner;
+    (
+        GameEvent {
+            t: "g".into(),
+            game: game_idx,
+            pair_seat,
+            scores,
+            pair_won,
+        },
+        evs,
+    )
+}
+
+fn cmd_lock_run(n: usize, seed: u64, out: &str) {
+    use rayon::prelude::*;
+    let num_games = n.div_ceil(2) * 2;
+    eprintln!("lock-run: {num_games} games, seed {seed} -> {out}");
+    let results: Vec<(GameEvent, Vec<LockEvent>)> = (0..num_games)
+        .into_par_iter()
+        .map_init(
+            || {
+                (
+                    PairStrategy::load("pair_model"),
+                    DNA::load_weights("champion.txt", Arc::new(default_genes()))
+                        .expect("champion.txt missing — run `train ga` first"),
+                )
+            },
+            |(pair, champ), i| lock_play_one(pair, champ, i, seed),
+        )
+        .collect();
+
+    let mut f = std::io::BufWriter::new(std::fs::File::create(out).unwrap());
+    for (g, evs) in &results {
+        for e in evs {
+            writeln!(f, "{}", serde_json::to_string(e).unwrap()).unwrap();
+        }
+        writeln!(f, "{}", serde_json::to_string(g).unwrap()).unwrap();
+    }
+    f.flush().unwrap();
+
+    let all: Vec<&LockEvent> = results.iter().flat_map(|(_, e)| e).collect();
+    let per_ctx = |c: &str| all.iter().filter(|e| e.ctx == c).count();
+    println!(
+        "{num_games} games, {} lock events ({:.2}/game): ap1 {} / ap2 {} / pp1 {}",
+        all.len(),
+        all.len() as f64 / num_games as f64,
+        per_ctx("ap1"),
+        per_ctx("ap2"),
+        per_ctx("pp1")
+    );
+    println!(
+        "multi-lock states: {}, rule-free-forced: {}",
+        all.iter().filter(|e| e.n_safe_locks > 1).count(),
+        all.iter().filter(|e| e.rule_free_forced).count()
+    );
 }
 
 fn cmd_lock_adjudicate(_input: &str, _out: &str, _k: usize) {
