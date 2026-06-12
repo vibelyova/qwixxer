@@ -86,6 +86,25 @@ enum Cmd {
         #[arg(long)]
         force_overwrite: bool,
     },
+    /// A/B bench: conditional safe-lock variant vs baseline pair or GA.
+    LockAb {
+        /// Number of games (rounded up to a rotation pair)
+        #[arg(short, default_value_t = 10000)]
+        n: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        /// Suppress the lock force when cdiff < this value (omit = never;
+        /// arms: 0 -> cdiff<0, 1 -> cdiff<=0, -5 -> cdiff<-5).
+        #[arg(long)]
+        suppress_below: Option<isize>,
+        /// Opponent: "pair" (baseline head-to-head) or "ga".
+        #[arg(long, default_value = "pair")]
+        opponent: String,
+        /// Run the variant(None)==baseline equivalence assertion over N games
+        /// instead of a bench.
+        #[arg(long)]
+        equivalence_check: Option<usize>,
+    },
 }
 
 // ---- JSONL schema ----
@@ -867,6 +886,94 @@ impl Strategy for LockShadowPair {
     }
 }
 
+// ---- A/B variant: lock force conditional on not being behind ----
+
+/// Baseline pair bot with the safe-lock force made conditional: when
+/// `suppress_below` is Some(t) and cdiff < t at decision time, the lock is
+/// NOT forced — it competes as a normal candidate (value selection over the
+/// rule-free pipeline). All non-suppressed play calls the production
+/// pipeline verbatim, so VariantPair(None) is move-identical to baseline.
+struct VariantPair {
+    bot: PairStrategy,
+    suppress_below: Option<isize>,
+}
+
+impl std::fmt::Debug for VariantPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "VariantPair({:?})", self.suppress_below)
+    }
+}
+
+impl VariantPair {
+    fn new(template: &PairStrategy, suppress_below: Option<isize>) -> Self {
+        VariantPair {
+            bot: PairStrategy::from_shared(template.model.clone(), template.device),
+            suppress_below,
+        }
+    }
+
+    fn suppressing(&self, state: &State, opps: &[State]) -> bool {
+        match self.suppress_below {
+            None => false,
+            Some(t) => {
+                let cdiff = state.count_points() - opps.iter().map(|s| s.count_points()).max().unwrap_or(0);
+                cdiff < t
+            }
+        }
+    }
+}
+
+impl Strategy for VariantPair {
+    fn active_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+        let (decision, sim_opp) = active_phase1_choices(&self.bot, state, opp_states, dice);
+        if self.suppressing(state, opp_states) {
+            let (scan_lock, rule_free) = phase1_plans_mirror(state, &sim_opp, dice);
+            if scan_lock.is_some() {
+                return eval_decision(&self.bot, rule_free, &sim_opp);
+            }
+        }
+        eval_decision(&self.bot, decision, &sim_opp)
+    }
+
+    fn active_phase2(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Option<Mark> {
+        if self.suppressing(state, opp_states) {
+            let marks = state.generate_color_moves(dice);
+            if find_safe_lock(state, &marks).is_some() {
+                let baseline = if has_marked {
+                    *state
+                } else {
+                    let mut s = *state;
+                    s.apply_strike();
+                    s
+                };
+                let opp_best = opp_states.iter().map(|s| s.count_points()).max().unwrap_or(0);
+                let rule_free = mark_choices_nolock(state, &marks, baseline, opp_best);
+                return eval_decision(&self.bot, rule_free, opp_states);
+            }
+        }
+        eval_decision(&self.bot, active_phase2_choices(state, opp_states, dice, has_marked), opp_states)
+    }
+
+    fn passive_phase1(
+        &mut self,
+        state: &State,
+        opp_states: &[State],
+        dice: [u8; 6],
+        active_player: usize,
+    ) -> Option<Mark> {
+        if self.suppressing(state, opp_states) {
+            let white_sum = dice[0] + dice[1];
+            let marks = state.generate_white_moves(white_sum);
+            if find_safe_lock(state, &marks).is_some() {
+                let opp_best = opp_best_phase1_score(opp_states, white_sum);
+                let rule_free = mark_choices_nolock(state, &marks, *state, opp_best);
+                return eval_decision(&self.bot, rule_free, opp_states);
+            }
+        }
+        self.bot.passive_phase1(state, opp_states, dice, active_player)
+    }
+}
+
 // ---- run mode ----
 
 fn play_one(pair_template: &PairStrategy, champion: &DNA, game_idx: usize, base_seed: u64) -> (GameEvent, Vec<DecisionEvent>) {
@@ -1412,6 +1519,16 @@ fn main() {
             refuse_overwrite(&out, force_overwrite);
             cmd_lock_adjudicate(&input, &out, k);
         }
+        Cmd::LockAb {
+            n,
+            seed,
+            suppress_below,
+            opponent,
+            equivalence_check,
+        } => match equivalence_check {
+            Some(games) => cmd_lock_ab_equivalence(games, seed),
+            None => cmd_lock_ab(n, seed, suppress_below, &opponent),
+        },
     }
 }
 
@@ -1704,4 +1821,139 @@ fn cmd_lock_adjudicate(input: &str, out: &str, k: usize) {
     }
     f.flush().unwrap();
     println!("alt verdicts: {counts:?}");
+}
+
+// ---- lock-ab mode ----
+
+/// One A/B game. `variant_seat`-aware rotation as in the other drivers.
+/// Returns (variant_score, opp_score).
+fn lock_ab_game(
+    pair_template: &PairStrategy,
+    champion: Option<&DNA>,
+    suppress_below: Option<isize>,
+    game_idx: usize,
+    base_seed: u64,
+) -> (isize, isize) {
+    let pairing = game_idx / 2;
+    let rotation = game_idx % 2;
+    let variant_seat = (1 + rotation) % 2;
+    let players: Vec<Player> = (0..2)
+        .map(|j| {
+            let dice = Box::new(SmallRng::seed_from_u64(seat_dice_seed(base_seed, pairing, j)));
+            let strategy: Box<dyn Strategy> = if j == variant_seat {
+                Box::new(VariantPair::new(pair_template, suppress_below))
+            } else {
+                match champion {
+                    Some(c) => Box::new(c.clone()),
+                    None => Box::new(PairStrategy::from_shared(
+                        pair_template.model.clone(),
+                        pair_template.device,
+                    )),
+                }
+            };
+            Player::new(strategy, dice)
+        })
+        .collect();
+    let mut game = Game::new(players);
+    game.play();
+    let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+    (scores[variant_seat], scores[1 - variant_seat])
+}
+
+fn cmd_lock_ab(n: usize, seed: u64, suppress_below: Option<isize>, opponent: &str) {
+    use rayon::prelude::*;
+    let num_games = n.div_ceil(2) * 2;
+    let vs_ga = match opponent {
+        "ga" => true,
+        "pair" => false,
+        o => {
+            eprintln!("unknown opponent {o} (use pair|ga)");
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "lock-ab: variant(suppress_below={suppress_below:?}) vs {opponent}, {num_games} games, seed {seed}"
+    );
+    let results: Vec<(isize, isize)> = (0..num_games)
+        .into_par_iter()
+        .map_init(
+            || {
+                (
+                    PairStrategy::load("pair_model"),
+                    if vs_ga {
+                        Some(
+                            DNA::load_weights("champion.txt", Arc::new(default_genes()))
+                                .expect("champion.txt missing"),
+                        )
+                    } else {
+                        None
+                    },
+                )
+            },
+            |(pair, champ), i| lock_ab_game(pair, champ.as_ref(), suppress_below, i, seed),
+        )
+        .collect();
+
+    let n_games = results.len();
+    let wins = results.iter().filter(|(v, o)| v > o).count();
+    let ties = results.iter().filter(|(v, o)| v == o).count();
+    let win_rate = wins as f64 / n_games as f64;
+    // Paired SE: per rotation pair (2 games, same dice), the mean of the two
+    // win indicators; SE over pair means.
+    let pair_means: Vec<f64> = results
+        .chunks(2)
+        .map(|c| c.iter().map(|(v, o)| if v > o { 1.0 } else { 0.0 }).sum::<f64>() / c.len() as f64)
+        .collect();
+    let m = pair_means.len() as f64;
+    let mean = pair_means.iter().sum::<f64>() / m;
+    let var = pair_means.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (m - 1.0);
+    let se = (var / m).sqrt();
+    let z = (mean - 0.5) / se;
+    println!(
+        "variant wins {:.3}% (ties {:.2}%), paired SE {:.3}pp, z vs 50%: {:+.2}",
+        win_rate * 100.0,
+        ties as f64 / n_games as f64 * 100.0,
+        se * 100.0,
+        z
+    );
+    println!(
+        "avg points: variant {:.2}, opponent {:.2}",
+        results.iter().map(|(v, _)| *v as f64).sum::<f64>() / n_games as f64,
+        results.iter().map(|(_, o)| *o as f64).sum::<f64>() / n_games as f64
+    );
+}
+
+fn cmd_lock_ab_equivalence(n: usize, seed: u64) {
+    use rayon::prelude::*;
+    let num_games = n.div_ceil(2) * 2;
+    eprintln!("equivalence check: VariantPair(None) must replay baseline exactly, {num_games} games");
+    (0..num_games).into_par_iter().for_each_init(
+        || PairStrategy::load("pair_model"),
+        |pair, i| {
+            let with_variant = lock_ab_game(pair, None, None, i, seed);
+            // Baseline-vs-baseline with the same seats and dice.
+            let pairing = i / 2;
+            let players: Vec<Player> = (0..2)
+                .map(|j| {
+                    Player::new(
+                        Box::new(PairStrategy::from_shared(pair.model.clone(), pair.device)),
+                        Box::new(SmallRng::seed_from_u64(seat_dice_seed(seed, pairing, j))),
+                    )
+                })
+                .collect();
+            let mut game = Game::new(players);
+            game.play();
+            let rotation = i % 2;
+            let variant_seat = (1 + rotation) % 2;
+            let baseline = (
+                game.players[variant_seat].state.count_points(),
+                game.players[1 - variant_seat].state.count_points(),
+            );
+            assert_eq!(
+                with_variant, baseline,
+                "game {i}: VariantPair(None) diverged from baseline — variant bug"
+            );
+        },
+    );
+    println!("equivalence holds over {num_games} games");
 }
