@@ -19,6 +19,8 @@ use rand::{rngs::SmallRng, Rng, SeedableRng};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use crate::bot::{self, DNA};
+use rayon::prelude::*;
 
 type MyAutodiffBackend = Autodiff<MyBackend>;
 
@@ -285,6 +287,194 @@ fn play_training_game(
     (all_samples, finals[0])
 }
 
+/// Same fixed-game-set paired benchmark as the pair bot, for aznet.
+const BENCH_SEED: u64 = 0xB54C;
+
+fn benchmark_vs_ga(artifact_dir: &str, champion: &DNA, num_games: usize) -> f64 {
+    use crate::game::{Game, Player};
+
+    let wins: u32 = (0..num_games)
+        .into_par_iter()
+        .map_init(
+            || AzStrategy::load(artifact_dir),
+            |template, i| {
+                let bot = AzStrategy::from_shared(template.model.clone(), template.device.clone());
+                let pair = (i / 2) as u64;
+                let rotation = i % 2;
+                let seat_dice =
+                    |seat: u64| Box::new(SmallRng::seed_from_u64(BENCH_SEED.wrapping_add(pair * 2 + seat)));
+                let players: Vec<Player> = if rotation == 0 {
+                    vec![
+                        Player::new(Box::new(bot), seat_dice(0)),
+                        Player::new(Box::new(champion.clone()), seat_dice(1)),
+                    ]
+                } else {
+                    vec![
+                        Player::new(Box::new(champion.clone()), seat_dice(0)),
+                        Player::new(Box::new(bot), seat_dice(1)),
+                    ]
+                };
+                let mut game = Game::new(players);
+                game.play();
+                let scores: Vec<isize> = game.players.iter().map(|p| p.state.count_points()).collect();
+                let idx = rotation;
+                (scores[idx] > scores[1 - idx]) as u32
+            },
+        )
+        .sum();
+    wins as f64 / num_games as f64
+}
+
+fn train_with_epochs(samples: Vec<AzSample>, artifact_dir: &str, num_epochs: usize, lr: f64) -> AzModel<MyBackend> {
+    let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+
+    let split = (samples.len() * 9) / 10;
+    let train_data = InMemDataset::new(samples[..split].to_vec());
+    let valid_data = InMemDataset::new(samples[split..].to_vec());
+
+    let model: AzModel<MyAutodiffBackend> = AzModelConfig::new()
+        .init::<MyAutodiffBackend>(&device)
+        .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+        .unwrap_or_else(|_| AzModelConfig::new().init::<MyAutodiffBackend>(&device));
+
+    let batcher_train = AzBatcher::<MyAutodiffBackend> { _phantom: std::marker::PhantomData };
+    let batcher_valid = AzBatcher::<MyBackend> { _phantom: std::marker::PhantomData };
+
+    let dataloader_train = DataLoaderBuilder::new(batcher_train)
+        .batch_size(1024)
+        .shuffle(TRAIN_SEED)
+        .build(train_data);
+    let dataloader_valid = DataLoaderBuilder::new(batcher_valid)
+        .batch_size(1024)
+        .shuffle(TRAIN_SEED)
+        .build(valid_data);
+
+    let ckpt_dir = format!("{artifact_dir}/ckpt");
+    std::fs::remove_dir_all(&ckpt_dir).ok();
+    std::fs::create_dir_all(&ckpt_dir).ok();
+
+    let training = SupervisedTraining::new(&ckpt_dir, dataloader_train, dataloader_valid)
+        .metric_train_numeric(LossMetric::new())
+        .metric_valid_numeric(LossMetric::new())
+        .num_epochs(num_epochs)
+        .summary();
+
+    let result = training.launch(Learner::new(model, AdamConfig::new().init(), lr));
+
+    result
+        .model
+        .save_file(format!("{artifact_dir}/model"), &CompactRecorder::new())
+        .expect("Failed to save aznet model");
+    std::fs::remove_dir_all(&ckpt_dir).ok();
+
+    AzModelConfig::new()
+        .init::<MyBackend>(&device)
+        .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+        .expect("Failed to reload aznet model for inference")
+}
+
+pub fn self_play_train(
+    artifact_dir: &str,
+    num_iterations: usize,
+    games_per_iteration: usize,
+    epochs_per_iteration: usize,
+    bench_games: usize,
+    checkpoints: bool,
+    start_iteration: usize,
+) {
+    let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+    MyBackend::seed(&device, TRAIN_SEED);
+    std::fs::create_dir_all(artifact_dir).ok();
+    let buffer_iterations = 3;
+    let mut replay_buffer: std::collections::VecDeque<Vec<AzSample>> = std::collections::VecDeque::new();
+
+    let scores_log_path = format!("{artifact_dir}/training_scores.csv");
+    if start_iteration == 0 || !std::path::Path::new(&scores_log_path).exists() {
+        std::fs::write(&scores_log_path, "iteration,avg_score,winrate\n").ok();
+    }
+
+    let genes = Arc::new(bot::default_genes());
+    let champion = DNA::load_weights("champion.txt", genes).expect("No champion.txt");
+    let start_time = std::time::Instant::now();
+
+    let mut model: AzModel<MyBackend> = AzModelConfig::new()
+        .init::<MyBackend>(&device)
+        .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+        .unwrap_or_else(|_| {
+            println!("  No pretrained aznet model, starting fresh");
+            AzModelConfig::new().init::<MyBackend>(&device)
+        });
+
+    for iteration in 0..num_iterations {
+        let global_iter = start_iteration + iteration;
+        let epsilon = (0.2 * (0.95f32).powi(global_iter as i32)).max(0.07);
+        println!("\n=== Aznet iteration {} (epsilon={epsilon:.3}) ===", global_iter + 1);
+
+        let models: Vec<AzModel<MyBackend>> = (0..games_per_iteration).map(|_| model.clone()).collect();
+        let game_results: Vec<(Vec<AzSample>, f32)> = (0..games_per_iteration)
+            .into_par_iter()
+            .zip(models.into_par_iter())
+            .map(|(game_idx, thread_model)| {
+                let seed = TRAIN_SEED.wrapping_add((iteration * games_per_iteration + game_idx) as u64);
+                play_training_game(&thread_model, &device, epsilon, seed)
+            })
+            .collect();
+
+        let game_scores: Vec<f32> = game_results.iter().map(|(_, s)| *s).collect();
+        let new_samples: Vec<AzSample> = game_results.into_iter().flat_map(|(s, _)| s).collect();
+        let avg_score = if game_scores.is_empty() {
+            0.0
+        } else {
+            game_scores.iter().sum::<f32>() / game_scores.len() as f32
+        };
+
+        replay_buffer.push_back(new_samples);
+        if replay_buffer.len() > buffer_iterations {
+            replay_buffer.pop_front();
+        }
+        let all_samples: Vec<AzSample> = replay_buffer.iter().flatten().copied().collect();
+        println!(
+            "  Generated {} new samples (avg score: {avg_score:.1}), replay buffer: {} total",
+            replay_buffer.back().unwrap().len(),
+            all_samples.len()
+        );
+
+        model = train_with_epochs(all_samples, artifact_dir, epochs_per_iteration, 4e-4);
+
+        if checkpoints {
+            let src = format!("{artifact_dir}/model.mpk");
+            let dst = format!("{artifact_dir}/iter-{}.mpk", global_iter + 1);
+            if let Err(e) = std::fs::copy(&src, &dst) {
+                eprintln!("  Failed to save iter-{} checkpoint: {e}", global_iter + 1);
+            }
+        }
+
+        let elapsed = start_time.elapsed().as_secs();
+        use std::io::Write;
+        if bench_games > 0 {
+            let winrate = benchmark_vs_ga(artifact_dir, &champion, bench_games);
+            println!(
+                "  Iteration {:>3}: avg score {:.1}, winrate {:.1}%, elapsed {}m{}s",
+                global_iter + 1,
+                avg_score,
+                winrate * 100.0,
+                elapsed / 60,
+                elapsed % 60,
+            );
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&scores_log_path) {
+                writeln!(f, "{},{avg_score:.2},{:.2}", global_iter + 1, winrate * 100.0).ok();
+            }
+        } else {
+            println!("  Iteration {:>3}: avg score {:.1}, elapsed {}m{}s", global_iter + 1, avg_score, elapsed / 60, elapsed % 60);
+            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&scores_log_path) {
+                writeln!(f, "{},{avg_score:.2}", global_iter + 1).ok();
+            }
+        }
+    }
+
+    println!("\nAznet self-play training complete. Model saved to {artifact_dir}/model");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +587,24 @@ mod tests {
             assert_eq!(a.final_diff, b.final_diff);
         }
         assert!(!s1.is_empty(), "a full game must produce samples");
+    }
+
+    #[test]
+    fn self_play_train_smoke_writes_model() {
+        let dir = std::env::temp_dir().join(format!("aznet_smoke_{}", std::process::id()));
+        let dir_s = dir.to_str().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        // 1 iteration, 6 games, 1 epoch, no bench. Must complete and write a
+        // loadable model.
+        self_play_train(dir_s, 1, 6, 1, 0, false, 0);
+        assert!(dir.join("model.mpk").exists(), "model artifact written");
+
+        // The written model loads and evaluates.
+        let bot = AzStrategy::load(dir_s);
+        let v = crate::strategy::Bot::evaluate(&bot, &State::default(), &[State::default()]);
+        assert!(v.is_finite());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
