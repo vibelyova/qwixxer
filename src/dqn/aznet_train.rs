@@ -143,5 +143,25 @@ mod tests {
         }
         permute_rows(&mut f, false, false, true);
         assert_eq!(f, orig);
+
+        // green <-> blue: blocks 2 and 3 in both boards, involution.
+        f = orig;
+        permute_rows(&mut f, false, true, false);
+        for board in [0usize, BOARD_RAW] {
+            for k in 0..ROW_BLOCK {
+                assert_eq!(f[board + 2 * ROW_BLOCK + k], orig[board + 3 * ROW_BLOCK + k]);
+                assert_eq!(f[board + 3 * ROW_BLOCK + k], orig[board + 2 * ROW_BLOCK + k]);
+            }
+            // red/yellow untouched.
+            for k in 0..ROW_BLOCK {
+                assert_eq!(f[board + k], orig[board + k]);
+                assert_eq!(f[board + ROW_BLOCK + k], orig[board + ROW_BLOCK + k]);
+            }
+        }
+        // strike one-hots untouched by an actual permutation.
+        assert_eq!(f[112..116], orig[112..116]);
+        assert_eq!(f[228..232], orig[228..232]);
+        permute_rows(&mut f, false, true, false);
+        assert_eq!(f, orig);
     }
 }
