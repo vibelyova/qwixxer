@@ -6,12 +6,24 @@
 
 use crate::state::State;
 
+use crate::dqn::MyBackend;
+use burn::{
+    nn::{Linear, LinearConfig, Relu},
+    prelude::*,
+};
+
 /// Per-row one-hot block width.
 pub const ROW_BLOCK: usize = 28;
 /// Per-board raw width: 4 row blocks + one-hot strikes.
 pub const BOARD_RAW: usize = 4 * ROW_BLOCK + 4; // 116
 /// Full input: two boards + cdiff.
 pub const AZ_FEATURES: usize = 2 * BOARD_RAW + 1; // 233
+
+/// Per-row embedding width out of the shared encoder. Fixed (the trunk-input
+/// width and the forward reshape depend on it); `AzModelConfig::init` asserts
+/// the config matches. Tune by editing this constant, mirroring pair.rs's
+/// fixed `D_H1`/`D_H2`.
+pub const ENC_OUT: usize = 16;
 
 /// One-hot crossing-order block for row `i` of `state` (afterstate; no roll).
 pub fn az_row_block(state: &State, i: usize) -> [f32; ROW_BLOCK] {
@@ -78,6 +90,94 @@ pub fn az_features(our: &State, opp: &State) -> [f32; AZ_FEATURES] {
     let cdiff = (our.count_points() - opp.count_points()) as f32;
     f[2 * BOARD_RAW] = (cdiff / 100.0).clamp(-1.0, 1.0);
     f
+}
+
+#[derive(Module, Debug)]
+pub struct AzModel<B: Backend> {
+    pub enc1: Linear<B>,        // ROW_BLOCK -> encoder_hidden
+    pub enc2: Linear<B>,        // encoder_hidden -> ENC_OUT
+    pub trunk1: Linear<B>,      // 8*ENC_OUT + 9 -> trunk1
+    pub trunk2: Linear<B>,      // trunk1 -> trunk2
+    pub output_mean: Linear<B>, // trunk2 -> 1
+    pub output_log_var: Linear<B>,
+    activation: Relu,
+}
+
+#[derive(Config, Debug)]
+pub struct AzModelConfig {
+    #[config(default = 32)]
+    pub encoder_hidden: usize,
+    #[config(default = 16)]
+    pub encoder_out: usize,
+    #[config(default = 128)]
+    pub trunk1: usize,
+    #[config(default = 64)]
+    pub trunk2: usize,
+}
+
+impl AzModelConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> AzModel<B> {
+        assert_eq!(self.encoder_out, ENC_OUT, "ENC_OUT const must match config");
+        let trunk_in = 8 * ENC_OUT + 9; // 8 row embeds + 8 strike one-hots + cdiff
+        AzModel {
+            enc1: LinearConfig::new(ROW_BLOCK, self.encoder_hidden).init(device),
+            enc2: LinearConfig::new(self.encoder_hidden, self.encoder_out).init(device),
+            trunk1: LinearConfig::new(trunk_in, self.trunk1).init(device),
+            trunk2: LinearConfig::new(self.trunk1, self.trunk2).init(device),
+            output_mean: LinearConfig::new(self.trunk2, 1).init(device),
+            output_log_var: LinearConfig::new(self.trunk2, 1).init(device),
+            activation: Relu::new(),
+        }
+    }
+}
+
+impl<B: Backend> AzModel<B> {
+    /// Apply the shared encoder to one board's 4 row blocks. `rows` is
+    /// `[n, 4*ROW_BLOCK]`; returns `[n, 4*ENC_OUT]`.
+    fn encode_rows(&self, rows: Tensor<B, 2>, n: usize) -> Tensor<B, 2> {
+        let x = rows.reshape([n * 4, ROW_BLOCK]);
+        let x = self.activation.forward(self.enc1.forward(x));
+        let x = self.activation.forward(self.enc2.forward(x));
+        x.reshape([n, 4 * ENC_OUT])
+    }
+
+    /// Forward over a `[n, AZ_FEATURES]` batch -> `[n, 2]` (μ_diff, log σ²_diff).
+    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
+        let n = input.shape().dims[0]; // repo idiom (see pair.rs extract_linear)
+        let own_rows = input.clone().narrow(1, 0, 4 * ROW_BLOCK);
+        let own_strikes = input.clone().narrow(1, 4 * ROW_BLOCK, 4);
+        let opp_rows = input.clone().narrow(1, BOARD_RAW, 4 * ROW_BLOCK);
+        let opp_strikes = input.clone().narrow(1, BOARD_RAW + 4 * ROW_BLOCK, 4);
+        let cdiff = input.narrow(1, 2 * BOARD_RAW, 1);
+
+        let own = self.encode_rows(own_rows, n);
+        let opp = self.encode_rows(opp_rows, n);
+
+        let trunk_in = Tensor::cat(vec![own, opp, own_strikes, opp_strikes, cdiff], 1);
+        let x = self.activation.forward(self.trunk1.forward(trunk_in));
+        let x = self.activation.forward(self.trunk2.forward(x));
+        let mean = self.output_mean.forward(x.clone());
+        let log_var = self.output_log_var.forward(x);
+        Tensor::cat(vec![mean, log_var], 1)
+    }
+}
+
+/// Run `model` over a batch of feature vectors in one forward pass.
+/// Returns `(μ, log σ²)` per row.
+pub fn az_batch_forward(
+    model: &AzModel<MyBackend>,
+    device: &burn::backend::ndarray::NdArrayDevice,
+    features_list: &[[f32; AZ_FEATURES]],
+) -> Vec<(f32, f32)> {
+    if features_list.is_empty() {
+        return Vec::new();
+    }
+    let n = features_list.len();
+    let flat: Vec<f32> = features_list.iter().flat_map(|f| f.iter().copied()).collect();
+    let input = Tensor::<MyBackend, 1>::from_floats(flat.as_slice(), device).reshape([n, AZ_FEATURES]);
+    let output = model.forward(input);
+    let values = output.into_data().to_vec::<f32>().unwrap();
+    (0..n).map(|i| (values[2 * i], values[2 * i + 1])).collect()
 }
 
 #[cfg(test)]
@@ -224,5 +324,29 @@ mod tests {
         // cdiff negates and is nonzero.
         assert!((ab[2 * BOARD_RAW] + ba[2 * BOARD_RAW]).abs() < 1e-6);
         assert!(ab[2 * BOARD_RAW] != 0.0);
+    }
+
+    #[test]
+    fn batch_forward_shape_and_determinism() {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = AzModelConfig::new().init::<crate::dqn::MyBackend>(&device);
+
+        let mut a = State::default();
+        a.apply_mark(Mark { row: 0, number: 4 });
+        let b = State::default();
+        let rows = vec![az_features(&a, &b), az_features(&b, &a)];
+
+        let v1 = az_batch_forward(&model, &device, &rows);
+        let v2 = az_batch_forward(&model, &device, &rows);
+        assert_eq!(v1.len(), 2);
+        assert!(v1.iter().all(|(m, l)| m.is_finite() && l.is_finite()));
+        assert_eq!(v1, v2, "forward is deterministic");
+    }
+
+    #[test]
+    fn batch_forward_empty_is_empty() {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = AzModelConfig::new().init::<crate::dqn::MyBackend>(&device);
+        assert!(az_batch_forward(&model, &device, &[]).is_empty());
     }
 }
