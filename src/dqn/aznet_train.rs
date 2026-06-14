@@ -16,6 +16,8 @@ use burn::{
     train::{metric::LossMetric, Learner, SupervisedTraining},
 };
 use rand::{rngs::SmallRng, Rng, SeedableRng};
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 type MyAutodiffBackend = Autodiff<MyBackend>;
@@ -152,6 +154,137 @@ fn build_az_samples(
     samples
 }
 
+/// Self-play recorder: ε-greedy on active decisions, greedy on passive;
+/// records afterstates for chain building. The static-policy subset of the
+/// pair net's `RecordingPair` (no search, no distill).
+struct RecordingAz {
+    bot: AzStrategy,
+    epsilon: f32,
+    rng: SmallRng,
+    recorded: Rc<RefCell<Vec<Snapshot>>>,
+}
+
+impl std::fmt::Debug for RecordingAz {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "RecordingAz")
+    }
+}
+
+impl Strategy for RecordingAz {
+    fn active_phase1(&mut self, state: &State, opp_states: &[State], dice: [u8; 6]) -> Option<Mark> {
+        // ε-uniform: random white mark or skip (recording happens post-phase-2).
+        if self.rng.gen::<f32>() < self.epsilon {
+            let white_marks = state.generate_white_moves(dice[0] + dice[1]);
+            if white_marks.is_empty() {
+                return None;
+            }
+            let idx = self.rng.gen_range(0..=white_marks.len());
+            return (idx < white_marks.len()).then(|| white_marks[idx]);
+        }
+        active_phase1_impl(&self.bot, state, opp_states, dice)
+    }
+
+    fn active_phase2(&mut self, state: &State, opp_states: &[State], dice: [u8; 6], has_marked: bool) -> Option<Mark> {
+        let marks = state.generate_color_moves(dice);
+        let no_mark_state = if has_marked {
+            *state
+        } else {
+            let mut s = *state;
+            s.apply_strike();
+            s
+        };
+
+        if marks.is_empty() {
+            self.recorded.borrow_mut().push((no_mark_state, opp_states.to_vec()));
+            return None;
+        }
+
+        let mark = if self.rng.gen::<f32>() < self.epsilon {
+            let idx = self.rng.gen_range(0..=marks.len());
+            (idx < marks.len()).then(|| marks[idx])
+        } else {
+            active_phase2_impl(&self.bot, state, opp_states, dice, has_marked)
+        };
+
+        let chosen = match mark {
+            Some(m) => {
+                let mut s = *state;
+                s.apply_mark(m);
+                s
+            }
+            None => no_mark_state,
+        };
+        self.recorded.borrow_mut().push((chosen, opp_states.to_vec()));
+        mark
+    }
+
+    fn passive_phase1(
+        &mut self,
+        state: &State,
+        opp_states: &[State],
+        dice: [u8; 6],
+        _active_player: usize,
+    ) -> Option<Mark> {
+        let marks = state.generate_white_moves(dice[0] + dice[1]);
+        if marks.is_empty() {
+            return None;
+        }
+        let mark = passive_phase1_impl(&self.bot, state, opp_states, dice);
+        let post = match mark {
+            Some(m) => {
+                let mut s = *state;
+                s.apply_mark(m);
+                s
+            }
+            None => *state, // record skips too
+        };
+        self.recorded.borrow_mut().push((post, opp_states.to_vec()));
+        mark
+    }
+}
+
+/// Play one 1v1 plain self-play game; both players are recording aznet bots
+/// (player 0 explores with ε, player 1 greedy). Returns all samples (both
+/// players' trajectories, swap-doubled) plus player 0's final score.
+fn play_training_game(
+    model: &AzModel<MyBackend>,
+    device: &burn::backend::ndarray::NdArrayDevice,
+    epsilon: f32,
+    seed: u64,
+) -> (Vec<AzSample>, f32) {
+    use crate::game::{Game, Player};
+
+    let mut buffers = Vec::with_capacity(2);
+    let mut players: Vec<Player> = Vec::with_capacity(2);
+    for i in 0..2usize {
+        let bot = AzStrategy::from_model(model.clone(), device.clone());
+        let buf = Rc::new(RefCell::new(Vec::new()));
+        buffers.push(Rc::clone(&buf));
+        players.push(Player::new(
+            Box::new(RecordingAz {
+                bot,
+                epsilon: if i == 0 { epsilon } else { 0.0 },
+                rng: SmallRng::seed_from_u64(seed.wrapping_add(100 + i as u64)),
+                recorded: buf,
+            }),
+            Box::new(SmallRng::seed_from_u64(seed.wrapping_add(i as u64))),
+        ));
+    }
+
+    let mut game = Game::new(players);
+    game.play();
+
+    let finals: Vec<f32> = game.players.iter().map(|p| p.state.count_points() as f32).collect();
+
+    let mut all_samples = Vec::new();
+    for (i, buf) in buffers.iter().enumerate() {
+        let snapshots = std::mem::take(&mut *buf.borrow_mut());
+        let opp_final = finals[(i + 1) % 2];
+        all_samples.extend(build_az_samples(model, device, &snapshots, finals[i], opp_final));
+    }
+    (all_samples, finals[0])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +379,23 @@ mod tests {
         let last_fwd = &samples[2];
         assert!((last_fwd.value - 8.0).abs() < 1e-5);
         assert!((last_fwd.final_diff - 8.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn play_training_game_is_deterministic() {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = AzModelConfig::new().init::<MyBackend>(&device);
+
+        let run = || play_training_game(&model, &device, 0.1, 4242);
+        let (s1, f1) = run();
+        let (s2, f2) = run();
+        assert_eq!(f1, f2);
+        assert_eq!(s1.len(), s2.len());
+        for (a, b) in s1.iter().zip(&s2) {
+            assert_eq!(a.features, b.features);
+            assert_eq!(a.value, b.value);
+            assert_eq!(a.final_diff, b.final_diff);
+        }
+        assert!(!s1.is_empty(), "a full game must produce samples");
     }
 }
