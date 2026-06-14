@@ -18,6 +18,8 @@ enum BotType {
     Dqn,
     Pair,
     PairSearch,
+    Aznet,
+    AznetSearch,
     Mcts,
     Opportunist,
     Conservative,
@@ -31,6 +33,8 @@ impl std::fmt::Display for BotType {
             BotType::Dqn => write!(f, "DQN"),
             BotType::Pair => write!(f, "PAIR"),
             BotType::PairSearch => write!(f, "PAIR-SEARCH"),
+            BotType::Aznet => write!(f, "AZNET"),
+            BotType::AznetSearch => write!(f, "AZNET-SEARCH"),
             BotType::Mcts => write!(f, "MCTS"),
             BotType::Opportunist => write!(f, "Opportunist"),
             BotType::Conservative => write!(f, "Conservative"),
@@ -52,6 +56,10 @@ fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
         BotType::PairSearch => Box::new(strategy::search::SearchBot::new(dqn::pair::PairStrategy::load(
             "pair_model",
         ))),
+        BotType::Aznet => Box::new(dqn::aznet::AzStrategy::load("aznet_model")),
+        BotType::AznetSearch => {
+            Box::new(strategy::search::SearchBot::new(dqn::aznet::AzStrategy::load("aznet_model")))
+        }
         BotType::Mcts => {
             let champion =
                 bot::DNA::load_weights("champion.txt", genes).expect("No champion.txt found. Run `train ga` first.");
@@ -66,6 +74,7 @@ fn make_strategy(bot: &BotType) -> Box<dyn strategy::Strategy> {
 struct StrategyTemplates {
     dqn: Option<dqn::DqnStrategy>,
     pair: Option<dqn::pair::PairStrategy>,
+    aznet: Option<dqn::aznet::AzStrategy>,
     champion: Option<bot::DNA>,
 }
 
@@ -73,6 +82,7 @@ impl StrategyTemplates {
     fn new(bots: &[BotType]) -> Self {
         let needs_dqn = bots.iter().any(|b| matches!(b, BotType::Dqn));
         let needs_pair = bots.iter().any(|b| matches!(b, BotType::Pair | BotType::PairSearch));
+        let needs_aznet = bots.iter().any(|b| matches!(b, BotType::Aznet | BotType::AznetSearch));
         let needs_champion = bots.iter().any(|b| matches!(b, BotType::Ga | BotType::Mcts));
         let genes = Arc::new(bot::default_genes());
         StrategyTemplates {
@@ -83,6 +93,11 @@ impl StrategyTemplates {
             },
             pair: if needs_pair {
                 Some(dqn::pair::PairStrategy::load("pair_model"))
+            } else {
+                None
+            },
+            aznet: if needs_aznet {
+                Some(dqn::aznet::AzStrategy::load("aznet_model"))
             } else {
                 None
             },
@@ -108,6 +123,17 @@ impl StrategyTemplates {
             BotType::PairSearch => {
                 let t = self.pair.as_ref().unwrap();
                 Box::new(strategy::search::SearchBot::new(dqn::pair::PairStrategy::from_shared(
+                    t.model.clone(),
+                    t.device.clone(),
+                )))
+            }
+            BotType::Aznet => {
+                let t = self.aznet.as_ref().unwrap();
+                Box::new(dqn::aznet::AzStrategy::from_shared(t.model.clone(), t.device.clone()))
+            }
+            BotType::AznetSearch => {
+                let t = self.aznet.as_ref().unwrap();
+                Box::new(strategy::search::SearchBot::new(dqn::aznet::AzStrategy::from_shared(
                     t.model.clone(),
                     t.device.clone(),
                 )))
@@ -225,6 +251,28 @@ enum Commands {
         /// (0 = current behavior; the run recipe uses 0.05)
         #[arg(long, default_value = "0.0")]
         epsilon_lock: f32,
+    },
+    /// Aznet (shared-encoder one-hot) self-play RL — 2-player only, plain
+    #[cfg(feature = "dqn")]
+    AznetTrain {
+        /// Number of iterations
+        #[arg(short, long, default_value = "40")]
+        iterations: usize,
+        /// Games per iteration
+        #[arg(short, long, default_value = "20000")]
+        games: usize,
+        /// Training epochs per iteration over the replay buffer
+        #[arg(short, long, default_value = "10")]
+        epochs: usize,
+        /// Benchmark games per iteration (0 to disable)
+        #[arg(short, long, default_value = "0")]
+        bench: usize,
+        /// Save per-iteration checkpoints as iter-N.mpk
+        #[arg(short, long)]
+        checkpoints: bool,
+        /// Starting iteration offset (for epsilon schedule when resuming)
+        #[arg(long, default_value = "0")]
+        start_iteration: usize,
     },
 }
 
@@ -688,6 +736,15 @@ fn main() {
                 epsilon_lock,
             },
         ),
+        #[cfg(feature = "dqn")]
+        Some(Commands::AznetTrain {
+            iterations,
+            games,
+            epochs,
+            bench,
+            checkpoints,
+            start_iteration,
+        }) => dqn::aznet_train::self_play_train("aznet_model", iterations, games, epochs, bench, checkpoints, start_iteration),
         None => {
             // Default: play against MCTS
             run_play(vec![BotType::Mcts], false);
