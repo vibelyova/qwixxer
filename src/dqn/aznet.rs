@@ -7,9 +7,12 @@
 use crate::state::State;
 
 use crate::dqn::MyBackend;
+use crate::dqn::{LOG_VAR_MAX, LOG_VAR_MIN};
 use burn::{
     nn::{Linear, LinearConfig, Relu},
     prelude::*,
+    tensor::backend::AutodiffBackend,
+    train::{InferenceStep, RegressionOutput, TrainOutput, TrainStep},
 };
 
 /// Per-row one-hot block width.
@@ -178,6 +181,60 @@ pub fn az_batch_forward(
     let output = model.forward(input);
     let values = output.into_data().to_vec::<f32>().unwrap();
     (0..n).map(|i| (values[2 * i], values[2 * i + 1])).collect()
+}
+
+#[derive(Clone, Debug)]
+pub struct AzBatch<B: Backend> {
+    pub inputs: Tensor<B, 2>,
+    pub targets: Tensor<B, 1>,
+    pub final_diffs: Tensor<B, 1>,
+}
+
+impl<B: Backend> AzModel<B> {
+    /// Decoupled μ/σ loss on the differential — identical recipe to the pair
+    /// net: μ = MSE toward the TD(λ) target; σ = Gaussian NLL against the
+    /// actual final-diff residual with μ detached.
+    pub fn forward_step(&self, batch: AzBatch<B>) -> RegressionOutput<B> {
+        let output = self.forward(batch.inputs);
+        let mean = output.clone().narrow(1, 0, 1);
+        let log_var = output.narrow(1, 1, 1).clamp(LOG_VAR_MIN, LOG_VAR_MAX);
+
+        let targets = batch.targets.clone().unsqueeze_dim(1);
+        let final_diffs = batch.final_diffs.clone().unsqueeze_dim(1);
+
+        let mu_residual = targets.clone() - mean.clone();
+        let mu_loss = (mu_residual.clone() * mu_residual).mean();
+
+        let mean_detached = mean.clone().detach();
+        let sigma_residual = final_diffs - mean_detached;
+        let sigma_sq = sigma_residual.clone() * sigma_residual;
+        let inv_var = log_var.clone().neg().exp();
+        let sigma_nll = log_var + sigma_sq * inv_var;
+        let sigma_loss = sigma_nll.mean().mul_scalar(0.5);
+
+        let loss = mu_loss + sigma_loss;
+
+        RegressionOutput { loss, output: mean, targets }
+    }
+}
+
+impl<B: AutodiffBackend> TrainStep for AzModel<B> {
+    type Input = AzBatch<B>;
+    type Output = RegressionOutput<B>;
+
+    fn step(&self, batch: AzBatch<B>) -> TrainOutput<RegressionOutput<B>> {
+        let item = self.forward_step(batch);
+        TrainOutput::new(self, item.loss.backward(), item)
+    }
+}
+
+impl<B: Backend> InferenceStep for AzModel<B> {
+    type Input = AzBatch<B>;
+    type Output = RegressionOutput<B>;
+
+    fn step(&self, batch: AzBatch<B>) -> RegressionOutput<B> {
+        self.forward_step(batch)
+    }
 }
 
 #[cfg(test)]
@@ -364,5 +421,32 @@ mod tests {
         let out = az_batch_forward(&model, &device, &[az_features(&a, &b)]);
         assert_eq!(out.len(), 1);
         assert!(out[0].0.is_finite() && out[0].1.is_finite());
+    }
+
+    #[test]
+    fn forward_step_loss_finite_and_mean_matches_head() {
+        use crate::dqn::aznet::AzBatch;
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = AzModelConfig::new().init::<crate::dqn::MyBackend>(&device);
+
+        let a = State::default();
+        let b = State::default();
+        let feats = [az_features(&a, &b), az_features(&b, &a)];
+        let flat: Vec<f32> = feats.iter().flat_map(|f| f.iter().copied()).collect();
+        let inputs = burn::tensor::Tensor::<crate::dqn::MyBackend, 1>::from_floats(flat.as_slice(), &device)
+            .reshape([2, AZ_FEATURES]);
+        let targets = burn::tensor::Tensor::<crate::dqn::MyBackend, 1>::from_floats([3.0f32, -3.0].as_slice(), &device);
+        let final_diffs =
+            burn::tensor::Tensor::<crate::dqn::MyBackend, 1>::from_floats([5.0f32, -5.0].as_slice(), &device);
+
+        let batch = AzBatch {
+            inputs,
+            targets,
+            final_diffs,
+        };
+        let out = model.forward_step(batch);
+        let loss = out.loss.into_data().to_vec::<f32>().unwrap()[0];
+        assert!(loss.is_finite(), "loss finite");
+        assert!(loss >= 0.0, "loss non-negative");
     }
 }
