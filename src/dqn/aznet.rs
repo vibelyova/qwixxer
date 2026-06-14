@@ -131,6 +131,21 @@ mod tests {
         let b = az_row_block(&s, 2);
         assert_eq!(b[3], 1.0, "count index 3");
         assert_eq!(b[FREE0 + 4], 1.0, "free slot 4 (12-8)");
+        assert!((b[BLANKS] - 0.1).abs() < 1e-6, "descending blanks (4-3)/10 = 0.1");
+    }
+
+    #[test]
+    fn wprob_zero_on_unlockable_terminal() {
+        // R marks 2,3,11 -> free = 12 (terminal) with only 3 marks: cannot lock,
+        // so wprob must be 0.
+        let mut s = State::default();
+        for n in [2u8, 3, 11] {
+            s.apply_mark(Mark { row: 0, number: n });
+        }
+        assert_eq!(s.row_free_values()[0], Some(12));
+        assert_eq!(s.row_totals()[0], 3);
+        let b = az_row_block(&s, 0);
+        assert_eq!(b[WPROB], 0.0, "unlockable terminal => wprob 0");
     }
 
     #[test]
