@@ -1540,3 +1540,43 @@ across phases as regression guards — including catching nothing-burgers
 bugs (CSV resume, tie-null bias). Remaining ideas, none pre-committed:
 representation work for lock/endgame interactions, a third distillation leg
 on fresh rollouts (flywheel), or accepting the ~60% structural ceiling.
+
+## Phase 20: AZ Representation (aznet) — shared-encoder one-hot value net
+
+**Status: implemented; run pending.** Spec:
+`docs/superpowers/specs/2026-06-15-aznet-representation-design.md`.
+
+Tests AlphaZero's *representation* lever in the existing pair-train harness: a
+new afterstate value net (`aznet`) encoding each board as one-hot crossing-order
+per-row blocks (count 0..=12, free-pointer slot, is_locked, is_lockable on both
+boards, wprob + blanks scalars) through a shared `f_row` 28→32→16 encoder, then
+a 128→64 trunk with μ/σ diff-space heads (~27.5k params). Everything else is the
+pair net's pipeline unchanged: TD(λ=0.8) diff targets, decoupled μ/σ loss,
+board-swap doubling, `(cdiff+μ)/σ` ranking, `SearchBot`, paired-CRN bench.
+2-player-only plain self-play; burn-only inference.
+
+### Run recipe
+
+```bash
+rm -f aznet_model/iter-*.mpk
+# Match the pair net's plain recipe; 200k per-iteration bench for checkpoint selection.
+cargo run --release -- aznet-train -i 40 -g 20000 -e 3 -b 200000 -c
+```
+
+### Pre-registration
+
+- **Control:** recorded plain pair numbers (~59.2% static / ~60.1% search;
+  weaker isolation — recorded run used 1v1/3p/4p thirds, not 2p-only).
+- **Primary:** selected checkpoint's win rate vs GA @ 1M, seed 42, static AND
+  search (`bench ga aznet -n 1000000`, `bench ga aznet-search -n 1000000`).
+- **PAY (≥ +0.3pp, CI-separated):** build the hand-rolled inference kernel, run
+  a distillation leg, proceed to Arm B (directly-learned win head).
+- **KILL (< +0.1pp):** representation is not the lever; stop before Arm B.
+- **Capacity-control (only if PAY):** re-run old repr ~27k OR new repr ~14k to
+  disentangle representation from the ~2× capacity.
+- **Guard:** checkpoint selection on the per-iteration 200k static curve;
+  90/10 valid loss watched for overfit (reduce epochs before resizing).
+
+### Results
+
+_(to be filled after the run)_
