@@ -78,7 +78,7 @@ impl DistillCfg {
 /// G_{n−1} = final_diff
 /// G_t     = (1−λ)·(μ_{t+1} + cdiff_{t+1}) + λ·G_{t+1}
 /// ```
-fn td_diff_targets(mus: &[f32], cdiffs: &[f32], final_diff: f32, lambda: f32) -> Vec<f32> {
+pub(crate) fn td_diff_targets(mus: &[f32], cdiffs: &[f32], final_diff: f32, lambda: f32) -> Vec<f32> {
     let n = cdiffs.len();
     let mut g = vec![0.0f32; n];
     g[n - 1] = final_diff;
