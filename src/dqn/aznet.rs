@@ -8,12 +8,15 @@ use crate::state::State;
 
 use crate::dqn::MyBackend;
 use crate::dqn::{LOG_VAR_MAX, LOG_VAR_MIN};
+use crate::strategy::Bot;
+use burn::record::CompactRecorder;
 use burn::{
     nn::{Linear, LinearConfig, Relu},
     prelude::*,
     tensor::backend::AutodiffBackend,
     train::{InferenceStep, RegressionOutput, TrainOutput, TrainStep},
 };
+use std::sync::Arc;
 
 /// Per-row one-hot block width.
 pub const ROW_BLOCK: usize = 28;
@@ -234,6 +237,102 @@ impl<B: Backend> InferenceStep for AzModel<B> {
 
     fn step(&self, batch: AzBatch<B>) -> RegressionOutput<B> {
         self.forward_step(batch)
+    }
+}
+
+pub struct AzStrategy {
+    pub model: Arc<AzModel<MyBackend>>,
+    pub device: burn::backend::ndarray::NdArrayDevice,
+}
+
+impl std::fmt::Debug for AzStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "AzStrategy")
+    }
+}
+
+impl AzStrategy {
+    pub fn load(artifact_dir: &str) -> Self {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = AzModelConfig::new()
+            .init::<MyBackend>(&device)
+            .load_file(format!("{artifact_dir}/model"), &CompactRecorder::new(), &device)
+            .expect("Failed to load aznet model");
+        Self::from_shared(Arc::new(model), device)
+    }
+
+    pub fn from_model(model: AzModel<MyBackend>, device: burn::backend::ndarray::NdArrayDevice) -> Self {
+        Self::from_shared(Arc::new(model), device)
+    }
+
+    pub fn from_shared(model: Arc<AzModel<MyBackend>>, device: burn::backend::ndarray::NdArrayDevice) -> Self {
+        AzStrategy { model, device }
+    }
+}
+
+impl Bot for AzStrategy {
+    fn evaluate(&self, our_state: &State, opp_states: &[State]) -> f32 {
+        self.evaluate_batch(&[*our_state], opp_states)[0]
+    }
+
+    fn evaluate_batch(&self, candidates: &[State], opp_states: &[State]) -> Vec<f32> {
+        self.evaluate_batch_multi(&[(candidates, opp_states)]).pop().unwrap()
+    }
+
+    fn evaluate_batch_multi(&self, groups: &[(&[State], &[State])]) -> Vec<Vec<f32>> {
+        // 2-player net: rank against the leading opponent; extra opponents
+        // (multiplayer) are ignored. Solo falls back to a fresh board.
+        let default_opps = [State::default()];
+        let mut leaders: Vec<isize> = Vec::with_capacity(groups.len());
+        let mut feats: Vec<[f32; AZ_FEATURES]> = Vec::new();
+        for (candidates, opp_states) in groups {
+            let opps: &[State] = if opp_states.is_empty() { &default_opps } else { opp_states };
+            let leader = opps.iter().max_by_key(|s| s.count_points()).unwrap();
+            for c in *candidates {
+                feats.push(az_features(c, leader));
+            }
+            leaders.push(leader.count_points());
+        }
+        let values = az_batch_forward(&self.model, &self.device, &feats);
+
+        let mut out = Vec::with_capacity(groups.len());
+        let mut idx = 0;
+        for ((candidates, _), leader_points) in groups.iter().zip(leaders) {
+            let group = candidates
+                .iter()
+                .map(|cand| {
+                    let (mu, log_var) = values[idx];
+                    idx += 1;
+                    let cdiff = (cand.count_points() - leader_points) as f32;
+                    let sigma = (0.5 * log_var.clamp(LOG_VAR_MIN, LOG_VAR_MAX)).exp();
+                    (cdiff + mu) / sigma
+                })
+                .collect();
+            out.push(group);
+        }
+        out
+    }
+}
+
+impl crate::strategy::search::WinProb for AzStrategy {
+    fn win_prob_multi(&self, groups: &[(&State, &[State])]) -> Vec<f32> {
+        let default_opps = [State::default()];
+        let mut feats = Vec::with_capacity(groups.len());
+        let mut cdiffs = Vec::with_capacity(groups.len());
+        for (our, opps) in groups {
+            let opps: &[State] = if opps.is_empty() { &default_opps } else { opps };
+            let leader = opps.iter().max_by_key(|s| s.count_points()).unwrap();
+            feats.push(az_features(our, leader));
+            cdiffs.push((our.count_points() - leader.count_points()) as f32);
+        }
+        az_batch_forward(&self.model, &self.device, &feats)
+            .into_iter()
+            .zip(cdiffs)
+            .map(|((mu, log_var), cdiff)| {
+                let sigma = (0.5 * log_var.clamp(LOG_VAR_MIN, LOG_VAR_MAX)).exp();
+                crate::strategy::search::phi((cdiff + mu) / sigma)
+            })
+            .collect()
     }
 }
 
@@ -483,5 +582,41 @@ mod tests {
             loss_perfect < loss,
             "better mu prediction lowers loss: {loss_perfect} < {loss}"
         );
+    }
+
+    #[test]
+    fn evaluate_batch_finite_and_deterministic() {
+        use crate::strategy::Bot;
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let bot = AzStrategy::from_model(AzModelConfig::new().init::<crate::dqn::MyBackend>(&device), device);
+
+        let mut cand = State::default();
+        cand.apply_mark(Mark { row: 1, number: 5 });
+        let candidates = [State::default(), cand];
+        let opps = [State::default()];
+
+        let v1 = bot.evaluate_batch(&candidates, &opps);
+        let v2 = bot.evaluate_batch(&candidates, &opps);
+        assert_eq!(v1.len(), 2);
+        assert_eq!(v1, v2);
+        assert!(v1.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn win_prob_is_probability_and_monotone() {
+        use crate::strategy::search::WinProb;
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let bot = AzStrategy::from_model(AzModelConfig::new().init::<crate::dqn::MyBackend>(&device), device);
+
+        let behind = State::default();
+        let mut ahead = State::default();
+        for n in 2..=8 {
+            ahead.apply_mark(Mark { row: 0, number: n });
+        }
+        let opp = State::default();
+        let p = bot.win_prob_multi(&[(&behind, &[opp]), (&ahead, &[opp])]);
+        assert_eq!(p.len(), 2);
+        assert!(p.iter().all(|x| (0.0..=1.0).contains(x)));
+        assert!(p[1] >= p[0], "a points lead must not be rated worse");
     }
 }
