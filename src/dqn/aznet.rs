@@ -439,6 +439,9 @@ mod tests {
         let final_diffs =
             burn::tensor::Tensor::<crate::dqn::MyBackend, 1>::from_floats([5.0f32, -5.0].as_slice(), &device);
 
+        // AzBatch takes ownership of `inputs`; keep a clone to reconstruct the
+        // direct forward for the mean-matches-head check below.
+        let inputs2 = inputs.clone();
         let batch = AzBatch {
             inputs,
             targets,
@@ -448,5 +451,37 @@ mod tests {
         let loss = out.loss.into_data().to_vec::<f32>().unwrap()[0];
         assert!(loss.is_finite(), "loss finite");
         assert!(loss >= 0.0, "loss non-negative");
+
+        // (1) out.output must equal the μ column (narrow(1, 0, 1)) of a direct
+        // forward over the same inputs. Pins the `output: mean` contract.
+        let mu_head = model.forward(inputs2.clone()).narrow(1, 0, 1);
+        let got = out.output.clone().into_data().to_vec::<f32>().unwrap();
+        let want = mu_head.clone().into_data().to_vec::<f32>().unwrap();
+        assert_eq!(got.len(), want.len(), "output / mu-head length match");
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!(
+                (g - w).abs() <= 1e-6,
+                "out.output tracks mu head: {g} vs {w}"
+            );
+        }
+
+        // (2) The MSE term responds to target accuracy: feeding targets equal to
+        // the model's own μ prediction (perfectly predicted mean) must yield a
+        // finite loss strictly below the original loss, which used mismatched
+        // targets 3.0/-3.0. We set final_diffs = μ too so the σ residual is
+        // also small. The μ column is [2,1]; flatten to a length-2 vector.
+        let mu_vec = mu_head.reshape([2]);
+        let batch_perfect = AzBatch {
+            inputs: inputs2,
+            targets: mu_vec.clone(),
+            final_diffs: mu_vec,
+        };
+        let out_perfect = model.forward_step(batch_perfect);
+        let loss_perfect = out_perfect.loss.into_data().to_vec::<f32>().unwrap()[0];
+        assert!(loss_perfect.is_finite(), "perfect-mu loss finite");
+        assert!(
+            loss_perfect < loss,
+            "better mu prediction lowers loss: {loss_perfect} < {loss}"
+        );
     }
 }
