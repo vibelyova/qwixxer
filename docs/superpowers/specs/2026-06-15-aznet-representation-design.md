@@ -41,7 +41,11 @@ pair-train harness.
 | old pair net, **distilled** (iter-57, committed `pair_model/model.mpk`) | 59.85% | 60.7% |
 
 Arm A compares against the **plain** row (apples-to-apples; distillation is a
-later, separate leg). A matched plain control is re-run under current code (§9).
+later, separate leg). We do **not** retrain or modify the old net's training
+code; the control is the **recorded** plain pair numbers above. This is weaker
+isolation (the recorded run used the 1v1/3p/4p-thirds recipe, not 2-player-only)
+— accepted deliberately to avoid touching `pair_train.rs`'s behavior. The
+comparison still shares `Game`/`State`/seeds/loss-recipe/TD/bench.
 
 ---
 
@@ -93,7 +97,7 @@ The **free-pointer slot** of an unlocked row is derived from `State`'s
 the pointer past the marked cell, including over skips), so the free-pointer slot
 fully determines future legality. A locked row has `free = None`.
 
-### 3.2 Per-row block — 27 dims
+### 3.2 Per-row block — 28 dims
 
 | group | dims | semantics |
 |---|---|---|
@@ -102,17 +106,20 @@ fully determines future legality. A locked row has `free = None`.
 | is_locked | 1 | explicit; locked rows are global game-enders (2 locks = game over). |
 | is_lockable | 1 | `total ≥ 5 ∧ free on terminal slot`. **Kept on BOTH boards** — for the opponent it is a genuine denial/endgame threat signal (the `total≥5 ⇔ lockable` rule handed to the net), not a "what I can do this turn" leak. |
 | weighted-prob scalar | 1 | today's `board_features` `f[12+i]`: `0` if the free pointer rests on an unlockable terminal, else `(ways/6) · (total+1)/11`. Retained as a proven EV-of-future-markability signal. |
+| blanks scalar | 1 | `(free_slot − count)` (cells skipped left of the pointer; always ≥0; **0 if locked**), normalized `/10`. A genuine `free_slot × count` interaction the encoder would otherwise have to learn, and directly value-relevant (skipped cells = permanently lost potential). Reintroduces, at per-row resolution, the board-level `blanks` signal the old net used (dropped by the globals-collapse in §3.4). |
 
-**Total: 27 dims/row.** The AZ doc's 35-dim block had an 11-dim
+**Total: 28 dims/row.** The AZ doc's 35-dim block had an 11-dim
 `is_markable_this_turn` group; that is dropped because afterstate evaluation has
-no associated roll.
+no associated roll. A per-row **score** scalar was considered and **rejected** as
+redundant: `triangular(count)` is a function of `count` alone, which the one-hot
+already lets the encoder represent exactly.
 
 ### 3.3 Per-board block
 
-- 4 row blocks × 27 = 108.
+- 4 row blocks × 28 = 112.
 - one-hot strikes: `strikes ∈ 0..=3` → 4 dims (4 ends the game; never an
   afterstate input).
-- **Per board raw = 112.**
+- **Per board raw = 116.**
 
 ### 3.4 Global features
 
@@ -124,57 +131,59 @@ Dropped vs the old net (justified by 2-player-only, §6): `num_opponents`
 max-opp-strikes, opp-lockable-sum) — all redundant with the single full opponent
 board now present at full resolution.
 
-### 3.5 Flat feature vector — `AZ_FEATURES = 225`
+### 3.5 Flat feature vector — `AZ_FEATURES = 233`
 
 Fixed layout (the model slices this; the batcher permutes row blocks within it):
 
 ```
-[  0.. 27)  own row 0 (R)        \
-[ 27.. 54)  own row 1 (Y)         |  own 4 row blocks (108)
-[ 54.. 81)  own row 2 (G)         |
-[ 81..108)  own row 3 (B)        /
-[108..112)  own strikes one-hot (4)
-[112..139)  opp row 0 (R)        \
-[139..166)  opp row 1 (Y)         |  opp 4 row blocks (108)
-[166..193)  opp row 2 (G)         |
-[193..220)  opp row 3 (B)        /
-[220..224)  opp strikes one-hot (4)
-[224]       cdiff/100 (clamped)
+[  0.. 28)  own row 0 (R)        \
+[ 28.. 56)  own row 1 (Y)         |  own 4 row blocks (112)
+[ 56.. 84)  own row 2 (G)         |
+[ 84..112)  own row 3 (B)        /
+[112..116)  own strikes one-hot (4)
+[116..144)  opp row 0 (R)        \
+[144..172)  opp row 1 (Y)         |  opp 4 row blocks (112)
+[172..200)  opp row 2 (G)         |
+[200..228)  opp row 3 (B)        /
+[228..232)  opp strikes one-hot (4)
+[232]       cdiff/100 (clamped)
 ```
 
-Constants: `ROW_BLOCK = 27`, `BOARD_RAW = 112` (108 rows + 4 strikes),
-`AZ_FEATURES = 225`.
+Constants: `ROW_BLOCK = 28`, `BOARD_RAW = 116` (112 rows + 4 strikes),
+`AZ_FEATURES = 233`.
 
-**Swap doubling** = swap `[0..112)` ↔ `[112..224)` and negate `[224]`.
-**Color augmentation** = permute the four 27-dim row blocks within own `[0..108)`
-and within opp `[112..220)` *identically*; strikes and cdiff untouched.
+**Swap doubling** = swap `[0..116)` ↔ `[116..232)` and negate `[232]`.
+**Color augmentation** = permute the four 28-dim row blocks within own `[0..112)`
+and within opp `[116..228)` *identically*; strikes and cdiff untouched.
 
 ---
 
 ## 4. Model architecture
 
 ```
-Az_FEATURES (225)
-  ├─ slice 8 row blocks (own 4 @ [0..108), opp 4 @ [112..220)) → [batch*8, 27]
-  │     shared f_row encoder:  Linear(27→32) → ReLU → Linear(32→16) → ReLU
+AZ_FEATURES (233)
+  ├─ slice 8 row blocks (own 4 @ [0..112), opp 4 @ [116..228)) → [batch*8, 28]
+  │     shared f_row encoder:  Linear(28→32) → ReLU → Linear(32→16) → ReLU
   │     → [batch, 8*16 = 128]
-  ├─ own strikes [108..112] (4) ─┐
-  ├─ opp strikes [220..224] (4) ─┤ concat
-  └─ cdiff [224] (1) ───────────┘
+  ├─ own strikes [112..116] (4) ─┐
+  ├─ opp strikes [228..232] (4) ─┤ concat
+  └─ cdiff [232] (1) ───────────┘
         → trunk input (128 + 4 + 4 + 1 = 137)
-        Linear(137→128) → LayerNorm → ReLU → Linear(128→64) → LayerNorm → ReLU
+        Linear(137→128) → ReLU → Linear(128→64) → ReLU
         ├─ output_mean   Linear(64→1)
         └─ output_log_var Linear(64→1)
   forward → cat([mean, log_var], dim=1) → [batch, 2]
 ```
 
-- **Shared encoder** `f_row`: one `Linear(27→32)` + one `Linear(32→16)` with
-  tied weights, applied to all 8 row blocks by batching them as `[batch*8, 27]`.
-- **Parameter count** ≈ 27·32+32 + 32·16+16 (encoder, 1 424) + 137·128+128 +
+- **Shared encoder** `f_row`: one `Linear(28→32)` + one `Linear(32→16)` with
+  tied weights, applied to all 8 row blocks by batching them as `[batch*8, 28]`.
+- **Parameter count** ≈ 28·32+32 + 32·16+16 (encoder, 1 456) + 137·128+128 +
   128·64+64 + 64+1 + 64+1 (trunk + 2 heads, 26 050) ≈ **27.5k** (~2× the old
   net's 14k; chosen "modest headroom" — see §9 capacity-control).
-- **LayerNorm** between trunk layers (self-play input distribution is
-  non-stationary; LayerNorm > BatchNorm here, per the AZ doc).
+- **No normalization** between trunk layers — matches the proven pair net's
+  recipe (inputs are bounded one-hots/scalars; a steady LR is reused). LayerNorm
+  is held in reserve (§11), added only if training shows instability; BatchNorm
+  is avoided regardless (tiny, varying inference batches).
 - **Inference: burn only.** No hand-rolled kernel in Arm A.
 
 ### Module name & types
@@ -205,12 +214,12 @@ self-contained).
 `src/dqn/aznet_train.rs`:
 
 - `AzSample { features: [f32; AZ_FEATURES], value: f32, final_diff: f32 }` with a
-  serde slice adapter (length 225 > serde's array cap), modeled on
+  serde slice adapter (length 233 > serde's array cap), modeled on
   `pair_features_serde`.
-- `AzBatcher` — color permutation over 27-dim row blocks (own + opp identically),
+- `AzBatcher` — color permutation over 28-dim row blocks (own + opp identically),
   seeded exactly as `PairBatcher` (`TRAIN_SEED ⊕ value.to_bits ⊕ batch_size`).
 - `permute_rows(&mut [f32; AZ_FEATURES], swap_ry, swap_gb, swap_pairs)` — swaps
-  whole 27-dim blocks at offsets `{0,27,54,81}` (own) and `{112,139,166,193}`
+  whole 28-dim blocks at offsets `{0,28,56,84}` (own) and `{116,144,172,200}`
   (opp). R↔Y swaps blocks 0↔1; G↔B swaps 2↔3; pair-swap swaps {0↔2, 1↔3}.
 - Reuse `td_diff_targets` — promote it to `pub(crate)` in `pair_train.rs` and
   import it (DRY; identical formula, already unit-tested).
@@ -242,15 +251,14 @@ epochs_per_iteration, bench_games, checkpoints, start_iteration)`:
 
 Model dir: **`aznet_model/`**.
 
-### Old-repr matched control
+### Control (no old-net retraining)
 
-Add a `two_player: bool` parameter to the existing
-`pair_train::self_play_train` (default `false`, preserving all current behavior
-and tests) that, when set, forces `game_configs` to all-`1`. Surface it as a
-`--two-player` flag on the `PairTrain` CLI command. The control run is then:
-old repr + plain self-play (`--search` off, `--distill` off) + `--two-player`,
-same epochs/seeds/bench as Arm A. This isolates representation (+capacity) as the
-only intended difference; both paths share `Game`/`State`/seeds/TD/loss/bench.
+We do **not** retrain the old net or touch `pair_train.rs`'s behavior. The
+control is the **recorded** plain pair numbers (~59.2% static / ~60.1% search).
+Weaker isolation is accepted: the recorded run used the 1v1/3p/4p-thirds recipe,
+not 2-player-only, so the comparison carries a recipe difference on top of the
+representation+capacity difference. This is the deliberate trade for leaving the
+pair trainer untouched.
 
 ---
 
@@ -262,7 +270,7 @@ only intended difference; both paths share `Game`/`State`/seeds/TD/loss/bench.
 - New `Commands::AznetTrain` mirroring `PairTrain` (iterations, games, epochs,
   bench, checkpoints, start-iteration) **without** `--search`/`--distill`
   (plain only) → calls `aznet_train::self_play_train`.
-- `PairTrain` gains `--two-player` (for the control).
+- No changes to the `PairTrain` command.
 
 ---
 
@@ -285,11 +293,13 @@ Feature extraction (goldens, the highest-value tests — they pin the lever):
 6. **is_lockable on both boards** — `total≥5 ∧ free on terminal` sets the bit for
    own *and* opponent boards.
 7. **swap relationship** — `az_features(a,b)` vs `az_features(b,a)`: board halves
-   exchange (`[0..112)`↔`[112..224)`), cdiff negates.
+   exchange (`[0..116)`↔`[116..232)`), cdiff negates.
+7b. **blanks scalar** — fresh row = 0; R{2,3,5} (count 3, free_slot 4) → `1/10`;
+    locked row → 0.
 
 Model / batcher:
 
-8. `permute_rows` — each generator swaps the right 27-dim blocks in both halves;
+8. `permute_rows` — each generator swaps the right 28-dim blocks in both halves;
    strikes/cdiff invariant; **involution** (apply twice = identity).
 9. `az_batch_forward` — shape `[n,2]`, finite, deterministic across calls.
 10. `AzModel::forward_step` — loss finite; μ output column matches `forward`'s
@@ -307,8 +317,9 @@ Pipeline:
 14. determinism — `play_training_game` (the aznet variant) produces identical
     samples run-to-run on a fixed seed.
 
-The existing `pair.rs`/`pair_train.rs` suites must stay green (the `--two-player`
-addition is behavior-preserving when `false`).
+The existing `pair.rs`/`pair_train.rs` suites must stay green (only the
+behavior-preserving `pub(crate)` promotion of `td_diff_targets` touches that
+file).
 
 ---
 
@@ -317,11 +328,13 @@ addition is behavior-preserving when `false`).
 **Primary metric:** new-repr **plain** win rate vs GA @ **1,000,000** games,
 seed 42 (paired CRN), both **static** and **search** (`SearchBot`).
 
-**Control:** old-repr **plain, 2-player-only** run (§6) benched identically.
-Secondary reference: recorded plain ~59.2% static / ~60.1% search.
+**Control:** the **recorded** plain pair numbers — ~59.2% static / ~60.1%
+search (§6; weaker isolation, accepted). No old-net retraining.
 
-**Checkpoint selection:** per-iteration **50k** static bench curve (cheaper;
-burn-only inference). Final 1M benches on the selected checkpoint only.
+**Checkpoint selection:** per-iteration **200k** static bench curve (SE ≈ 0.1pp
+paired — enough resolution to track a +0.3pp signal; 50k's ~0.22pp SE is too
+coarse). Final **1M** benches (static + search) on the selected checkpoint only.
+Burn-only inference is slow but tolerable at these sizes.
 
 | outcome | rule |
 |---|---|
@@ -347,8 +360,8 @@ up, reduce epochs (old net needed 3 to break a plateau) before resizing.
 | `src/dqn/aznet.rs` | **new** — features, `AzModel`/`AzModelConfig`, `az_batch_forward`, `AzStrategy` (`Bot` + `WinProb`). |
 | `src/dqn/aznet_train.rs` | **new** — `AzSample`, `AzBatcher`/`permute_rows`, `build_az_samples`, `RecordingAz`, `play_training_game`, `benchmark_vs_ga`, `self_play_train`, `train_with_epochs`. |
 | `src/dqn/mod.rs` | export `aznet`, `aznet_train`; expose shared helpers as needed (`row_progress` is private — re-derive or `pub(crate)` it). |
-| `src/dqn/pair_train.rs` | promote `td_diff_targets` to `pub(crate)`; add `two_player: bool` to `self_play_train` (default-false, behavior-preserving). |
-| `src/main.rs` | `BotType::Aznet`/`AznetSearch`; `Commands::AznetTrain`; `--two-player` on `PairTrain`. |
+| `src/dqn/pair_train.rs` | promote `td_diff_targets` to `pub(crate)` (only change; behavior-preserving). |
+| `src/main.rs` | `BotType::Aznet`/`AznetSearch`; `Commands::AznetTrain`. |
 | `docs/EXPERIMENTS.md` | Phase 20 stub (pre-registration) before the run; results after. |
 
 No changes to `pair.rs`, `state.rs`, `game.rs`, `search.rs`, `sim.rs`, or the
@@ -360,8 +373,10 @@ web crate.
 
 - Exact encoder widths (`32→16`) and trunk widths (`128→64`) — start as specified
   (~27k); adjust only on observed under/overfit.
+- **LayerNorm between trunk layers** — held in reserve; add only if training
+  shows instability/divergence (the no-norm recipe is the default, per §4).
 - Whether `row_progress` is re-derived in `aznet.rs` or promoted `pub(crate)`.
 - Epochs per iteration (start at the pair net's tuned value; revisit on valid
   loss).
-- Number of self-play iterations and games/iter for the run (match the pair net's
-  plain recipe for a clean control).
+- Number of self-play iterations and games/iter (match the pair net's plain
+  recipe so the recorded-baseline comparison is as close as the recipe allows).
