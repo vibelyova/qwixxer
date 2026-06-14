@@ -21,6 +21,9 @@ pub mod train;
 #[cfg(feature = "dqn")]
 pub mod pair_train;
 
+#[cfg(feature = "dqn")]
+pub mod aznet_train;
+
 pub mod pair;
 
 pub mod aznet;
