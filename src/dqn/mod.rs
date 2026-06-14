@@ -23,6 +23,8 @@ pub mod pair_train;
 
 pub mod pair;
 
+pub mod aznet;
+
 use crate::state::State;
 use crate::strategy::Bot;
 use burn::{
