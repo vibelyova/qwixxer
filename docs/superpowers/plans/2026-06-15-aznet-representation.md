@@ -1842,13 +1842,8 @@ git commit -m "docs: Phase 20 (aznet representation) pre-registration stub"
 
 - [ ] `cargo test --features dqn` — full suite green (existing + new).
 - [ ] `cargo build --release --features dqn` — clean release build.
-- [ ] `cargo build --no-default-features --features burn` — the web/inference
-  build still compiles (confirms `aznet_train`'s `dqn`-gating is correct and
-  `aznet.rs` doesn't pull in training-only deps under `burn`-only). If `aznet.rs`
-  fails here because it uses `burn::train` types (`RegressionOutput`,
-  `TrainStep`, `InferenceStep`) that are training-only, gate the loss/step
-  block (`forward_step` + `TrainStep` + `InferenceStep` impls + the
-  `burn::train` import) behind `#[cfg(feature = "dqn")]` — the web crate never
-  trains, and `AzStrategy`/`forward`/`az_batch_forward` stay available under
-  `burn`. Re-run this build to confirm.
 - [ ] The three CLI smoke commands in Task 10 Step 6 run without panic.
+
+**Web build is out of scope for this task** — do not run or worry about
+`--no-default-features --features burn`. `aznet.rs` may freely use `burn::train`
+types; no `#[cfg]`-gating of the loss/step block is required.
