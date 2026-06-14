@@ -110,6 +110,7 @@ type Snapshot = (State, Vec<State>);
 /// TD(λ) chain, every sample emitted in both board orders (swap doubling) with
 /// negated targets. μ for the bootstrap comes from a burn forward over the
 /// chain's features.
+/// 2p-only: indexes `opps[0]`; any extra opponents are ignored.
 fn build_az_samples(
     model: &AzModel<MyBackend>,
     device: &burn::backend::ndarray::NdArrayDevice,
@@ -121,6 +122,10 @@ fn build_az_samples(
     if snapshots.is_empty() {
         return samples;
     }
+    debug_assert!(
+        !snapshots[0].1.is_empty(),
+        "build_az_samples is 2-player: each snapshot needs >= 1 opponent"
+    );
     let final_diff = our_final - opp_final;
 
     let feats: Vec<[f32; AZ_FEATURES]> = snapshots
