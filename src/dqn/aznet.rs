@@ -316,6 +316,7 @@ impl Bot for AzStrategy {
 
 impl crate::strategy::search::WinProb for AzStrategy {
     fn win_prob_multi(&self, groups: &[(&State, &[State])]) -> Vec<f32> {
+        // 2-player net: same leading-opponent reduction as evaluate_batch_multi.
         let default_opps = [State::default()];
         let mut feats = Vec::with_capacity(groups.len());
         let mut cdiffs = Vec::with_capacity(groups.len());
@@ -618,5 +619,40 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert!(p.iter().all(|x| (0.0..=1.0).contains(x)));
         assert!(p[1] >= p[0], "a points lead must not be rated worse");
+    }
+
+    #[test]
+    fn evaluate_batch_multi_matches_per_group_calls() {
+        use crate::strategy::Bot;
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let bot = AzStrategy::from_model(AzModelConfig::new().init::<crate::dqn::MyBackend>(&device), device);
+
+        let mut a = State::default();
+        a.apply_mark(Mark { row: 0, number: 4 });
+        let mut b = State::default();
+        b.apply_mark(Mark { row: 2, number: 9 });
+        let mut opp = State::default();
+        opp.apply_mark(Mark { row: 1, number: 6 });
+
+        let g1_c = [State::default(), a];
+        let g1_o = [opp];
+        let g2_c = [b];
+        let g2_o = [State::default(), a]; // different leader situation
+
+        let multi = bot.evaluate_batch_multi(&[(&g1_c[..], &g1_o[..]), (&g2_c[..], &g2_o[..])]);
+        let solo1 = bot.evaluate_batch(&g1_c, &g1_o);
+        let solo2 = bot.evaluate_batch(&g2_c, &g2_o);
+        assert_eq!(multi.len(), 2);
+        assert_eq!(multi[0], solo1);
+        assert_eq!(multi[1], solo2);
+    }
+
+    #[test]
+    fn evaluate_handles_empty_opponents() {
+        use crate::strategy::Bot;
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let bot = AzStrategy::from_model(AzModelConfig::new().init::<crate::dqn::MyBackend>(&device), device);
+        let v = bot.evaluate(&State::default(), &[]);
+        assert!(v.is_finite());
     }
 }
