@@ -103,6 +103,50 @@ impl<B: Backend> Batcher<B, AzSample, AzBatch<B>> for AzBatcher<B> {
     }
 }
 
+/// One recorded decision: our post-decision state + the opponent's state.
+type Snapshot = (State, Vec<State>);
+
+/// Build training samples from one player's 2-player trajectory: a single
+/// TD(λ) chain, every sample emitted in both board orders (swap doubling) with
+/// negated targets. μ for the bootstrap comes from a burn forward over the
+/// chain's features.
+fn build_az_samples(
+    model: &AzModel<MyBackend>,
+    device: &burn::backend::ndarray::NdArrayDevice,
+    snapshots: &[Snapshot],
+    our_final: f32,
+    opp_final: f32,
+) -> Vec<AzSample> {
+    let mut samples = Vec::new();
+    if snapshots.is_empty() {
+        return samples;
+    }
+    let final_diff = our_final - opp_final;
+
+    let feats: Vec<[f32; AZ_FEATURES]> = snapshots
+        .iter()
+        .map(|(our, opps)| az_features(our, &opps[0]))
+        .collect();
+    let cdiffs: Vec<f32> = snapshots
+        .iter()
+        .map(|(our, opps)| (our.count_points() - opps[0].count_points()) as f32)
+        .collect();
+    let mus: Vec<f32> = az_batch_forward(model, device, &feats).into_iter().map(|(m, _)| m).collect();
+    let g = td_diff_targets(&mus, &cdiffs, final_diff, LAMBDA);
+
+    for (t, (our, opps)) in snapshots.iter().enumerate() {
+        let value = g[t] - cdiffs[t];
+        let fdiff = final_diff - cdiffs[t];
+        samples.push(AzSample { features: feats[t], value, final_diff: fdiff });
+        samples.push(AzSample {
+            features: az_features(&opps[0], our),
+            value: -value,
+            final_diff: -fdiff,
+        });
+    }
+    samples
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +207,39 @@ mod tests {
         assert_eq!(f[228..232], orig[228..232]);
         permute_rows(&mut f, false, true, false);
         assert_eq!(f, orig);
+    }
+
+    #[test]
+    fn build_az_samples_emits_negated_swapped_pairs() {
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = AzModelConfig::new().init::<MyBackend>(&device);
+
+        // 2-step 1v1 trajectory.
+        let mut our1 = State::default();
+        our1.apply_mark(Mark { row: 0, number: 5 });
+        let opp1 = State::default();
+        let mut our2 = our1;
+        our2.apply_mark(Mark { row: 0, number: 7 });
+        let mut opp2 = State::default();
+        opp2.apply_mark(Mark { row: 2, number: 10 });
+
+        let snapshots = vec![(our1, vec![opp1]), (our2, vec![opp2])];
+        let samples = build_az_samples(&model, &device, &snapshots, 30.0, 20.0);
+
+        // 2 steps × 2 orders.
+        assert_eq!(samples.len(), 4);
+        for pair in samples.chunks(2) {
+            let (fwd, swp) = (&pair[0], &pair[1]);
+            assert_eq!(swp.value, -fwd.value);
+            assert_eq!(swp.final_diff, -fwd.final_diff);
+            assert_eq!(fwd.features[0..BOARD_RAW], swp.features[BOARD_RAW..2 * BOARD_RAW]);
+            assert_eq!(fwd.features[BOARD_RAW..2 * BOARD_RAW], swp.features[0..BOARD_RAW]);
+        }
+        // Last forward sample: G_{n-1} = final_diff = 10; cdiff at t=1:
+        // our 3 pts (marks 5,7 -> 2 marks = 3) − opp 1 pt (1 mark) = 2.
+        // value = final_diff − cdiff = 10 − 2 = 8.
+        let last_fwd = &samples[2];
+        assert!((last_fwd.value - 8.0).abs() < 1e-5);
+        assert!((last_fwd.final_diff - 8.0).abs() < 1e-5);
     }
 }
