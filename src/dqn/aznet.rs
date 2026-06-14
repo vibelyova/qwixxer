@@ -349,4 +349,20 @@ mod tests {
         let model = AzModelConfig::new().init::<crate::dqn::MyBackend>(&device);
         assert!(az_batch_forward(&model, &device, &[]).is_empty());
     }
+
+    #[test]
+    fn non_default_encoder_hidden_still_forwards() {
+        // encoder_hidden is freely tunable (only encoder_out is load-bearing for
+        // the reshape/trunk-input coupling). A non-default hidden width must
+        // still build and forward.
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let model = AzModelConfig::new()
+            .with_encoder_hidden(8)
+            .init::<crate::dqn::MyBackend>(&device);
+        let a = State::default();
+        let b = State::default();
+        let out = az_batch_forward(&model, &device, &[az_features(&a, &b)]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].0.is_finite() && out[0].1.is_finite());
+    }
 }
