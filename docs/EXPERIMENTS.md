@@ -1577,6 +1577,19 @@ cargo run --release -- aznet-train -i 40 -g 20000 -e 3 -b 200000 -c
 - **Guard:** checkpoint selection on the per-iteration 200k static curve;
   90/10 valid loss watched for overfit (reduce epochs before resizing).
 
+### Implementation note — memory (2026-06-15)
+
+The first run (`-i 40 -g 20000 -e 3 -b 200000 -c`) OOM'd after ~4 iterations:
+each `AzSample` stored the expanded `[f32; 233]` input (940 B, ~5x the pair
+net's sample), and sample count grows as play improves, so the 3-iteration
+replay buffer plus transient copies exceeded RAM. A reduced `-g 5000` run
+completed but **plateaued at 58.3%** (200k bench) — below the ~59.2% plain
+baseline, **but confounded**: a larger-input/larger net was fed 4x less data
+per iteration than the recipe. Fix: `AzSample` now stores the two compact
+`State`s and the batcher expands them to the 233-float input (~20x less
+memory), so the pre-registered `-g 20000` recipe runs. Adjudication waits on a
+clean full-data run benched at 1M seed-42 (static + search).
+
 ### Results
 
 _(to be filled after the run)_
