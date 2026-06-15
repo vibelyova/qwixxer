@@ -26,26 +26,14 @@ type MyAutodiffBackend = Autodiff<MyBackend>;
 
 const LAMBDA: f32 = 0.8;
 
-/// serde adapter for `[f32; AZ_FEATURES]` (length 233 exceeds serde's array
-/// impls). Round-trips through a `Vec<f32>`.
-mod az_features_serde {
-    use super::AZ_FEATURES;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(arr: &[f32; AZ_FEATURES], s: S) -> Result<S::Ok, S::Error> {
-        arr.as_slice().serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[f32; AZ_FEATURES], D::Error> {
-        let v = Vec::<f32>::deserialize(d)?;
-        <[f32; AZ_FEATURES]>::try_from(v.as_slice()).map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+/// One training sample: the two boards (compact `State`s — expanded to the
+/// 233-float input by [`AzBatcher`] at batch time, keeping the replay buffer
+/// ~20x smaller than storing the expanded features), plus the TD(λ) target
+/// (`value`) and the actual final-diff residual (`final_diff`).
+#[derive(Clone, Copy, Debug)]
 pub struct AzSample {
-    #[serde(with = "az_features_serde")]
-    pub features: [f32; AZ_FEATURES],
+    pub our: State,
+    pub opp: State,
     pub value: f32,
     pub final_diff: f32,
 }
@@ -91,7 +79,7 @@ impl<B: Backend> Batcher<B, AzSample, AzBatch<B>> for AzBatcher<B> {
         let inputs: Vec<f32> = items
             .iter()
             .flat_map(|s| {
-                let mut f = s.features;
+                let mut f = az_features(&s.our, &s.opp);
                 permute_rows(&mut f, rng.gen(), rng.gen(), rng.gen());
                 f
             })
@@ -146,12 +134,8 @@ fn build_az_samples(
     for (t, (our, opps)) in snapshots.iter().enumerate() {
         let value = g[t] - cdiffs[t];
         let fdiff = final_diff - cdiffs[t];
-        samples.push(AzSample { features: feats[t], value, final_diff: fdiff });
-        samples.push(AzSample {
-            features: az_features(&opps[0], our),
-            value: -value,
-            final_diff: -fdiff,
-        });
+        samples.push(AzSample { our: *our, opp: opps[0], value, final_diff: fdiff });
+        samples.push(AzSample { our: opps[0], opp: *our, value: -value, final_diff: -fdiff });
     }
     samples
 }
@@ -560,8 +544,8 @@ mod tests {
             let (fwd, swp) = (&pair[0], &pair[1]);
             assert_eq!(swp.value, -fwd.value);
             assert_eq!(swp.final_diff, -fwd.final_diff);
-            assert_eq!(fwd.features[0..BOARD_RAW], swp.features[BOARD_RAW..2 * BOARD_RAW]);
-            assert_eq!(fwd.features[BOARD_RAW..2 * BOARD_RAW], swp.features[0..BOARD_RAW]);
+            assert_eq!(fwd.our, swp.opp, "swap exchanges the two boards");
+            assert_eq!(fwd.opp, swp.our, "swap exchanges the two boards");
         }
         // Last forward sample: G_{n-1} = final_diff = 10; cdiff at t=1:
         // our 3 pts (marks 5,7 -> 2 marks = 3) − opp 1 pt (1 mark) = 2.
@@ -582,7 +566,8 @@ mod tests {
         assert_eq!(f1, f2);
         assert_eq!(s1.len(), s2.len());
         for (a, b) in s1.iter().zip(&s2) {
-            assert_eq!(a.features, b.features);
+            assert_eq!(a.our, b.our);
+            assert_eq!(a.opp, b.opp);
             assert_eq!(a.value, b.value);
             assert_eq!(a.final_diff, b.final_diff);
         }
@@ -606,5 +591,32 @@ mod tests {
         assert!(v.is_finite());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn batcher_expands_states_to_inputs_deterministically() {
+        use burn::data::dataloader::batcher::Batcher;
+        let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+        let batcher = AzBatcher::<MyBackend> { _phantom: std::marker::PhantomData };
+
+        let mut a = State::default();
+        a.apply_mark(Mark { row: 0, number: 5 });
+        let b = State::default();
+        let items = vec![
+            AzSample { our: a, opp: b, value: 1.0, final_diff: 2.0 },
+            AzSample { our: b, opp: a, value: -1.0, final_diff: -2.0 },
+        ];
+
+        let batch1 = batcher.batch(items.clone(), &device);
+        let batch2 = batcher.batch(items.clone(), &device);
+        // Shape: [2, AZ_FEATURES]. (`.shape().dims` is the repo idiom — see AzModel::forward.)
+        assert_eq!(batch1.inputs.shape().dims, [2, AZ_FEATURES]);
+        // Deterministic (seed derived from value.to_bits + batch_size).
+        let v1 = batch1.inputs.into_data().to_vec::<f32>().unwrap();
+        let v2 = batch2.inputs.into_data().to_vec::<f32>().unwrap();
+        assert_eq!(v1, v2);
+        // targets / final_diffs carried through.
+        assert_eq!(batch1.targets.into_data().to_vec::<f32>().unwrap(), vec![1.0, -1.0]);
+        assert_eq!(batch1.final_diffs.into_data().to_vec::<f32>().unwrap(), vec![2.0, -2.0]);
     }
 }
