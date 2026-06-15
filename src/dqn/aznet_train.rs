@@ -313,8 +313,10 @@ fn train_with_epochs(samples: Vec<AzSample>, artifact_dir: &str, num_epochs: usi
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
 
     let split = (samples.len() * 9) / 10;
-    let train_data = InMemDataset::new(samples[..split].to_vec());
-    let valid_data = InMemDataset::new(samples[split..].to_vec());
+    let mut samples = samples;
+    let valid = samples.split_off(split);
+    let train_data = InMemDataset::new(samples);
+    let valid_data = InMemDataset::new(valid);
 
     let model: AzModel<MyAutodiffBackend> = AzModelConfig::new()
         .init::<MyAutodiffBackend>(&device)
