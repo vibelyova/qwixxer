@@ -546,8 +546,10 @@ mod tests {
             let (fwd, swp) = (&pair[0], &pair[1]);
             assert_eq!(swp.value, -fwd.value);
             assert_eq!(swp.final_diff, -fwd.final_diff);
-            assert_eq!(fwd.our, swp.opp, "swap exchanges the two boards");
-            assert_eq!(fwd.opp, swp.our, "swap exchanges the two boards");
+            let ff = az_features(&fwd.our, &fwd.opp);
+            let sf = az_features(&swp.our, &swp.opp);
+            assert_eq!(ff[..BOARD_RAW], sf[BOARD_RAW..2 * BOARD_RAW], "swap exchanges board halves");
+            assert_eq!(ff[BOARD_RAW..2 * BOARD_RAW], sf[..BOARD_RAW], "swap exchanges board halves");
         }
         // Last forward sample: G_{n-1} = final_diff = 10; cdiff at t=1:
         // our 3 pts (marks 5,7 -> 2 marks = 3) − opp 1 pt (1 mark) = 2.
@@ -568,8 +570,7 @@ mod tests {
         assert_eq!(f1, f2);
         assert_eq!(s1.len(), s2.len());
         for (a, b) in s1.iter().zip(&s2) {
-            assert_eq!(a.our, b.our);
-            assert_eq!(a.opp, b.opp);
+            assert_eq!(az_features(&a.our, &a.opp), az_features(&b.our, &b.opp));
             assert_eq!(a.value, b.value);
             assert_eq!(a.final_diff, b.final_diff);
         }
