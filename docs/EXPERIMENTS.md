@@ -1543,7 +1543,7 @@ on fresh rollouts (flywheel), or accepting the ~60% structural ceiling.
 
 ## Phase 20: AZ Representation (aznet) — shared-encoder one-hot value net
 
-**Status: implemented; run pending.** Spec:
+**Status: CONCLUDED — KILL (representation is not the lever).** Spec:
 `docs/superpowers/specs/2026-06-15-aznet-representation-design.md`.
 
 Tests AlphaZero's *representation* lever in the existing pair-train harness: a
@@ -1592,4 +1592,37 @@ clean full-data run benched at 1M seed-42 (static + search).
 
 ### Results
 
-_(to be filled after the run)_
+**Run** (user-executed, clean from-scratch `-g 20000 -e 3 -b 200000 -c`, 40
+iters): the per-iteration static curve **peaked at iteration 36, 59.0%**,
+**confirmed at 1M seed-42 vs GA**. (The memory fix held — `-g 20000` ran without
+OOM. The earlier `-g 5000` plateau of 58.3% was indeed mostly data starvation;
+full data recovered ~0.7pp.)
+
+**Acceptance:**
+
+| metric | pre-registered | measured | verdict |
+|---|---|---|---|
+| primary (1M seed-42, static) | PAY ≥ +0.3pp over plain ~59.2%; KILL < +0.1pp | **59.0%** (≈ −0.2pp) | **KILL** |
+
+The search arm was not separately benched: with static landing **below** its
+plain counterpart, search (which inherits this value net) cannot plausibly clear
+the ~60.4% it would need to PAY against the old plain search's ~60.1%. The static
+result alone is a decisive non-PAY.
+
+**Verdict: KILL — the representation is not the lever.** At full data, from
+scratch, the AlphaZero-style one-hot crossing-order representation + shared row
+encoder (~2× capacity) does **not** beat the hand-scalar pair net — it ties it,
+marginally below (59.0 vs ~59.2 static). This is an informative negative: the
+~60% wall is **not a representation-expressiveness problem**. The hand-engineered
+scalar features already capture what the value net needs; handing the network raw
+one-hot count/frontier/lockable structure buys nothing. Consistent with the
+Phases 13–19 structural-ceiling picture (diffuse, irreducible-dice-variance edge),
+not a contradiction of it.
+
+Per the pre-registration, **Arm B (directly-learned win head) was gated on Arm A
+paying and is not pursued.** It tests a different axis (output target / P(win)
+calibration near locks, not input representation), so it is not strictly refuted
+— but combined with Phase 19's "lock blind spot not fixable by data alone," the
+accumulated evidence makes it a low-odds bet; the ~60% ceiling is banked. The
+`aznet` code remains in the tree (`src/dqn/aznet.rs`, `aznet_train.rs`, the
+`aznet`/`aznet-search` CLI bots) as a documented negative result.
